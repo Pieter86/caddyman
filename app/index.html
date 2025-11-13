@@ -1,0 +1,869 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>CaddyMAN</title>
+    <link rel="stylesheet" href="/static/style.css?v=1.2.12">
+
+</head>
+<body class="dark">
+    <!-- Login Screen -->
+<div id="login-screen" class="login-container">
+  <div class="login-box">
+    <h1>⚡ CaddyMAN</h1>
+    <div id="login-alert"></div>
+
+    <form id="login-form" onsubmit="event.preventDefault(); login(); return false;">
+      <div class="form-group">
+        <label>Username</label>
+        <input type="text" id="login-username" placeholder="Enter username" required autocomplete="username">
+      </div>
+      <div class="form-group">
+        <label>Password</label>
+        <input type="password" id="login-password" placeholder="Enter password" required autocomplete="current-password">
+      </div>
+      <div class="form-group hidden" id="login-2fa-group">
+        <label>2FA Code</label>
+        <input type="text" id="login-2fa-token" placeholder="000000" maxlength="6" pattern="[0-9]{6}" autocomplete="off" style="text-align: center; font-size: 18px; letter-spacing: 5px;">
+        <small style="color: var(--text-secondary); font-size: 12px; display: block; margin-top: 5px;">Enter the 6-digit code from your authenticator app</small>
+      </div>
+      <button type="submit" class="btn btn-primary" style="width: 100%;">Login</button>
+    </form>
+  </div>
+</div>
+
+
+    <!-- Main App -->
+    <div id="main-app" class="hidden">
+        <div id="update-banner" class="update-banner hidden">
+            <span>🎉 Update available!</span>
+            <button class="btn btn-success" onclick="installUpdate()">Install Update</button>
+        </div>
+        
+        <div class="container">
+            <div class="sidebar">
+                <div class="logo">⚡ CaddyMAN</div>
+                <div class="nav-item active" onclick="showPage('dashboard', event)">
+                    <span>📊</span> Dashboard
+                </div>
+                <div class="nav-item" onclick="showPage('proxies', event)">
+                    <span>🔄</span> Reverse Proxies
+                </div>
+                <div class="nav-item" onclick="showPage('websites', event)">
+                    <span>🌐</span> Websites
+                </div>
+                <div class="nav-item" onclick="showPage('users', event)">
+                    <span>👥</span> Users
+                </div>
+                <div class="nav-item" onclick="showPage('groups', event)" >
+                    <span>🏷️</span> Groups
+                </div>
+                <div class="nav-item" onclick="showPage('settings', event)">
+                    <span>⚙️</span> Settings
+                </div>
+                <div class="nav-item" onclick="showPage('help', event)">
+                    <span>❓</span> Help
+                </div>
+                <div class="nav-item" onclick="logout()" style="margin-top: auto;">
+                    <span>🚪</span> Logout
+                </div>
+            </div>
+            
+            <div class="content">
+                <div id="alert-container"></div>
+                
+                <!-- Dashboard -->
+<!-- Dashboard -->
+                <div id="dashboard-page" class="page">
+                    <div class="header">
+                        <h1>Dashboard</h1>
+                    </div>
+
+                    <!-- Security Warnings (only shown when Enhanced Security is enabled) -->
+                    <div id="security-warnings-card" class="card hidden">
+                        <h3 style="margin-bottom: 15px;">⚠️ Security Warnings</h3>
+                        <div id="security-warnings-list"></div>
+                    </div>
+
+                    <div class="card">
+                        <h3>Caddy Status</h3>
+                        <p id="caddy-status">Checking...</p>
+                    </div>
+                    <div class="card">
+                        <h3>System Info</h3>
+                        <p>App: <strong>Caddy Manager by PN86JVR</strong></p>
+                        <p>Version: <strong id="app-version">""" + VERSION + """</strong></p>
+                        <p>Proxies: <strong id="proxy-count">0</strong></p>
+                        <p>Websites: <strong id="website-count">0</strong></p>
+                        <p>Users: <strong id="user-count">0</strong></p>
+                    </div>
+                    <div class="card">
+                        <h3>Recent Activity</h3>
+                        <div id="activity-log" style="max-height: 400px; overflow-y: auto; font-family: monospace; font-size: 12px;">
+                            <p style="color: var(--text-secondary);">Loading activity...</p>
+                        </div>
+                    </div>
+                </div>
+                
+                <!-- Proxies Page -->
+                <div id="proxies-page" class="page hidden">
+                    <div class="header">
+                        <h1>Reverse Proxies</h1>
+                        <button class="btn btn-primary" onclick="openProxyModal()">+ Add Proxy</button>
+                    </div>
+                    <div class="item-list" id="proxy-list"></div>
+                </div>
+                
+                <!-- Websites Page -->
+                <div id="websites-page" class="page hidden">
+                    <div class="header">
+                        <h1>Static Websites</h1>
+                        <button class="btn btn-primary" onclick="openWebsiteModal()">+ Add Website</button>
+                    </div>
+                    <div class="item-list" id="website-list"></div>
+                </div>
+                
+                <!-- Users Page -->
+                <div id="users-page" class="page hidden">
+                    <div class="header">
+                        <h1>Users</h1>
+                        <button class="btn btn-primary" onclick="openUserModal()">+ Add User</button>
+                    </div>
+                    <div class="item-list" id="user-list"></div>
+                </div>
+                
+                <!-- Groups Page -->
+                <div id="groups-page" class="page hidden">
+                    <div class="header">
+                        <h1>Groups</h1>
+                        <button class="btn btn-primary" onclick="openGroupModal()">+ Add Group</button>
+                    </div>
+                    <div class="item-list" id="group-list"></div>
+                </div>
+                
+                <!-- Settings Page -->
+                <div id="settings-page" class="page hidden">
+                    <div class="header">
+                        <h1>Settings</h1>
+                        <button class="btn btn-success" onclick="saveSettings()">Save Settings</button>
+                    </div>
+                    <div class="card">
+                        <h3>General</h3>
+                        <div class="form-group">
+                            <label>Theme</label>
+                            <div class="toggle-group" id="theme-toggle">
+                                <div class="toggle-btn" onclick="setTheme('light')">Light</div>
+                                <div class="toggle-btn active" onclick="setTheme('dark')">Dark</div>
+                                <div class="toggle-btn" onclick="setTheme('black')">Black</div>
+                            </div>
+                        </div>
+                        <div class="form-group">
+                            <label>Manager Port</label>
+                            <input type="number" id="manager-port" min="1" max="65535" value="8000">
+                            <small style="color: var(--text-secondary); font-size: 12px;">Port for Caddy Manager web interface (requires restart)</small>
+                        </div>
+                        <div class="form-group">
+                            <div class="checkbox-wrapper">
+                                <input type="checkbox" id="enhanced-security">
+                                <label>Enable Enhanced Security Mode</label>
+                            </div>
+                            <small style="color: var(--text-secondary); font-size: 12px; display: block; margin-top: 5px;">
+                                Enables strict password requirements, Have I Been Pwned checking, and allows 2FA for users
+                            </small>
+                        </div>
+                    </div>
+                    <div class="card">
+                        <h3>Health Check</h3>
+                        <div class="form-group">
+                            <div class="checkbox-wrapper">
+                                <input type="checkbox" id="health-check-enabled">
+                                <label>Enable Health Monitoring</label>
+                            </div>
+                        </div>
+                        <div class="form-group">
+                            <label>Domain to Monitor</label>
+                            <input type="text" id="health-check-domain" placeholder="example.com">
+                        </div>
+                        <div class="form-group">
+                            <label>Check Interval (seconds)</label>
+                            <input type="number" id="health-check-interval" value="60" min="30">
+                        </div>
+                        <div class="form-group">
+                            <label>Restart After Failures</label>
+                            <input type="number" id="restart-after-failures" value="3" min="1">
+                        </div>
+                    </div>
+                    <div class="card">
+                        <h3>Notifications</h3>
+                        <div class="form-group">
+                            <label>Service</label>
+                            <select id="notification-service">
+                                <option value="">None</option>
+                                <option value="gotify">Gotify</option>
+                                <option value="ntfy">Ntfy</option>
+                            </select>
+                        </div>
+                        <div class="form-group">
+                            <label>Service URL</label>
+                            <input type="text" id="notification-url" placeholder="https://gotify.example.com">
+                        </div>
+                        <div class="form-group">
+                            <label>Token</label>
+                            <input type="text" id="notification-token" placeholder="API Token">
+                        </div>
+                    </div>
+                    <div class="card">
+                        <h3>PHP Configuration</h3>
+                        <div class="form-group">
+                            <div class="checkbox-wrapper">
+                                <input type="checkbox" id="php-enabled">
+                                <label>Enable PHP Support</label>
+                            </div>
+                        </div>
+                        <div class="form-group">
+                            <label>PHP-CGI Executable Path</label>
+                            <input type="text" id="php-path" placeholder="C:\php\php-cgi.exe or /usr/bin/php-cgi">
+                            <small style="color: var(--text-secondary); font-size: 12px;">Full path to php-cgi executable (required for PHP support)</small>
+                        </div>
+                    </div>
+                    <div class="card">
+                        <h3>Caddy Logging</h3>
+                        <div class="form-group">
+                            <label>Global Log Level</label>
+                            <select id="caddy-log-level">
+                                <option value="DEBUG">DEBUG - Very detailed logs</option>
+                                <option value="INFO">INFO - General information</option>
+                                <option value="WARN" selected>WARN - Warnings only (default)</option>
+                                <option value="ERROR">ERROR - Errors only</option>
+                            </select>
+                            <small style="color: var(--text-secondary); font-size: 12px;">Sets the logging level for Caddy server (requires restart)</small>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Help Page -->
+                <div id="help-page" class="page hidden">
+        <div class="header">
+            <h1>Help & Documentation</h1>
+        </div>
+
+        <div style="max-width: 1200px; margin: 0 auto; padding: 20px; color: var(--text-primary);">
+            <!-- Getting Started -->
+            <div class="card" style="margin-bottom: 20px;">
+                <h2 style="margin-top: 0; color: var(--accent);">Getting Started</h2>
+                <p><strong>CaddyMAN</strong> is a powerful web-based management interface for Caddy web server v2. It provides an intuitive GUI to manage reverse proxies, static websites, user authentication, and more.</p>
+
+                <h3 style="color: var(--accent); margin-top: 20px;">First Time Setup</h3>
+                <ol style="line-height: 1.8;">
+                    <li><strong>Login:</strong> Default credentials are username: <code>admin</code>, password: <code>changeme</code></li>
+                    <li><strong>Change Password:</strong> Go to Users page and update the admin password immediately</li>
+                    <li><strong>Enable 2FA:</strong> For enhanced security, enable Two-Factor Authentication in the Users page</li>
+                    <li><strong>Configure Settings:</strong> Visit the Settings page to configure PHP, ports, and other options</li>
+                </ol>
+            </div>
+
+            <!-- Dashboard -->
+            <div class="card" style="margin-bottom: 20px;">
+                <h2 style="margin-top: 0; color: var(--accent);">Dashboard</h2>
+                <p>The dashboard provides an overview of your Caddy server status and quick statistics:</p>
+                <ul style="line-height: 1.8;">
+                    <li><strong>Caddy Status:</strong> Shows if Caddy is running or stopped with the current process ID</li>
+                    <li><strong>Statistics:</strong> Total count of reverse proxies, websites, users, and groups</li>
+                    <li><strong>Updates:</strong> Shows current version (v1.2.11) and checks for available updates</li>
+                </ul>
+            </div>
+
+            <!-- Reverse Proxies -->
+            <div class="card" style="margin-bottom: 20px;">
+                <h2 style="margin-top: 0; color: var(--accent);">Reverse Proxies</h2>
+                <p>Reverse proxies forward incoming requests to backend services running on different ports or servers.</p>
+
+                <h3 style="color: var(--accent); margin-top: 20px;">Creating a Reverse Proxy</h3>
+                <ol style="line-height: 1.8;">
+                    <li>Click the <strong>"Add Reverse Proxy"</strong> button</li>
+                    <li><strong>Domains:</strong> Enter domain names (e.g., api.example.com) - one per line</li>
+                    <li><strong>Target:</strong> Enter the backend URL (e.g., http://localhost:3000)</li>
+                    <li><strong>Ports:</strong> Configure HTTP ports (e.g., 80, 8080) and HTTPS ports (e.g., 443, 8443)</li>
+                    <li><strong>Auto HTTPS:</strong> Enable for automatic TLS certificate management (requires port 80 available)</li>
+                    <li><strong>Access Groups:</strong> Restrict access to specific user groups (optional)</li>
+                    <li><strong>Advanced:</strong> Add custom Caddyfile directives for complex configurations</li>
+                </ol>
+
+                <h3 style="color: var(--accent); margin-top: 20px;">Important Notes</h3>
+                <ul style="line-height: 1.8;">
+                    <li><strong>Port 80 Requirement:</strong> Auto HTTPS only works when port 80 is available for HTTP challenges</li>
+                    <li><strong>Custom HTTPS:</strong> When using non-standard HTTPS ports, Auto HTTPS is automatically disabled</li>
+                    <li><strong>Multiple Domains:</strong> You can serve multiple domains from one reverse proxy configuration</li>
+                </ul>
+            </div>
+
+            <!-- Websites -->
+            <div class="card" style="margin-bottom: 20px;">
+                <h2 style="margin-top: 0; color: var(--accent);">Static Websites</h2>
+                <p>Host static websites and PHP applications directly from local directories.</p>
+
+                <h3 style="color: var(--accent); margin-top: 20px;">Creating a Website</h3>
+                <ol style="line-height: 1.8;">
+                    <li>Click the <strong>"Add Website"</strong> button</li>
+                    <li><strong>Domains:</strong> Enter domain names or use IP addresses - one per line</li>
+                    <li><strong>Root Path:</strong> Absolute path to the website files (e.g., C:\inetpub\wwwroot\mysite)</li>
+                    <li><strong>Index Files:</strong> Default files to serve (e.g., index.html, index.php) - one per line</li>
+                    <li><strong>Ports:</strong> Configure HTTP and HTTPS ports</li>
+                    <li><strong>PHP Enabled:</strong> Enable if the site contains PHP files (requires PHP configuration in Settings)</li>
+                    <li><strong>Auto HTTPS:</strong> Enable for automatic TLS (requires port 80 and valid domain)</li>
+                    <li><strong>Access Groups:</strong> Restrict access to authenticated users in specific groups</li>
+                </ol>
+
+                <h3 style="color: var(--accent); margin-top: 20px;">PHP Configuration</h3>
+                <ul style="line-height: 1.8;">
+                    <li><strong>Requirements:</strong> PHP-CGI must be installed and path configured in Settings</li>
+                    <li><strong>Global Enable:</strong> PHP must be enabled globally in Settings for per-site PHP to work</li>
+                    <li><strong>FastCGI:</strong> CaddyMAN automatically starts PHP-CGI on the configured port (default: 9000)</li>
+                    <li><strong>Extensions:</strong> Only files with extensions listed in Settings will be processed as PHP</li>
+                </ul>
+            </div>
+
+            <!-- Users and Groups -->
+            <div class="card" style="margin-bottom: 20px;">
+                <h2 style="margin-top: 0; color: var(--accent);">Users & Groups</h2>
+
+                <h3 style="color: var(--accent); margin-top: 15px;">User Management</h3>
+                <p>Control who can access protected websites and reverse proxies:</p>
+                <ul style="line-height: 1.8;">
+                    <li><strong>Create Users:</strong> Add users with usernames and secure passwords</li>
+                    <li><strong>Assign Groups:</strong> Users can belong to multiple groups for access control</li>
+                    <li><strong>Two-Factor Auth:</strong> Enable 2FA per user for enhanced security</li>
+                    <li><strong>Password Requirements:</strong> Minimum 8 characters with complexity requirements</li>
+                </ul>
+
+                <h3 style="color: var(--accent); margin-top: 20px;">Group Management</h3>
+                <ul style="line-height: 1.8;">
+                    <li><strong>Access Control:</strong> Groups define which users can access specific sites/proxies</li>
+                    <li><strong>System Groups:</strong> Some groups (like admin_group) are protected and cannot be deleted</li>
+                    <li><strong>Multiple Groups:</strong> Assign sites to multiple groups for flexible access control</li>
+                </ul>
+
+                <h3 style="color: var(--accent); margin-top: 20px;">Two-Factor Authentication (2FA)</h3>
+                <ol style="line-height: 1.8;">
+                    <li>Click <strong>"Show QR Code"</strong> next to a user</li>
+                    <li>Scan the QR code with an authenticator app (Google Authenticator, Authy, etc.)</li>
+                    <li>Enable 2FA for that user</li>
+                    <li>User will need to enter TOTP code after password on login</li>
+                </ol>
+            </div>
+
+            <!-- Settings -->
+            <div class="card" style="margin-bottom: 20px;">
+                <h2 style="margin-top: 0; color: var(--accent);">Settings</h2>
+                <p>Configure global application behavior and Caddy server options.</p>
+
+                <h3 style="color: var(--accent); margin-top: 20px;">Application Settings</h3>
+                <ul style="line-height: 1.8;">
+                    <li><strong>Theme:</strong> Choose between Dark mode (default), Light mode, or Black mode</li>
+                    <li><strong>Manager Port:</strong> Port for CaddyMAN web interface (default: 8000)</li>
+                    <li><strong>Enhanced Security Mode:</strong> Requires authentication on management interface</li>
+                </ul>
+
+                <h3 style="color: var(--accent); margin-top: 20px;">PHP Settings</h3>
+                <ul style="line-height: 1.8;">
+                    <li><strong>Enable PHP:</strong> Master switch - must be ON for any site to use PHP</li>
+                    <li><strong>PHP Path:</strong> Full path to php-cgi.exe executable</li>
+                    <li><strong>PHP Port:</strong> FastCGI port for PHP processing (default: 9000)</li>
+                    <li><strong>PHP Extensions:</strong> File extensions to process as PHP (e.g., .php, .phtml)</li>
+                </ul>
+
+                <h3 style="color: var(--accent); margin-top: 20px;">Caddy Settings</h3>
+                <ul style="line-height: 1.8;">
+                    <li><strong>Caddy Path:</strong> Path to Caddy v2 executable</li>
+                    <li><strong>Config Path:</strong> Where Caddy configuration is saved</li>
+                    <li><strong>Log Level:</strong> Verbosity of Caddy logs (DEBUG, INFO, WARN, ERROR)</li>
+                </ul>
+
+                <h3 style="color: var(--accent); margin-top: 20px;">Enhanced Security Mode</h3>
+                <ul style="line-height: 1.8;">
+                    <li><strong>Purpose:</strong> Adds extra security by requiring authentication on the management interface itself</li>
+                    <li><strong>When Enabled:</strong> All API requests require valid authentication token</li>
+                    <li><strong>Login Required:</strong> Must log in before accessing any page</li>
+                    <li><strong>Best Practice:</strong> Enable for production environments</li>
+                </ul>
+
+                <h3 style="color: var(--accent); margin-top: 20px;">Notifications</h3>
+                <ul style="line-height: 1.8;">
+                    <li><strong>Gotify:</strong> Receive notifications via Gotify (self-hosted notification service)</li>
+                    <li><strong>Ntfy:</strong> Send notifications to Ntfy (https://ntfy.sh or self-hosted)</li>
+                    <li><strong>Events:</strong> Get notified on Caddy restarts, configuration changes, and updates</li>
+                </ul>
+            </div>
+
+            <!-- Advanced Features -->
+            <div class="card" style="margin-bottom: 20px;">
+                <h2 style="margin-top: 0; color: var(--accent);">Advanced Features</h2>
+
+                <h3 style="color: var(--accent); margin-top: 15px;">Custom Caddyfile Directives</h3>
+                <p>Use the "Advanced" field in reverse proxies and websites to add custom Caddyfile directives:</p>
+                <pre style="background: var(--bg-secondary); padding: 15px; border-radius: 8px; overflow-x: auto;">header {
+    # Security headers
+    X-Frame-Options "DENY"
+    X-Content-Type-Options "nosniff"
+}
+
+# Rate limiting
+rate_limit {
+    zone static {
+        key {remote_host}
+        events 100
+        window 1m
+    }
+}</pre>
+
+                <h3 style="color: var(--accent); margin-top: 20px;">Manual TLS Configuration</h3>
+                <p>For custom SSL certificates, use the TLS field in advanced settings:</p>
+                <pre style="background: var(--bg-secondary); padding: 15px; border-radius: 8px; overflow-x: auto;">tls /path/to/cert.pem /path/to/key.pem</pre>
+
+                <h3 style="color: var(--accent); margin-top: 20px;">Multiple Ports</h3>
+                <p>Sites and proxies can listen on multiple HTTP and HTTPS ports simultaneously. Just add each port on a new line in the ports configuration.</p>
+            </div>
+
+            <!-- Troubleshooting -->
+            <div class="card" style="margin-bottom: 20px;">
+                <h2 style="margin-top: 0; color: var(--accent);">Troubleshooting</h2>
+
+                <h3 style="color: var(--accent); margin-top: 15px;">Caddy Won't Start</h3>
+                <ul style="line-height: 1.8;">
+                    <li><strong>Port Conflicts:</strong> Check if another service is using the configured ports (use <code>netstat -ano | findstr :PORT</code>)</li>
+                    <li><strong>Configuration Error:</strong> Check the Caddy logs for syntax errors in advanced directives</li>
+                    <li><strong>Permissions:</strong> Ensure Caddy has permission to bind to ports (especially 80/443)</li>
+                    <li><strong>Path Issues:</strong> Verify the Caddy executable path in Settings is correct</li>
+                </ul>
+
+                <h3 style="color: var(--accent); margin-top: 20px;">PHP Not Working</h3>
+                <ul style="line-height: 1.8;">
+                    <li><strong>Global Enable:</strong> Ensure PHP is enabled globally in Settings</li>
+                    <li><strong>Site Enable:</strong> Ensure the specific website has PHP enabled</li>
+                    <li><strong>PHP Path:</strong> Verify the path to php-cgi.exe is correct in Settings</li>
+                    <li><strong>Port Conflict:</strong> Check if another service is using the PHP FastCGI port (default: 9000)</li>
+                    <li><strong>Restart Required:</strong> Restart Caddy after changing PHP settings</li>
+                </ul>
+
+                <h3 style="color: var(--accent); margin-top: 20px;">Auto HTTPS Issues</h3>
+                <ul style="line-height: 1.8;">
+                    <li><strong>Port 80 Required:</strong> Auto HTTPS needs port 80 available for HTTP-01 challenges</li>
+                    <li><strong>Valid Domain:</strong> You need a real domain name that points to your server (not localhost or IP)</li>
+                    <li><strong>DNS Propagation:</strong> Ensure DNS records have propagated before attempting HTTPS</li>
+                    <li><strong>Firewall:</strong> Ports 80 and 443 must be open in your firewall</li>
+                    <li><strong>Alternative:</strong> For local development, use custom TLS or disable HTTPS</li>
+                </ul>
+
+                <h3 style="color: var(--accent); margin-top: 20px;">Settings Not Persisting</h3>
+                <ul style="line-height: 1.8;">
+                    <li><strong>Fixed in v1.2.11:</strong> Settings now properly persist across restarts</li>
+                    <li><strong>Database:</strong> All configuration is stored in caddy_manager.db (SQLite)</li>
+                    <li><strong>Backup:</strong> Back up caddy_manager.db regularly to preserve your configuration</li>
+                </ul>
+
+                <h3 style="color: var(--accent); margin-top: 20px;">Can't Access Management Interface</h3>
+                <ul style="line-height: 1.8;">
+                    <li><strong>Port Check:</strong> Verify CaddyMAN is running on the configured port (default: 8000)</li>
+                    <li><strong>URL:</strong> Access via http://localhost:8000 or http://127.0.0.1:8000</li>
+                    <li><strong>Process Check:</strong> Run <code>tasklist | findstr python</code> to verify the process is running</li>
+                    <li><strong>Logs:</strong> Check app.log for startup errors</li>
+                </ul>
+            </div>
+
+            <!-- API Documentation -->
+            <div class="card" style="margin-bottom: 20px;">
+                <h2 style="margin-top: 0; color: var(--accent);">API Endpoints</h2>
+                <p>CaddyMAN provides a REST API for automation and integration:</p>
+
+                <h3 style="color: var(--accent); margin-top: 20px;">Authentication</h3>
+                <ul style="line-height: 1.8;">
+                    <li><code>POST /api/login</code> - Authenticate and receive session token</li>
+                    <li><code>POST /api/logout</code> - End current session</li>
+                    <li><code>GET /api/check-auth</code> - Verify authentication status</li>
+                </ul>
+
+                <h3 style="color: var(--accent); margin-top: 20px;">Caddy Control</h3>
+                <ul style="line-height: 1.8;">
+                    <li><code>GET /api/caddy/status</code> - Check Caddy running status</li>
+                    <li><code>POST /api/caddy/start</code> - Start Caddy server</li>
+                    <li><code>POST /api/caddy/stop</code> - Stop Caddy server</li>
+                    <li><code>POST /api/caddy/restart</code> - Restart Caddy server</li>
+                    <li><code>GET /api/caddy/config</code> - View current Caddy configuration</li>
+                </ul>
+
+                <h3 style="color: var(--accent); margin-top: 20px;">Configuration Management</h3>
+                <ul style="line-height: 1.8;">
+                    <li><code>GET /api/reverse-proxies</code> - List all reverse proxies</li>
+                    <li><code>POST /api/reverse-proxies</code> - Create/update reverse proxy</li>
+                    <li><code>DELETE /api/reverse-proxies/{id}</code> - Delete reverse proxy</li>
+                    <li><code>GET /api/websites</code> - List all websites</li>
+                    <li><code>POST /api/websites</code> - Create/update website</li>
+                    <li><code>DELETE /api/websites/{id}</code> - Delete website</li>
+                    <li><code>GET /api/users</code> - List all users</li>
+                    <li><code>GET /api/groups</code> - List all groups</li>
+                    <li><code>GET /api/settings</code> - Get all settings</li>
+                    <li><code>POST /api/settings</code> - Update settings</li>
+                </ul>
+            </div>
+
+            <!-- Database Information -->
+            <div class="card" style="margin-bottom: 20px;">
+                <h2 style="margin-top: 0; color: var(--accent);">Database Information</h2>
+                <p>CaddyMAN uses SQLite for data storage, providing reliability and ease of backup.</p>
+
+                <h3 style="color: var(--accent); margin-top: 20px;">Database Location</h3>
+                <p>All configuration is stored in: <code>caddy_manager.db</code></p>
+
+                <h3 style="color: var(--accent); margin-top: 20px;">Database Tables</h3>
+                <ul style="line-height: 1.8;">
+                    <li><strong>users:</strong> User accounts, passwords (hashed), and 2FA settings</li>
+                    <li><strong>settings:</strong> Application configuration (key-value pairs)</li>
+                    <li><strong>groups:</strong> Access control groups</li>
+                    <li><strong>websites:</strong> Static website configurations</li>
+                    <li><strong>reverse_proxies:</strong> Reverse proxy configurations</li>
+                </ul>
+
+                <h3 style="color: var(--accent); margin-top: 20px;">Backup & Restore</h3>
+                <ul style="line-height: 1.8;">
+                    <li><strong>Backup:</strong> Simply copy <code>caddy_manager.db</code> to a safe location</li>
+                    <li><strong>Restore:</strong> Stop CaddyMAN, replace the database file, then restart</li>
+                    <li><strong>Automated:</strong> Consider setting up scheduled backups of the database file</li>
+                </ul>
+            </div>
+
+            <!-- Version Information -->
+            <div class="card" style="margin-bottom: 20px;">
+                <h2 style="margin-top: 0; color: var(--accent);">Version Information</h2>
+                <p><strong>Current Version:</strong> v1.2.11</p>
+
+                <h3 style="color: var(--accent); margin-top: 20px;">Recent Updates</h3>
+                <ul style="line-height: 1.8;">
+                    <li><strong>v1.2.11:</strong> Application rebranded to CaddyMAN, comprehensive help menu added</li>
+                    <li><strong>v1.2.10:</strong> Fixed critical settings persistence bug</li>
+                    <li><strong>v1.2.9:</strong> Complete SQLite migration for all configuration data</li>
+                    <li><strong>v1.2.8:</strong> Enhanced Security Mode and 2FA implementation</li>
+                    <li><strong>v1.2.7:</strong> Custom scrollbars and UI improvements</li>
+                </ul>
+
+                <h3 style="color: var(--accent); margin-top: 20px;">Update Mechanism</h3>
+                <p>CaddyMAN includes an automatic update checker that notifies you when new versions are available. Updates can be downloaded and applied from the Dashboard.</p>
+            </div>
+
+            <!-- Support -->
+            <div class="card" style="margin-bottom: 20px;">
+                <h2 style="margin-top: 0; color: var(--accent);">Support & Resources</h2>
+
+                <h3 style="color: var(--accent); margin-top: 15px;">Log Files</h3>
+                <ul style="line-height: 1.8;">
+                    <li><strong>app.log:</strong> CaddyMAN application logs</li>
+                    <li><strong>Caddy logs:</strong> Controlled via Log Level setting</li>
+                </ul>
+
+                <h3 style="color: var(--accent); margin-top: 20px;">Command Line Options</h3>
+                <p>Start CaddyMAN with: <code>python caddy_manager.py</code></p>
+
+                <h3 style="color: var(--accent); margin-top: 20px;">System Requirements</h3>
+                <ul style="line-height: 1.8;">
+                    <li><strong>Python:</strong> 3.7 or higher</li>
+                    <li><strong>Caddy:</strong> v2.x (latest stable recommended)</li>
+                    <li><strong>PHP (optional):</strong> PHP-CGI for PHP website support</li>
+                    <li><strong>Operating System:</strong> Windows (Linux/macOS with minor modifications)</li>
+                </ul>
+
+                <h3 style="color: var(--accent); margin-top: 20px;">Security Best Practices</h3>
+                <ul style="line-height: 1.8;">
+                    <li>Change default admin password immediately</li>
+                    <li>Enable Enhanced Security Mode for production</li>
+                    <li>Enable 2FA for all user accounts</li>
+                    <li>Use strong, unique passwords (min 8 characters with complexity)</li>
+                    <li>Regular backups of caddy_manager.db</li>
+                    <li>Keep CaddyMAN and Caddy updated to latest versions</li>
+                    <li>Restrict management interface to trusted networks</li>
+                </ul>
+            </div>
+        </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Modals -->
+    
+    <!-- Proxy Modal -->
+    <div id="proxy-modal" class="modal">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h2 id="proxy-modal-title">Add Reverse Proxy</h2>
+                <button class="close-btn" onclick="closeProxyModal()">×</button>
+            </div>
+            <div class="toggle-group">
+                <div class="toggle-btn active" onclick="toggleProxyMode('simple')">Simple</div>
+                <div class="toggle-btn" onclick="toggleProxyMode('advanced')">Advanced</div>
+            </div>
+            <div id="proxy-simple-form">
+                <div class="form-group">
+                    <label>Domain(s) - Comma-separated or leave empty</label>
+                    <input type="text" id="proxy-domain" placeholder="example.com, www.example.com">
+                </div>
+                <div class="form-group">
+                    <label>Listen Ports (HTTP) - comma-separated</label>
+                    <input type="text" id="proxy-http-ports" placeholder="80, 8080" value="80">
+                    <small style="color: var(--text-secondary); font-size: 12px;">Ports for HTTP (no TLS)</small>
+                </div>
+                <div class="form-group">
+                    <label>Listen Ports (HTTPS) - comma-separated</label>
+                    <input type="text" id="proxy-https-ports" placeholder="443, 8443">
+                    <small style="color: var(--text-secondary); font-size: 12px;">Ports for HTTPS (with TLS)</small>
+                </div>
+                <div class="form-group">
+                    <label>Upstream (Target)</label>
+                    <input type="text" id="proxy-upstream" placeholder="localhost:3000">
+                </div>
+                <div class="form-group">
+                    <label>Load Balancing</label>
+                    <select id="proxy-load-balance">
+                        <option value="">None</option>
+                        <option value="random">Random</option>
+                        <option value="round_robin">Round Robin</option>
+                        <option value="least_conn">Least Connections</option>
+                        <option value="ip_hash">IP Hash</option>
+                    </select>
+                </div>
+                <div class="form-group">
+                    <label>Custom Host Header</label>
+                    <input type="text" id="proxy-header-host" placeholder="Optional">
+                </div>
+                <div class="form-group">
+                    <label>Custom Headers (JSON)</label>
+                    <textarea id="proxy-custom-headers" placeholder='{"X-Custom": "value"}'></textarea>
+                </div>
+                <div class="form-group">
+                    <label>Access Control (Groups)</label>
+                    <div id="proxy-access-groups"></div>
+                </div>
+                <div class="form-group">
+                    <div class="checkbox-wrapper">
+                        <input type="checkbox" id="proxy-websocket">
+                        <label>WebSocket Support</label>
+                    </div>
+                </div>
+                <div class="form-group">
+                    <div class="checkbox-wrapper">
+                        <input type="checkbox" id="proxy-remove-origin">
+                        <label>Remove Origin Header</label>
+                    </div>
+                </div>
+                <div class="form-group">
+                    <div class="checkbox-wrapper">
+                        <input type="checkbox" id="proxy-remove-referer">
+                        <label>Remove Referer Header</label>
+                    </div>
+                </div>
+                <div class="form-group">
+                    <div class="checkbox-wrapper">
+                        <input type="checkbox" id="proxy-auto-https">
+                        <label>Auto HTTP → HTTPS Redirect (default would be port 80 to 443)</label>
+                    </div>
+                </div>
+                <div class="form-group">
+                    <div class="checkbox-wrapper">
+                        <input type="checkbox" id="proxy-enabled" checked>
+                        <label>Enabled</label>
+                    </div>
+                </div>
+            </div>
+            <div id="proxy-advanced-form" class="hidden">
+                <div class="form-group">
+                    <label>Domain(s)</label>
+                    <input type="text" id="proxy-domain-adv">
+                </div>
+                <div class="form-group">
+                    <label>Listen Ports (HTTP) - comma-separated</label>
+                    <input type="text" id="proxy-http-ports-adv" placeholder="80" value="80">
+                </div>
+                <div class="form-group">
+                    <label>Listen Ports (HTTPS) - comma-separated</label>
+                    <input type="text" id="proxy-https-ports-adv" placeholder="443">
+                </div>
+                <div class="form-group">
+                    <label>Advanced Config (JSON)</label>
+                    <textarea id="proxy-advanced"></textarea>
+                </div>
+                <div class="form-group">
+                    <div class="checkbox-wrapper">
+                        <input type="checkbox" id="proxy-enabled-adv" checked>
+                        <label>Enabled</label>
+                    </div>
+                </div>
+            </div>
+            <button class="btn btn-primary" onclick="saveProxy()">Save</button>
+        </div>
+    </div>
+    
+    <!-- Website Modal -->
+    <div id="website-modal" class="modal">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h2 id="website-modal-title">Add Website</h2>
+                <button class="close-btn" onclick="closeWebsiteModal()">×</button>
+            </div>
+            <div class="toggle-group">
+                <div class="toggle-btn active" onclick="toggleWebsiteMode('simple')">Simple</div>
+                <div class="toggle-btn" onclick="toggleWebsiteMode('advanced')">Advanced</div>
+            </div>
+            <div id="website-simple-form">
+                <div class="form-group">
+                    <label>Domain(s) - Comma-separated or leave empty</label>
+                    <input type="text" id="website-domain" placeholder="example.com">
+                </div>
+                <div class="form-group">
+                    <label>Listen Ports (HTTP) - comma-separated</label>
+                    <input type="text" id="website-http-ports" placeholder="80, 8080" value="80">
+                    <small style="color: var(--text-secondary); font-size: 12px;">Ports for HTTP (no TLS)</small>
+                </div>
+                <div class="form-group">
+                    <label>Listen Ports (HTTPS) - comma-separated</label>
+                    <input type="text" id="website-https-ports" placeholder="443, 8443">
+                    <small style="color: var(--text-secondary); font-size: 12px;">Ports for HTTPS (with TLS)</small>
+                </div>
+                <div class="form-group">
+                    <label>Root Directory</label>
+                    <input type="text" id="website-root" placeholder="./www">
+                </div>
+                <div class="form-group">
+                    <label>Index Files (comma-separated)</label>
+                    <input type="text" id="website-index" value="index.html">
+                </div>
+                <div class="form-group" >
+                    <label>Access Control (Groups)</label>
+                    <div id="website-access-groups"></div>
+                </div>
+                <div class="form-group">
+                    <div class="checkbox-wrapper">
+                        <input type="checkbox" id="website-auto-https">
+                        <label>Auto HTTP → HTTPS Redirect (upgrades port 80 to 443)</label>
+                    </div>
+                </div>
+                <div class="form-group">
+                    <div class="checkbox-wrapper">
+                        <input type="checkbox" id="website-php-enabled">
+                        <label>Enable PHP Support (requires PHP configured in settings)</label>
+                    </div>
+                </div>
+                <div class="form-group">
+                    <div class="checkbox-wrapper">
+                        <input type="checkbox" id="website-enabled" checked>
+                        <label>Enabled</label>
+                    </div>
+                </div>
+            </div>
+            <div id="website-advanced-form" class="hidden">
+                <div class="form-group">
+                    <label>Domain(s)</label>
+                    <input type="text" id="website-domain-adv">
+                </div>
+                <div class="form-group">
+                    <label>Listen Ports (HTTP) - comma-separated</label>
+                    <input type="text" id="website-http-ports-adv" placeholder="80" value="80">
+                </div>
+                <div class="form-group">
+                    <label>Listen Ports (HTTPS) - comma-separated</label>
+                    <input type="text" id="website-https-ports-adv" placeholder="443">
+                </div>
+                <div class="form-group">
+                    <label>Advanced Config (JSON)</label>
+                    <textarea id="website-advanced"></textarea>
+                </div>
+                <div class="form-group">
+                    <div class="checkbox-wrapper">
+                        <input type="checkbox" id="website-enabled-adv" checked>
+                        <label>Enabled</label>
+                    </div>
+                </div>
+            </div>
+            <button class="btn btn-primary" onclick="saveWebsite()">Save</button>
+        </div>
+    </div>
+    
+    <!-- User Modal -->
+    <div id="user-modal" class="modal">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h2 id="user-modal-title">Add User</h2>
+                <button class="close-btn" onclick="closeUserModal()">×</button>
+            </div>
+            <form onsubmit="event.preventDefault(); saveUser(); return false;">
+                <div class="form-group">
+                    <label>Username</label>
+                    <input type="text" id="user-username" placeholder="username" autocomplete="username">
+                </div>
+                <div class="form-group">
+                    <label>Password</label>
+                    <input type="password" id="user-password" placeholder="Leave empty to keep current" autocomplete="new-password">
+                </div>
+                <div class="form-group" >
+                    <label>Groups</label>
+                    <div id="user-groups"></div>
+                </div>
+
+                <!-- 2FA Section (only visible when editing existing user and Enhanced Security enabled) -->
+                <div id="user-2fa-section" class="hidden" style="margin-top: 20px; padding-top: 20px; border-top: 1px solid var(--border);">
+                    <h3>Two-Factor Authentication (2FA)</h3>
+                    <div id="user-2fa-status" style="margin-bottom: 15px;">
+                        <strong>Status:</strong> <span id="user-2fa-enabled-text">Disabled</span>
+                    </div>
+
+                    <!-- Enable 2FA Flow -->
+                    <div id="user-2fa-enable-section" class="hidden">
+                        <button type="button" class="btn btn-secondary" onclick="enable2FA()" style="margin-bottom: 15px;">Enable 2FA</button>
+                    </div>
+
+                    <!-- QR Code Display -->
+                    <div id="user-2fa-qr-section" class="hidden">
+                        <p>Scan this QR code with Google Authenticator or any TOTP app:</p>
+                        <div style="text-align: center; margin: 15px 0;">
+                            <img id="user-2fa-qr-code" src="" alt="QR Code" style="max-width: 250px; border: 1px solid var(--border); padding: 10px; background: white;">
+                        </div>
+                        <div class="form-group">
+                            <label>Enter 6-digit code from your authenticator app:</label>
+                            <input type="text" id="user-2fa-token" placeholder="000000" maxlength="6" pattern="[0-9]{6}" style="width: 150px; text-align: center; font-size: 18px; letter-spacing: 5px;" autocomplete="off">
+                        </div>
+                        <button type="button" class="btn btn-primary" onclick="verify2FA()">Verify and Enable</button>
+                        <button type="button" class="btn btn-secondary" onclick="cancel2FASetup()" style="margin-left: 10px;">Cancel</button>
+                    </div>
+
+                    <!-- Disable 2FA -->
+                    <div id="user-2fa-disable-section" class="hidden">
+                        <p style="color: var(--success); margin-bottom: 10px;">✓ Two-factor authentication is enabled</p>
+                        <button type="button" class="btn btn-danger" onclick="disable2FA()">Disable 2FA</button>
+                    </div>
+                </div>
+
+                <button type="submit" class="btn btn-primary">Save</button>
+            </form>
+        </div>
+    </div>
+    
+    <!-- Group Modal -->
+    <div id="group-modal" class="modal">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h2 id="group-modal-title">Add Group</h2>
+                <button class="close-btn" onclick="closeGroupModal()">×</button>
+            </div>
+            <div class="form-group">
+                <label>Name</label>
+                <input type="text" id="group-name" placeholder="Group name">
+            </div>
+            <div class="form-group">
+                <label>Description</label>
+                <textarea id="group-description" placeholder="Optional description"></textarea>
+            </div>
+            <button class="btn btn-primary" onclick="saveGroup()">Save</button>
+        </div>
+    </div>
+
+     <script src="/static/script.js?v=1.2.12">    </script>
+</body>
+</html>

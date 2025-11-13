@@ -1,0 +1,142 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Login Required</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            background: #1a1a1a;
+            color: #e0e0e0;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            min-height: 100vh;
+        }
+        .container {
+            background: #252525;
+            border: 1px solid #3a3a3a;
+            border-radius: 12px;
+            padding: 40px;
+            width: 400px;
+            max-width: 90%;
+        }
+        h1 {
+            color: #3b82f6;
+            margin-bottom: 10px;
+            font-size: 24px;
+        }
+        p {
+            color: #a0a0a0;
+            margin-bottom: 30px;
+        }
+        .form-group {
+            margin-bottom: 20px;
+        }
+        label {
+            display: block;
+            margin-bottom: 8px;
+            color: #a0a0a0;
+            font-weight: 500;
+        }
+        input {
+            width: 100%;
+            padding: 12px;
+            border: 1px solid #3a3a3a;
+            border-radius: 6px;
+            background: #2d2d2d;
+            color: #e0e0e0;
+            font-size: 14px;
+        }
+        button {
+            width: 100%;
+            padding: 12px;
+            border: none;
+            border-radius: 6px;
+            background: #3b82f6;
+            color: white;
+            font-size: 16px;
+            font-weight: 500;
+            cursor: pointer;
+        }
+        button:hover {
+            background: #2563eb;
+        }
+        .error {
+            background: rgba(239, 68, 68, 0.2);
+            color: #ef4444;
+            border: 1px solid #ef4444;
+            padding: 12px;
+            border-radius: 6px;
+            margin-bottom: 20px;
+            display: none;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>🔐 Authentication Required</h1>
+        <p>Please log in to access this content.</p>
+        <div id="error" class="error"></div>
+        <form id="loginForm" onsubmit="login(event)">
+            <div class="form-group">
+                <label>Username</label>
+                <input type="text" id="username" required autofocus>
+            </div>
+            <div class="form-group">
+                <label>Password</label>
+                <input type="password" id="password" required>
+            </div>
+            <button type="submit">Login</button>
+        </form>
+    </div>
+
+    <script>
+        async function login(event) {
+            event.preventDefault();
+
+            const username = document.getElementById('username').value;
+            const password = document.getElementById('password').value;
+            const errorDiv = document.getElementById('error');
+
+            // Get the redirect URL from query parameter or use root
+            const urlParams = new URLSearchParams(window.location.search);
+            const redirectUrl = urlParams.get('redirect') || '/';
+
+            try {
+                const response = await fetch('/api/website-auth/validate', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({
+                        username: username,
+                        password: password,
+                        original_url: redirectUrl
+                    })
+                });
+
+                if (!response.ok) {
+                    const error = await response.json();
+                    errorDiv.textContent = error.detail || 'Login failed';
+                    errorDiv.style.display = 'block';
+                    return;
+                }
+
+                const data = await response.json();
+
+                if (data.requires_2fa) {
+                    // Redirect to 2FA challenge page with original redirect URL
+                    window.location.href = `/auth/2fa-challenge?challenge_id=${data.challenge_id}&redirect=${encodeURIComponent(redirectUrl)}`;
+                } else {
+                    // Set session cookie and redirect to original page
+                    document.cookie = `website_session=${data.session_id}; path=/; max-age=86400; SameSite=Lax`;
+                    window.location.href = redirectUrl;
+                }
+            } catch (err) {
+                errorDiv.textContent = 'An error occurred. Please try again.';
+                errorDiv.style.display = 'block';
+            }
+        }
+    </script>
+</body>
+</html>
