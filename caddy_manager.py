@@ -979,7 +979,6 @@ async def send_notification(title: str, message: str, notification_type: str = "
                     headers["X-Click"] = f"http://{hostname}:8000"
 
                 # Send message as plain text body to ntfy
-                # ntfy URL already includes topic (e.g., https://notify.jvr.nz/issues)
                 await client.post(
                     settings["notification_url"],
                     content=message.encode('utf-8'),
