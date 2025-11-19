@@ -333,6 +333,7 @@ async function loadSettings() {
     document.getElementById('php-enabled').checked = data.php_enabled || false;
     document.getElementById('php-path').value = data.php_path || '';
     document.getElementById('manager-port').value = data.manager_port || 8000;
+    document.getElementById('caddy-admin-port').value = data.caddy_admin_port || 12999;
     document.getElementById('enhanced-security').checked = data.enhanced_security || false;
     document.getElementById('caddy-log-level').value = data.caddy_log_level || 'WARN';
     document.body.className = data.theme;
@@ -358,6 +359,7 @@ async function saveSettings() {
         php_enabled: document.getElementById('php-enabled').checked,
         php_path: document.getElementById('php-path').value,
         manager_port: parseInt(document.getElementById('manager-port').value),
+        caddy_admin_port: parseInt(document.getElementById('caddy-admin-port').value),
         enhanced_security: document.getElementById('enhanced-security').checked,
         caddy_log_level: document.getElementById('caddy-log-level').value
     };
@@ -823,6 +825,23 @@ async function loadProxies() {
     }).join('');
 }
 
+function toggleLoadBalancingVisibility() {
+    const upstreamInput = document.getElementById('proxy-upstream');
+    const loadBalanceGroup = document.getElementById('proxy-load-balance-group');
+
+    if (!upstreamInput || !loadBalanceGroup) return;
+
+    const upstreamValue = upstreamInput.value.trim();
+    // Check if there are multiple upstreams (contains comma)
+    const hasMultipleUpstreams = upstreamValue.includes(',');
+
+    if (hasMultipleUpstreams) {
+        loadBalanceGroup.classList.remove('hidden');
+    } else {
+        loadBalanceGroup.classList.add('hidden');
+    }
+}
+
 function openProxyModal() {
     editingProxyId = null;
     document.getElementById('proxy-modal-title').textContent = 'Add Reverse Proxy';
@@ -832,13 +851,22 @@ function openProxyModal() {
     document.getElementById('proxy-upstream').value = '';
     document.getElementById('proxy-load-balance').value = '';
     document.getElementById('proxy-header-host').value = '';
-    document.getElementById('proxy-custom-headers').value = '';
     document.getElementById('proxy-websocket').checked = false;
     document.getElementById('proxy-remove-origin').checked = false;
     document.getElementById('proxy-remove-referer').checked = false;
     document.getElementById('proxy-auto-https').checked = false;
     document.getElementById('proxy-enabled').checked = true;
+    document.getElementById('proxy-additional-directives').value = '';
     renderGroupSelector('proxy-access-groups', []);
+
+    // Hide load balancing initially (no upstream entered yet)
+    document.getElementById('proxy-load-balance-group').classList.add('hidden');
+
+    // Add event listener to upstream input
+    const upstreamInput = document.getElementById('proxy-upstream');
+    upstreamInput.removeEventListener('input', toggleLoadBalancingVisibility); // Remove old listener if exists
+    upstreamInput.addEventListener('input', toggleLoadBalancingVisibility);
+
     document.getElementById('proxy-modal').classList.add('active');
 }
 
@@ -846,11 +874,20 @@ function closeProxyModal() {
     document.getElementById('proxy-modal').classList.remove('active');
 }
 
-function toggleProxyMode(mode) {
+function toggleProxyMode(mode, event) {
     currentProxyMode = mode;
     document.querySelectorAll('#proxy-modal .toggle-btn').forEach(btn => btn.classList.remove('active'));
-    event.target.classList.add('active');
-    
+
+    // If called programmatically without event, find and activate the correct button
+    if (event && event.target) {
+        event.target.classList.add('active');
+    } else {
+        const buttonToActivate = document.querySelector(`#proxy-modal .toggle-btn[onclick*="${mode}"]`);
+        if (buttonToActivate) {
+            buttonToActivate.classList.add('active');
+        }
+    }
+
     if (mode === 'simple') {
         document.getElementById('proxy-simple-form').classList.remove('hidden');
         document.getElementById('proxy-advanced-form').classList.add('hidden');
@@ -864,7 +901,6 @@ async function saveProxy() {
     try {
         let proxy;
         if (currentProxyMode === 'simple') {
-            const customHeaders = document.getElementById('proxy-custom-headers').value.trim();
             const domainInput = document.getElementById('proxy-domain').value.trim();
             if (!domainInput) {
                 showAlert('Domain(s) are required for reverse proxy', 'error');
@@ -894,38 +930,38 @@ async function saveProxy() {
                 upstream: document.getElementById('proxy-upstream').value,
                 load_balance: document.getElementById('proxy-load-balance').value || null,
                 header_up_host: document.getElementById('proxy-header-host').value || null,
-                custom_headers: customHeaders ? JSON.parse(customHeaders) : null,
                 websocket: document.getElementById('proxy-websocket').checked,
                 remove_origin: document.getElementById('proxy-remove-origin').checked,
                 remove_referer: document.getElementById('proxy-remove-referer').checked,
                 auto_https: document.getElementById('proxy-auto-https').checked,
                 enabled: document.getElementById('proxy-enabled').checked,
+                additional_directives: document.getElementById('proxy-additional-directives').value.trim(),
                 access_groups: accessGroups
             };
         } else {
-            const advancedJson = document.getElementById('proxy-advanced').value;
-            const domainInput = document.getElementById('proxy-domain-adv').value.trim();
-            if (!domainInput) {
-                showAlert('Domain(s) are required for reverse proxy', 'error');
+            // Advanced mode - all config is in the JSON
+            const advancedJson = document.getElementById('proxy-advanced').value.trim();
+            if (!advancedJson) {
+                showAlert('Caddy JSON configuration is required in advanced mode', 'error');
                 return;
             }
-            const domains = domainInput ? domainInput.split(',').map(d => d.trim()).filter(d => d) : [];
 
-            // Parse port strings for advanced mode
-            const httpPortsInput = document.getElementById('proxy-http-ports-adv').value.trim();
-            const httpsPortsInput = document.getElementById('proxy-https-ports-adv').value.trim();
-
-            const http_ports = httpPortsInput ? httpPortsInput.split(',').map(p => parseInt(p.trim())).filter(p => !isNaN(p)) : [80];
-            const https_ports = httpsPortsInput ? httpsPortsInput.split(',').map(p => parseInt(p.trim())).filter(p => !isNaN(p)) : [];
+            let advancedConfig;
+            try {
+                advancedConfig = JSON.parse(advancedJson);
+            } catch (e) {
+                showAlert('Invalid JSON in advanced configuration: ' + e.message, 'error');
+                return;
+            }
 
             proxy = {
                 id: editingProxyId || 'proxy_' + Date.now(),
-                domains: domains,
-                http_ports: http_ports,
-                https_ports: https_ports,
-                upstream: '',
+                domains: [],  // Defined in JSON
+                http_ports: [],  // Defined in JSON
+                https_ports: [],  // Defined in JSON
+                upstream: '',  // Defined in JSON
                 enabled: document.getElementById('proxy-enabled-adv').checked,
-                advanced: JSON.parse(advancedJson),
+                advanced: advancedConfig,
                 access_groups: []
             };
         }
@@ -953,30 +989,7 @@ async function editProxy(id) {
 
     if (proxy.advanced) {
         toggleProxyMode('advanced');
-        document.getElementById('proxy-domain-adv').value = (proxy.domains || []).join(', ');
-
-        // Handle port arrays - check for new format first, then fall back to legacy
-        let http_ports, https_ports;
-        if (proxy.http_ports || proxy.https_ports) {
-            // New format
-            http_ports = proxy.http_ports || [];
-            https_ports = proxy.https_ports || [];
-        } else if (proxy.listen_port !== undefined) {
-            // Legacy format
-            if (proxy.tls) {
-                http_ports = [];
-                https_ports = [proxy.listen_port];
-            } else {
-                http_ports = [proxy.listen_port];
-                https_ports = [];
-            }
-        } else {
-            http_ports = [80];
-            https_ports = [];
-        }
-
-        document.getElementById('proxy-http-ports-adv').value = http_ports.join(', ');
-        document.getElementById('proxy-https-ports-adv').value = https_ports.join(', ');
+        // Advanced mode - all config is in the JSON, just load it
         document.getElementById('proxy-advanced').value = JSON.stringify(proxy.advanced, null, 2);
         document.getElementById('proxy-enabled-adv').checked = proxy.enabled;
     } else {
@@ -1007,13 +1020,19 @@ async function editProxy(id) {
         document.getElementById('proxy-upstream').value = proxy.upstream;
         document.getElementById('proxy-load-balance').value = proxy.load_balance || '';
         document.getElementById('proxy-header-host').value = proxy.header_up_host || '';
-        document.getElementById('proxy-custom-headers').value = proxy.custom_headers ? JSON.stringify(proxy.custom_headers, null, 2) : '';
         document.getElementById('proxy-websocket').checked = proxy.websocket || false;
         document.getElementById('proxy-remove-origin').checked = proxy.remove_origin || false;
         document.getElementById('proxy-remove-referer').checked = proxy.remove_referer || false;
         document.getElementById('proxy-auto-https').checked = proxy.auto_https || false;
         document.getElementById('proxy-enabled').checked = proxy.enabled;
+        document.getElementById('proxy-additional-directives').value = proxy.additional_directives || '';
         renderGroupSelector('proxy-access-groups', proxy.access_groups || []);
+
+        // Add event listener to upstream input and toggle visibility
+        const upstreamInput = document.getElementById('proxy-upstream');
+        upstreamInput.removeEventListener('input', toggleLoadBalancingVisibility);
+        upstreamInput.addEventListener('input', toggleLoadBalancingVisibility);
+        toggleLoadBalancingVisibility(); // Check initial state
     }
 
     document.getElementById('proxy-modal').classList.add('active');
@@ -1111,11 +1130,20 @@ function closeWebsiteModal() {
     document.getElementById('website-modal').classList.remove('active');
 }
 
-function toggleWebsiteMode(mode) {
+function toggleWebsiteMode(mode, event) {
     currentWebsiteMode = mode;
     document.querySelectorAll('#website-modal .toggle-btn').forEach(btn => btn.classList.remove('active'));
-    event.target.classList.add('active');
-    
+
+    // If called programmatically without event, find and activate the correct button
+    if (event && event.target) {
+        event.target.classList.add('active');
+    } else {
+        const buttonToActivate = document.querySelector(`#website-modal .toggle-btn[onclick*="${mode}"]`);
+        if (buttonToActivate) {
+            buttonToActivate.classList.add('active');
+        }
+    }
+
     if (mode === 'simple') {
         document.getElementById('website-simple-form').classList.remove('hidden');
         document.getElementById('website-advanced-form').classList.add('hidden');
@@ -1156,25 +1184,29 @@ async function saveWebsite() {
                 access_groups: accessGroups
             };
         } else {
-            const advancedJson = document.getElementById('website-advanced').value;
-            const domainInput = document.getElementById('website-domain-adv').value.trim();
-            const domains = domainInput ? domainInput.split(',').map(d => d.trim()).filter(d => d) : [];
+            // Advanced mode - all config is in the JSON
+            const advancedJson = document.getElementById('website-advanced').value.trim();
+            if (!advancedJson) {
+                showAlert('Caddy JSON configuration is required in advanced mode', 'error');
+                return;
+            }
 
-            // Parse port strings for advanced mode
-            const httpPortsInput = document.getElementById('website-http-ports-adv').value.trim();
-            const httpsPortsInput = document.getElementById('website-https-ports-adv').value.trim();
-
-            const http_ports = httpPortsInput ? httpPortsInput.split(',').map(p => parseInt(p.trim())).filter(p => !isNaN(p)) : [80];
-            const https_ports = httpsPortsInput ? httpsPortsInput.split(',').map(p => parseInt(p.trim())).filter(p => !isNaN(p)) : [];
+            let advancedConfig;
+            try {
+                advancedConfig = JSON.parse(advancedJson);
+            } catch (e) {
+                showAlert('Invalid JSON in advanced configuration: ' + e.message, 'error');
+                return;
+            }
 
             website = {
                 id: editingWebsiteId || 'website_' + Date.now(),
-                domains: domains,
-                http_ports: http_ports,
-                https_ports: https_ports,
+                domains: [],  // Defined in JSON
+                http_ports: [],  // Defined in JSON
+                https_ports: [],  // Defined in JSON
                 root: '',
                 enabled: document.getElementById('website-enabled-adv').checked,
-                advanced: JSON.parse(advancedJson),
+                advanced: advancedConfig,
                 access_groups: []
             };
         }
@@ -1205,33 +1237,13 @@ async function editWebsite(id) {
 
     if (website.advanced) {
         toggleWebsiteMode('advanced');
-        document.getElementById('website-domain-adv').value = (website.domains || []).join(', ');
-
-        // Handle port arrays - check for new format first, then fall back to legacy
-        let http_ports, https_ports;
-        if (website.http_ports || website.https_ports) {
-            // New format
-            http_ports = website.http_ports || [];
-            https_ports = website.https_ports || [];
-        } else if (website.listen_port !== undefined) {
-            // Legacy format
-            if (website.tls) {
-                http_ports = [];
-                https_ports = [website.listen_port];
-            } else {
-                http_ports = [website.listen_port];
-                https_ports = [];
-            }
-        } else {
-            http_ports = [80];
-            https_ports = [];
-        }
-
-        document.getElementById('website-http-ports-adv').value = http_ports.join(', ');
-        document.getElementById('website-https-ports-adv').value = https_ports.join(', ');
+        // Advanced mode - all config is in the JSON, just load it
         document.getElementById('website-advanced').value = JSON.stringify(website.advanced, null, 2);
         document.getElementById('website-enabled-adv').checked = website.enabled;
     } else {
+        toggleWebsiteMode('simple');
+        // Clear advanced textarea to prevent showing old data
+        document.getElementById('website-advanced').value = '';
         document.getElementById('website-domain').value = (website.domains || []).join(', ');
 
         // Handle port arrays - check for new format first, then fall back to legacy

@@ -33,7 +33,7 @@ import re
 import sqlite3
 from contextlib import closing
 
-VERSION = "1.2.11"
+VERSION = "1.2.18"
 
 def resource_path(relative_path):
     """Get absolute path to resource, works for dev and PyInstaller"""
@@ -43,9 +43,45 @@ def resource_path(relative_path):
     except AttributeError:
         base_path = os.path.abspath(".")
     return os.path.join(base_path, relative_path)
-UPDATE_CHECK_URL = "" 
 
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+def get_permanent_caddy_path():
+    """Copy caddy.exe to a permanent location to avoid firewall issues with PyInstaller's temp folders"""
+    if platform.system() != "Windows":
+        return "caddy"  # On Linux/Mac, use system caddy
+
+    # Define permanent location in the same directory as the database
+    permanent_caddy = os.path.join(os.path.abspath("."), "caddy.exe")
+
+    # If running from PyInstaller bundle, copy caddy.exe to permanent location
+    try:
+        bundled_caddy = resource_path("caddy.exe")
+        # Only copy if source is different (i.e., we're in a PyInstaller bundle)
+        if bundled_caddy != permanent_caddy and os.path.exists(bundled_caddy):
+            import shutil
+            shutil.copy2(bundled_caddy, permanent_caddy)
+            logger.info(f"Copied caddy.exe to permanent location: {permanent_caddy}")
+    except Exception as e:
+        logger.warning(f"Could not copy caddy.exe to permanent location: {e}")
+
+    # Return permanent path if it exists, otherwise fall back to bundled
+    if os.path.exists(permanent_caddy):
+        return permanent_caddy
+    return resource_path("caddy.exe")
+UPDATE_CHECK_URL = ""
+
+# Ensure logs directory exists before setting up logging
+LOG_DIR = "logs"
+Path(LOG_DIR).mkdir(exist_ok=True)
+
+# Configure logging to write to logs/app.log
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler(os.path.join(LOG_DIR, 'app.log')),
+        logging.StreamHandler()  # Also output to console
+    ]
+)
 logger = logging.getLogger(__name__)
 
 @asynccontextmanager
@@ -135,13 +171,11 @@ static_dir = resource_path("app")
 # Mount /static to serve CSS/JS/etc
 app.mount("/static", StaticFiles(directory=static_dir), name="static")
 
-CADDY_ADMIN_URL = "http://localhost:2019"
-# Use resource_path for caddy.exe to work with PyInstaller
-CADDY_BIN = os.getenv("CADDY_BIN", resource_path("caddy.exe") if platform.system() == "Windows" else "caddy")
+# CADDY_ADMIN_URL is now dynamic based on settings, see get_caddy_admin_url()
+# Use get_permanent_caddy_path() to avoid Windows Firewall issues with PyInstaller temp folders
+CADDY_BIN = os.getenv("CADDY_BIN", get_permanent_caddy_path())
 CONFIG_FILE = "caddy_manager_config.json"
 DB_FILE = "caddy_manager.db"
-BACKUP_DIR = "config_backups"
-LOG_DIR = "logs"
 
 caddy_process = None
 php_cgi_process = None
@@ -157,9 +191,6 @@ activity_log = []  # Store recent activity
 MAX_ACTIVITY_LOG = 100  # Keep last 100 activities
 failed_login_attempts = {}  # Track failed login attempts by IP
 pending_2fa_challenges = {}  # Track pending 2FA challenges {challenge_id: {username, expires, original_url}}
-
-Path(BACKUP_DIR).mkdir(exist_ok=True)
-Path(LOG_DIR).mkdir(exist_ok=True)
 
 # Load last restart time from database (persists across reboots)
 def load_last_restart_time():
@@ -220,7 +251,7 @@ default_settings = {
     "notification_service": "", "notification_url": "", "notification_token": "",
     "php_enabled": False, "php_path": "",
     "manager_port": 8000, "enhanced_security": False,
-    "caddy_log_level": "WARN"
+    "caddy_log_level": "WARN", "caddy_admin_port": 12999
 }
 
 # Models
@@ -238,6 +269,7 @@ class Settings(BaseModel):
     manager_port: int = Field(default=8000, ge=1, le=65535)
     enhanced_security: bool = False
     caddy_log_level: str = "WARN"
+    caddy_admin_port: int = Field(default=12999, ge=1, le=65535)
 
     @field_validator('php_path')
     @classmethod
@@ -497,12 +529,21 @@ def init_database():
                 enabled INTEGER DEFAULT 1,
                 access_groups TEXT,
                 advanced TEXT,
+                additional_directives TEXT,
                 listen_port INTEGER,
                 tls TEXT,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         ''')
+
+        # Migration: Add additional_directives column if it doesn't exist
+        try:
+            cursor.execute("ALTER TABLE reverse_proxies ADD COLUMN additional_directives TEXT")
+            logger.info("Added additional_directives column to reverse_proxies table")
+        except sqlite3.OperationalError:
+            # Column already exists
+            pass
 
         # Create indexes
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_username ON users(username)')
@@ -610,6 +651,12 @@ def save_settings_to_db(settings: dict):
             ''', (key, json.dumps(value) if not isinstance(value, str) else value))
         conn.commit()
 
+def get_caddy_admin_url():
+    """Get the Caddy admin URL from settings"""
+    settings = get_settings_from_db()
+    port = settings.get("caddy_admin_port", 12999)
+    return f"http://localhost:{port}"
+
 # Groups database functions
 def get_all_groups_from_db():
     """Get all groups from database"""
@@ -679,7 +726,7 @@ def get_all_websites_from_db():
                 'index_files': json.loads(row['index_files']) if row['index_files'] else [],
                 'access_groups': json.loads(row['access_groups']) if row['access_groups'] else [],
                 'php_enabled': bool(row['php_enabled']),
-                'advanced': row['advanced'],
+                'advanced': json.loads(row['advanced']) if row['advanced'] else None,
                 'listen_port': row['listen_port'],
                 'tls': row['tls']
             })
@@ -703,7 +750,7 @@ def get_website_by_id_from_db(website_id: str):
                 'index_files': json.loads(row['index_files']) if row['index_files'] else [],
                 'access_groups': json.loads(row['access_groups']) if row['access_groups'] else [],
                 'php_enabled': bool(row['php_enabled']),
-                'advanced': row['advanced'],
+                'advanced': json.loads(row['advanced']) if row['advanced'] else None,
                 'listen_port': row['listen_port'],
                 'tls': row['tls']
             }
@@ -729,7 +776,7 @@ def save_website_to_db(website: dict):
             json.dumps(website.get('index_files', [])),
             json.dumps(website.get('access_groups', [])),
             int(website.get('php_enabled', False)),
-            website.get('advanced'),
+            json.dumps(website.get('advanced')) if website.get('advanced') else None,
             website.get('listen_port'),
             website.get('tls')
         ))
@@ -755,12 +802,14 @@ def get_all_proxies_from_db():
                 'id': row['id'],
                 'domains': json.loads(row['domains']) if row['domains'] else [],
                 'target': row['target'],
+                'upstream': row['target'],  # Alias for frontend compatibility
                 'http_ports': json.loads(row['http_ports']) if row['http_ports'] else [],
                 'https_ports': json.loads(row['https_ports']) if row['https_ports'] else [],
                 'auto_https': bool(row['auto_https']),
                 'enabled': bool(row['enabled']),
                 'access_groups': json.loads(row['access_groups']) if row['access_groups'] else [],
-                'advanced': row['advanced'],
+                'advanced': json.loads(row['advanced']) if row['advanced'] else None,
+                'additional_directives': row['additional_directives'] if 'additional_directives' in row.keys() else '',
                 'listen_port': row['listen_port'],
                 'tls': row['tls']
             })
@@ -777,12 +826,14 @@ def get_proxy_by_id_from_db(proxy_id: str):
                 'id': row['id'],
                 'domains': json.loads(row['domains']) if row['domains'] else [],
                 'target': row['target'],
+                'upstream': row['target'],  # Alias for frontend compatibility
                 'http_ports': json.loads(row['http_ports']) if row['http_ports'] else [],
                 'https_ports': json.loads(row['https_ports']) if row['https_ports'] else [],
                 'auto_https': bool(row['auto_https']),
                 'enabled': bool(row['enabled']),
                 'access_groups': json.loads(row['access_groups']) if row['access_groups'] else [],
-                'advanced': row['advanced'],
+                'advanced': json.loads(row['advanced']) if row['advanced'] else None,
+                'additional_directives': row['additional_directives'] if 'additional_directives' in row.keys() else '',
                 'listen_port': row['listen_port'],
                 'tls': row['tls']
             }
@@ -792,21 +843,26 @@ def save_proxy_to_db(proxy: dict):
     """Save/update a reverse proxy in database"""
     with closing(get_db_connection()) as conn:
         cursor = conn.cursor()
+
+        # Handle both 'upstream' (from frontend) and 'target' (from database)
+        target = proxy.get('target') or proxy.get('upstream')
+
         cursor.execute('''
             INSERT OR REPLACE INTO reverse_proxies
             (id, domains, target, http_ports, https_ports, auto_https, enabled,
-             access_groups, advanced, listen_port, tls, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+             access_groups, advanced, additional_directives, listen_port, tls, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
         ''', (
             proxy['id'],
             json.dumps(proxy.get('domains', [])),
-            proxy['target'],
+            target,
             json.dumps(proxy.get('http_ports', [])),
             json.dumps(proxy.get('https_ports', [])),
             int(proxy.get('auto_https', False)),
             int(proxy.get('enabled', True)),
             json.dumps(proxy.get('access_groups', [])),
-            proxy.get('advanced'),
+            json.dumps(proxy.get('advanced')) if proxy.get('advanced') else None,
+            proxy.get('additional_directives', ''),
             proxy.get('listen_port'),
             proxy.get('tls')
         ))
@@ -830,18 +886,12 @@ def load_config():
     return {"reverse_proxies": [], "websites": [], "groups": []}
 
 def save_config(config):
+    """Save configuration to JSON file (legacy support only - main storage is now SQLite database)"""
     try:
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        backup_file = os.path.join(BACKUP_DIR, f"config_{timestamp}.json")
-        if os.path.exists(CONFIG_FILE):
-            shutil.copy2(CONFIG_FILE, backup_file)
         with tempfile.NamedTemporaryFile('w', delete=False, dir='.') as tmp:
             json.dump(config, tmp, indent=2)
             tmp_name = tmp.name
         shutil.move(tmp_name, CONFIG_FILE)
-        backups = sorted(Path(BACKUP_DIR).glob("config_*.json"))
-        for old_backup in backups[:-10]:
-            old_backup.unlink()
     except Exception as e:
         logger.error(f"Failed to save config: {e}")
         raise
@@ -1164,11 +1214,25 @@ async def start_caddy():
         if caddy_process and caddy_process.returncode is None:
             return {"status": "already_running"}
         try:
+            # Get admin port from settings
+            settings = get_settings_from_db()
+            admin_port = settings.get("caddy_admin_port", 12999)
+
             stdout_log = open(os.path.join(LOG_DIR, "caddy.stdout.log"), "a")
             stderr_log = open(os.path.join(LOG_DIR, "caddy.stderr.log"), "a")
-            caddy_process = await asyncio.create_subprocess_exec(CADDY_BIN, "run", stdout=stdout_log, stderr=stderr_log)
+
+            # Set CADDY_ADMIN environment variable to configure admin endpoint
+            env = os.environ.copy()
+            env["CADDY_ADMIN"] = f"localhost:{admin_port}"
+
+            # Start Caddy with environment variable specifying admin API port
+            caddy_process = await asyncio.create_subprocess_exec(
+                CADDY_BIN, "run",
+                stdout=stdout_log, stderr=stderr_log,
+                env=env
+            )
             caddy_stop_reason = ""  # Clear stop reason on successful start
-            logger.info(f"Caddy started (PID {caddy_process.pid})")
+            logger.info(f"Caddy started (PID {caddy_process.pid}) with admin API on port {admin_port}")
             await asyncio.sleep(2)
             return {"status": "started", "pid": caddy_process.pid}
         except Exception as e:
@@ -1347,7 +1411,13 @@ def build_caddy_config():
                 handler = {"handler": "reverse_proxy", "upstreams": []}
                 upstreams = proxy["upstream"].split(",") if "," in proxy["upstream"] else [proxy["upstream"]]
                 for upstream in upstreams:
-                    handler["upstreams"].append({"dial": upstream.strip()})
+                    # Strip http:// or https:// scheme from upstream - Caddy dial expects host:port only
+                    dial_addr = upstream.strip()
+                    if dial_addr.startswith('http://'):
+                        dial_addr = dial_addr[7:]  # Remove 'http://'
+                    elif dial_addr.startswith('https://'):
+                        dial_addr = dial_addr[8:]  # Remove 'https://'
+                    handler["upstreams"].append({"dial": dial_addr})
                 if proxy.get("load_balance"):
                     handler["load_balancing"] = {"selection_policy": {"policy": proxy["load_balance"]}}
                 if proxy.get("header_up_host") or proxy.get("remove_origin") or proxy.get("remove_referer") or proxy.get("custom_headers"):
@@ -1374,6 +1444,88 @@ def build_caddy_config():
                         "Connection": ["{http.request.header.Connection}"],
                         "Upgrade": ["{http.request.header.Upgrade}"]
                     })
+
+                # Parse additional_directives (raw Caddyfile text) and convert to JSON
+                if proxy.get("additional_directives"):
+                    directives = proxy["additional_directives"].strip()
+                    if directives:
+                        # Parse line by line
+                        for line in directives.split('\n'):
+                            line = line.strip()
+                            if not line or line.startswith('#'):
+                                continue
+
+                            # Handle header_up directives
+                            if line.startswith('header_up '):
+                                rest = line[10:].strip()  # Remove 'header_up '
+
+                                # Check if it's a delete operation (starts with -)
+                                if rest.startswith('-'):
+                                    header_name = rest[1:].strip()
+                                    handler["headers"] = handler.get("headers", {})
+                                    handler["headers"]["request"] = handler["headers"].get("request", {})
+                                    if "delete" not in handler["headers"]["request"]:
+                                        handler["headers"]["request"]["delete"] = []
+                                    if header_name not in handler["headers"]["request"]["delete"]:
+                                        handler["headers"]["request"]["delete"].append(header_name)
+
+                                # Check if it's a set operation (contains space or :)
+                                elif ' ' in rest or ':' in rest:
+                                    # Parse "header_up Host 10.10.0.7:5055" or "header_up Host: value"
+                                    # First try splitting on space (most common format)
+                                    parts = rest.split(None, 1)
+                                    if len(parts) == 2:
+                                        header_name = parts[0].strip()
+                                        header_value = parts[1].strip()
+                                        # Remove leading colon if present (e.g., "Host: value" -> "value")
+                                        if header_value.startswith(':'):
+                                            header_value = header_value[1:].strip()
+                                    elif ':' in rest:
+                                        # Fallback: split on first colon only if no space found
+                                        idx = rest.index(':')
+                                        header_name = rest[:idx].strip()
+                                        header_value = rest[idx+1:].strip()
+                                    else:
+                                        continue
+
+                                    handler["headers"] = handler.get("headers", {})
+                                    handler["headers"]["request"] = handler["headers"].get("request", {})
+                                    handler["headers"]["request"]["set"] = handler["headers"]["request"].get("set", {})
+                                    handler["headers"]["request"]["set"][header_name] = [header_value]
+
+                            # Handle header_down directives
+                            elif line.startswith('header_down '):
+                                rest = line[12:].strip()  # Remove 'header_down '
+
+                                # Check if it's a delete operation (starts with -)
+                                if rest.startswith('-'):
+                                    header_name = rest[1:].strip()
+                                    handler["headers"] = handler.get("headers", {})
+                                    handler["headers"]["response"] = handler["headers"].get("response", {})
+                                    if "delete" not in handler["headers"]["response"]:
+                                        handler["headers"]["response"]["delete"] = []
+                                    if header_name not in handler["headers"]["response"]["delete"]:
+                                        handler["headers"]["response"]["delete"].append(header_name)
+
+                                # Check if it's a set operation
+                                elif ':' in rest or ' ' in rest:
+                                    if ':' in rest:
+                                        parts = rest.split(':', 1)
+                                        header_name = parts[0].strip()
+                                        header_value = parts[1].strip()
+                                    else:
+                                        parts = rest.split(None, 1)
+                                        if len(parts) == 2:
+                                            header_name = parts[0].strip()
+                                            header_value = parts[1].strip()
+                                        else:
+                                            continue
+
+                                    handler["headers"] = handler.get("headers", {})
+                                    handler["headers"]["response"] = handler["headers"].get("response", {})
+                                    handler["headers"]["response"]["set"] = handler["headers"]["response"].get("set", {})
+                                    handler["headers"]["response"]["set"][header_name] = [header_value]
+
                 route_base["handle"].append(handler)
 
             # Add routes for HTTP ports
@@ -1459,9 +1611,11 @@ def build_caddy_config():
                         "root": root_path
                     })
 
-                    # Get index files
-                    index_files = site.get("index_files", ["index.html"])
-                    if "index.php" not in index_files:
+                    # Get index files - default to index.html, index.htm, index.php for PHP sites
+                    index_files = site.get("index_files")
+                    if not index_files:  # None or empty list
+                        index_files = ["index.html", "index.htm", "index.php"]
+                    elif "index.php" not in index_files:
                         index_files = index_files + ["index.php"]
 
                     # Add PHP subroute with proper FastCGI configuration
@@ -1500,7 +1654,10 @@ def build_caddy_config():
                     })
                 else:
                     # No PHP - just add regular file_server
-                    index_files = site.get("index_files", ["index.html"])
+                    # Default to index.html, index.htm for non-PHP sites
+                    index_files = site.get("index_files")
+                    if not index_files:  # None or empty list
+                        index_files = ["index.html", "index.htm"]
                     route_base["handle"].append({
                         "handler": "file_server",
                         "root": root_path,
@@ -1550,7 +1707,11 @@ def build_caddy_config():
                 if http_port not in servers:
                     continue  # Skip if this HTTP port isn't actually in use
 
+                # Collect all domains that need HTTPS redirect on this port
+                all_redirect_domains = []
                 for target_https_port, domains in redirect_targets.items():
+                    all_redirect_domains.extend(domains)
+
                     # Build the redirect Location header
                     # Use {http.request.host} which strips the port from the Host header
                     if target_https_port == 443:
@@ -1569,8 +1730,15 @@ def build_caddy_config():
                     if "*" not in domains:
                         redirect_route["match"] = [{"host": domains}]
 
+                    # Exclude ACME challenge paths from redirect - Let's Encrypt needs HTTP access
+                    # This uses a "not" matcher to avoid redirecting /.well-known/acme-challenge/*
+                    if "match" not in redirect_route:
+                        redirect_route["match"] = [{}]
+                    redirect_route["match"][0]["not"] = [{"path": ["/.well-known/acme-challenge/*"]}]
+
                     # Insert at beginning so it matches before other routes
                     servers[http_port]["routes"].insert(0, redirect_route)
+
 
         # Add routes to bypass authentication for auth endpoints
         # These must come BEFORE any auth-protected routes
@@ -1596,6 +1764,7 @@ def build_caddy_config():
             server_data["routes"].insert(0, api_auth_bypass_route)
 
         # Build base config with automatic HTTPS disabled
+        # Note: Admin port is configured via --admin flag when starting Caddy
         config = {
             "apps": {
                 "http": {
@@ -1618,8 +1787,8 @@ def build_caddy_config():
             server_config = {"listen": [f":{port}"], "routes": server_data["routes"]}
             if server_data["has_tls"]:
                 server_config["tls_connection_policies"] = [{}]
-                # Disable automatic HTTPS to prevent port 80 binding
-                server_config["automatic_https"] = {"disable": True}
+                # Enable automatic HTTPS for certificate provisioning
+                server_config["automatic_https"] = {"disable": False}
             config["apps"]["http"]["servers"][f"srv_{port}"] = server_config
         return config
     except Exception as e:
@@ -1629,8 +1798,9 @@ def build_caddy_config():
 async def reload_caddy():
     config = build_caddy_config()
     try:
+        admin_url = get_caddy_admin_url()
         async with httpx.AsyncClient(timeout=10.0) as client:
-            response = await client.post(f"{CADDY_ADMIN_URL}/load", json=config)
+            response = await client.post(f"{admin_url}/load", json=config)
             if response.status_code != 200:
                 raise HTTPException(status_code=500, detail=f"Caddy reload failed: {response.text}")
             return {"status": "reloaded"}

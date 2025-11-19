@@ -164,6 +164,11 @@
                             <small style="color: var(--text-secondary); font-size: 12px;">Port for Caddy Manager web interface (requires restart)</small>
                         </div>
                         <div class="form-group">
+                            <label>Caddy Admin Port</label>
+                            <input type="number" id="caddy-admin-port" min="1" max="65535" value="12999">
+                            <small style="color: var(--text-secondary); font-size: 12px;">Port for Caddy's admin API (default: 12999, requires Caddy restart)</small>
+                        </div>
+                        <div class="form-group">
                             <div class="checkbox-wrapper">
                                 <input type="checkbox" id="enhanced-security">
                                 <label>Enable Enhanced Security Mode</label>
@@ -270,7 +275,7 @@
                 <ul style="line-height: 1.8;">
                     <li><strong>Caddy Status:</strong> Shows if Caddy is running or stopped with the current process ID</li>
                     <li><strong>Statistics:</strong> Total count of reverse proxies, websites, users, and groups</li>
-                    <li><strong>Updates:</strong> Shows current version (v1.2.11) and checks for available updates</li>
+                    <li><strong>Updates:</strong> Shows current version (v1.2.18) and checks for available updates</li>
                 </ul>
             </div>
 
@@ -362,6 +367,7 @@
                 <ul style="line-height: 1.8;">
                     <li><strong>Theme:</strong> Choose between Dark mode (default), Light mode, or Black mode</li>
                     <li><strong>Manager Port:</strong> Port for CaddyMAN web interface (default: 8000)</li>
+                    <li><strong>Caddy Admin Port:</strong> Port for Caddy's admin API (default: 12999, requires Caddy restart)</li>
                     <li><strong>Enhanced Security Mode:</strong> Requires authentication on management interface</li>
                 </ul>
 
@@ -535,15 +541,18 @@ rate_limit {
             <!-- Version Information -->
             <div class="card" style="margin-bottom: 20px;">
                 <h2 style="margin-top: 0; color: var(--accent);">Version Information</h2>
-                <p><strong>Current Version:</strong> v1.2.11</p>
+                <p><strong>Current Version:</strong> v1.2.18</p>
 
                 <h3 style="color: var(--accent); margin-top: 20px;">Recent Updates</h3>
                 <ul style="line-height: 1.8;">
+                    <li><strong>v1.2.18:</strong> Fixed header parsing for reverse proxies, stripped scheme from upstream dial addresses, added ACME challenge bypass for Let's Encrypt, default index files (index.html, index.htm) for static sites</li>
+                    <li><strong>v1.2.17:</strong> Added configurable Caddy admin port, fixed import port defaults, fixed auto_https redirects</li>
+                    <li><strong>v1.2.16:</strong> Fixed website edit modal bugs, improved mode toggle handling</li>
+                    <li><strong>v1.2.13:</strong> Added additional directives support for Simple mode, cleaned up advanced forms</li>
                     <li><strong>v1.2.11:</strong> Application rebranded to CaddyMAN, comprehensive help menu added</li>
                     <li><strong>v1.2.10:</strong> Fixed critical settings persistence bug</li>
                     <li><strong>v1.2.9:</strong> Complete SQLite migration for all configuration data</li>
                     <li><strong>v1.2.8:</strong> Enhanced Security Mode and 2FA implementation</li>
-                    <li><strong>v1.2.7:</strong> Custom scrollbars and UI improvements</li>
                 </ul>
 
                 <h3 style="color: var(--accent); margin-top: 20px;">Update Mechanism</h3>
@@ -618,9 +627,10 @@ rate_limit {
                 </div>
                 <div class="form-group">
                     <label>Upstream (Target)</label>
-                    <input type="text" id="proxy-upstream" placeholder="localhost:3000">
+                    <input type="text" id="proxy-upstream" placeholder="http://localhost:3000 or http://backend1:3000, http://backend2:3000">
+                    <small style="color: var(--text-secondary); font-size: 12px;">Single backend or comma-separated multiple backends for load balancing</small>
                 </div>
-                <div class="form-group">
+                <div class="form-group" id="proxy-load-balance-group">
                     <label>Load Balancing</label>
                     <select id="proxy-load-balance">
                         <option value="">None</option>
@@ -629,14 +639,19 @@ rate_limit {
                         <option value="least_conn">Least Connections</option>
                         <option value="ip_hash">IP Hash</option>
                     </select>
+                    <small style="color: var(--text-secondary); font-size: 12px;">Choose load balancing strategy for multiple upstreams</small>
                 </div>
                 <div class="form-group">
                     <label>Custom Host Header</label>
                     <input type="text" id="proxy-header-host" placeholder="Optional">
                 </div>
                 <div class="form-group">
-                    <label>Custom Headers (JSON)</label>
-                    <textarea id="proxy-custom-headers" placeholder='{"X-Custom": "value"}'></textarea>
+                    <label>Additional Reverse Proxy Directives</label>
+                    <textarea id="proxy-additional-directives" placeholder="header_up X-Custom-Header value&#10;header_down X-Remove-Header&#10;transport http {&#10;    ...&#10;}" style="min-height: 100px; font-family: 'Consolas', 'Monaco', monospace; font-size: 13px;"></textarea>
+                    <small style="color: var(--text-secondary); font-size: 12px;">
+                        Add any additional Caddyfile directives that go inside the reverse_proxy block (one per line).
+                        Example: <code>header_up Host 10.10.0.7:5055</code> or <code>header_up -Origin</code>
+                    </small>
                 </div>
                 <div class="form-group">
                     <label>Access Control (Groups)</label>
@@ -674,21 +689,21 @@ rate_limit {
                 </div>
             </div>
             <div id="proxy-advanced-form" class="hidden">
-                <div class="form-group">
-                    <label>Domain(s)</label>
-                    <input type="text" id="proxy-domain-adv">
+                <div style="background: var(--card-bg); padding: 15px; border-radius: 8px; margin-bottom: 20px; border-left: 4px solid var(--accent);">
+                    <strong>Advanced Mode</strong>
+                    <p style="margin: 10px 0 0 0; color: var(--text-secondary); font-size: 14px;">
+                        In advanced mode, you have full control over the Caddy JSON configuration.
+                        Define servers, routes, matchers, handlers, and all Caddy directives directly in JSON format.
+                        All configuration (domains, ports, upstreams, headers, etc.) is defined in the JSON below.
+                    </p>
                 </div>
                 <div class="form-group">
-                    <label>Listen Ports (HTTP) - comma-separated</label>
-                    <input type="text" id="proxy-http-ports-adv" placeholder="80" value="80">
-                </div>
-                <div class="form-group">
-                    <label>Listen Ports (HTTPS) - comma-separated</label>
-                    <input type="text" id="proxy-https-ports-adv" placeholder="443">
-                </div>
-                <div class="form-group">
-                    <label>Advanced Config (JSON)</label>
-                    <textarea id="proxy-advanced"></textarea>
+                    <label>Caddy JSON Configuration</label>
+                    <textarea id="proxy-advanced" style="min-height: 400px; font-family: 'Consolas', 'Monaco', monospace; font-size: 13px;"></textarea>
+                    <small style="color: var(--text-secondary); font-size: 12px;">
+                        Full Caddy server configuration in JSON format.
+                        <a href="https://caddyserver.com/docs/json/" target="_blank" style="color: var(--accent);">View Caddy JSON docs</a>
+                    </small>
                 </div>
                 <div class="form-group">
                     <div class="checkbox-wrapper">
@@ -759,21 +774,21 @@ rate_limit {
                 </div>
             </div>
             <div id="website-advanced-form" class="hidden">
-                <div class="form-group">
-                    <label>Domain(s)</label>
-                    <input type="text" id="website-domain-adv">
+                <div style="background: var(--card-bg); padding: 15px; border-radius: 8px; margin-bottom: 20px; border-left: 4px solid var(--accent);">
+                    <strong>Advanced Mode</strong>
+                    <p style="margin: 10px 0 0 0; color: var(--text-secondary); font-size: 14px;">
+                        In advanced mode, you have full control over the Caddy JSON configuration.
+                        Define servers, routes, matchers, handlers, and all Caddy directives directly in JSON format.
+                        All configuration (domains, ports, root paths, file_server, etc.) is defined in the JSON below.
+                    </p>
                 </div>
                 <div class="form-group">
-                    <label>Listen Ports (HTTP) - comma-separated</label>
-                    <input type="text" id="website-http-ports-adv" placeholder="80" value="80">
-                </div>
-                <div class="form-group">
-                    <label>Listen Ports (HTTPS) - comma-separated</label>
-                    <input type="text" id="website-https-ports-adv" placeholder="443">
-                </div>
-                <div class="form-group">
-                    <label>Advanced Config (JSON)</label>
-                    <textarea id="website-advanced"></textarea>
+                    <label>Caddy JSON Configuration</label>
+                    <textarea id="website-advanced" style="min-height: 400px; font-family: 'Consolas', 'Monaco', monospace; font-size: 13px;"></textarea>
+                    <small style="color: var(--text-secondary); font-size: 12px;">
+                        Full Caddy server configuration in JSON format.
+                        <a href="https://caddyserver.com/docs/json/" target="_blank" style="color: var(--accent);">View Caddy JSON docs</a>
+                    </small>
                 </div>
                 <div class="form-group">
                     <div class="checkbox-wrapper">
@@ -864,6 +879,6 @@ rate_limit {
         </div>
     </div>
 
-     <script src="/static/script.js?v=1.2.12">    </script>
+     <script src="/static/script.js?v=1.2.18">    </script>
 </body>
 </html>
