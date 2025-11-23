@@ -1,5 +1,5 @@
 // Caddy Manager - Complete UI JavaScript
-// Save this as: caddy_manager_ui.js
+// Save this as: CaddyMAN_ui.js
 
 let currentUser = null;
 let allGroups = [];
@@ -9,6 +9,46 @@ let editingUserId = null;
 let editingGroupId = null;
 let currentProxyMode = 'simple';
 let currentWebsiteMode = 'simple';
+let csrfToken = null; // CSRF token for secure requests
+let inactivityTimer = null; // Auto-logout timer
+const INACTIVITY_TIMEOUT = 30 * 60 * 1000; // 30 minutes in milliseconds
+
+// Mobile Menu Functions
+function toggleMobileMenu() {
+    const sidebar = document.getElementById('sidebar');
+    const overlay = document.getElementById('mobile-overlay');
+    sidebar.classList.toggle('mobile-open');
+    overlay.classList.toggle('active');
+}
+
+function closeMobileMenu() {
+    const sidebar = document.getElementById('sidebar');
+    const overlay = document.getElementById('mobile-overlay');
+    sidebar.classList.remove('mobile-open');
+    overlay.classList.remove('active');
+}
+
+// Inactivity Timer Functions
+function startInactivityTimer() {
+    clearInactivityTimer();
+    inactivityTimer = setTimeout(() => {
+        showAlert('You have been logged out due to inactivity', 'warning');
+        logout();
+    }, INACTIVITY_TIMEOUT);
+}
+
+function resetInactivityTimer() {
+    if (currentUser) {
+        startInactivityTimer();
+    }
+}
+
+function clearInactivityTimer() {
+    if (inactivityTimer) {
+        clearTimeout(inactivityTimer);
+        inactivityTimer = null;
+    }
+}
 
 // Utility Functions
 function showAlert(message, type = 'success') {
@@ -22,6 +62,13 @@ function showAlert(message, type = 'success') {
 
 async function apiCall(url, options = {}, showErrors = true) {
     try {
+        // Add CSRF token header for state-changing requests
+        if (csrfToken && options.method && ['POST', 'PUT', 'DELETE'].includes(options.method.toUpperCase())) {
+            options.headers = {
+                ...options.headers,
+                'X-CSRF-Token': csrfToken
+            };
+        }
         const response = await fetch(url, {
             ...options,
             credentials: 'include'
@@ -75,6 +122,7 @@ function showLogin() {
 function showApp() {
     document.getElementById('login-screen').classList.add('hidden');
     document.getElementById('main-app').classList.remove('hidden');
+    startInactivityTimer(); // Start inactivity timer when user logs in
 }
 
 async function login() {
@@ -120,11 +168,19 @@ async function login() {
 
         const data = await response.json();
         currentUser = data.user;
+        csrfToken = data.csrf_token; // Store CSRF token for subsequent requests
+        sessionStorage.setItem('csrf_token', csrfToken); // Persist for page refreshes and mobile tab suspension
 
         // Hide 2FA field for next login and clear alert
         document.getElementById('login-2fa-group').classList.add('hidden');
         document.getElementById('login-2fa-token').value = '';
         document.getElementById('login-alert').innerHTML = '';
+
+        // Check if password change is required
+        if (data.needs_password_change) {
+            showAlert('Please change your default password for security reasons', 'warning');
+            // Could redirect to settings or show password change modal here
+        }
 
         showApp();
         await checkForUpdates();
@@ -139,6 +195,9 @@ async function login() {
 async function logout() {
     await fetch('/api/auth/logout', {method: 'POST', credentials: 'include'});
     currentUser = null;
+    csrfToken = null; // Clear CSRF token on logout
+    sessionStorage.removeItem('csrf_token'); // Clear stored CSRF token
+    clearInactivityTimer(); // Clear inactivity timer on logout
     if (refreshInterval) {
         clearInterval(refreshInterval);
         refreshInterval = null;
@@ -150,6 +209,11 @@ async function checkAuth() {
     try {
         const data = await apiCall('/api/auth/me', {}, false);
         currentUser = data;
+        // Restore CSRF token from sessionStorage if available (for page refreshes and mobile tab restoration)
+        const storedToken = sessionStorage.getItem('csrf_token');
+        if (storedToken) {
+            csrfToken = storedToken;
+        }
         showApp();
         await loadDashboard();
         startAutoRefresh(); // NEW LINE
@@ -182,7 +246,7 @@ function showPage(page, sourceEvent = null) {
     document.querySelectorAll('.page').forEach(p => p.classList.add('hidden'));
     document.querySelectorAll('.nav-item').forEach(n => n.classList.remove('active'));
     document.getElementById(page + '-page').classList.remove('hidden');
-    
+
     // Only try to update active nav item if we have a source event
     if (sourceEvent && sourceEvent.target) {
         const navItem = sourceEvent.target.closest('.nav-item');
@@ -198,13 +262,17 @@ function showPage(page, sourceEvent = null) {
             }
         });
     }
-    
+
+    // Close mobile menu after navigation
+    closeMobileMenu();
+
     if (page === 'dashboard') loadDashboard();
     if (page === 'proxies') loadProxies();
     if (page === 'websites') loadWebsites();
     if (page === 'users') loadUsers();
     if (page === 'groups') loadGroups();
     if (page === 'settings') loadSettings();
+    if (page === 'help') loadRuntimeInfo();
 }
 
 function setTheme(theme, sourceEvent = null) {
@@ -254,6 +322,7 @@ async function loadDashboard() {
 
         await loadSecurityWarnings();
         await loadActivity();
+        await loadNotifications();
     } catch {}
 }
 
@@ -320,8 +389,134 @@ async function loadActivity() {
     } catch {}
 }
 
+async function loadNotifications() {
+    try {
+        const data = await apiCall('/api/notifications');
+        const log = document.getElementById('notification-log');
+
+        if (data.notifications.length === 0) {
+            log.innerHTML = '<p style="color: var(--text-secondary);">No notifications sent yet</p>';
+            return;
+        }
+
+        log.innerHTML = data.notifications.map(notif => {
+            const time = new Date(notif.timestamp).toLocaleString();
+            const typeColors = {
+                'info': 'var(--accent)',
+                'success': 'var(--success)',
+                'warning': '#ff9800',
+                'critical': 'var(--danger)',
+                'alert': '#ff5722'
+            };
+            const typeColor = typeColors[notif.type] || 'var(--text-primary)';
+
+            return `
+                <div style="padding: 8px; border-bottom: 1px solid var(--border); line-height: 1.6;">
+                    <div style="color: var(--text-secondary);">${time}</div>
+                    <div>
+                        <strong style="color: ${typeColor};">${notif.title}</strong>
+                    </div>
+                    <div style="color: var(--text-secondary); font-size: 11px; white-space: pre-wrap;">${notif.message}</div>
+                </div>
+            `;
+        }).join('');
+    } catch {}
+}
+
+// Load runtime info and update help page dynamically
+let runtimeInfo = null;
+async function loadRuntimeInfo() {
+    if (runtimeInfo) return; // Only load once
+    try {
+        runtimeInfo = await apiCall('/api/runtime-info');
+        updateHelpPage();
+        updateSettingsPlaceholder();
+    } catch (err) {
+        console.error('Failed to load runtime info:', err);
+    }
+}
+
+function updateHelpPage() {
+    if (!runtimeInfo) return;
+
+    const { platform, is_executable, executable_name, php_cgi_name } = runtimeInfo;
+
+    // Update PHP-CGI references
+    const phpCgiElements = ['help-php-cgi', 'help-php-cgi-troubleshoot'];
+    phpCgiElements.forEach(id => {
+        const el = document.getElementById(id);
+        if (el) el.textContent = php_cgi_name;
+    });
+
+    // Update process check command
+    const processCmdEl = document.getElementById('help-process-cmd');
+    if (processCmdEl) {
+        if (platform === 'windows') {
+            if (is_executable) {
+                processCmdEl.textContent = `tasklist | findstr ${executable_name}`;
+            } else {
+                processCmdEl.textContent = 'tasklist | findstr python';
+            }
+        } else {
+            // Linux/Mac
+            if (is_executable) {
+                processCmdEl.textContent = `ps aux | grep ${executable_name}`;
+            } else {
+                processCmdEl.textContent = 'ps aux | grep CaddyMAN.py';
+            }
+        }
+    }
+
+    // Update command line start instruction
+    const startCmdEl = document.getElementById('help-start-cmd');
+    if (startCmdEl) {
+        if (is_executable) {
+            startCmdEl.textContent = `./${executable_name}`;
+        } else {
+            startCmdEl.textContent = 'python CaddyMAN.py';
+        }
+    }
+
+    // Update Python requirement visibility
+    const pythonReqEl = document.getElementById('help-python-req');
+    if (pythonReqEl) {
+        if (is_executable) {
+            pythonReqEl.style.display = 'none';
+        } else {
+            pythonReqEl.style.display = 'list-item';
+        }
+    }
+
+    // Update OS support text
+    const osListEl = document.getElementById('help-os-list');
+    if (osListEl) {
+        const platformName = platform === 'windows' ? 'Windows' :
+                            platform === 'linux' ? 'Linux' :
+                            platform === 'darwin' ? 'macOS' : platform;
+        osListEl.textContent = `${platformName} (other platforms supported)`;
+    }
+}
+
+function updateSettingsPlaceholder() {
+    if (!runtimeInfo) return;
+
+    const phpPathInput = document.getElementById('php-path');
+    const phpCgiNameSpan = document.getElementById('php-cgi-name');
+
+    if (phpPathInput && runtimeInfo.platform === 'windows') {
+        phpPathInput.placeholder = `C:\\php\\${runtimeInfo.php_cgi_name}`;
+    } else if (phpPathInput) {
+        phpPathInput.placeholder = `/usr/bin/${runtimeInfo.php_cgi_name}`;
+    }
+
+    if (phpCgiNameSpan) {
+        phpCgiNameSpan.textContent = runtimeInfo.php_cgi_name;
+    }
+}
+
 // Settings
 async function loadSettings() {
+    await loadRuntimeInfo(); // Ensure runtime info is loaded
     const data = await apiCall('/api/settings');
     document.getElementById('health-check-enabled').checked = data.health_check_enabled;
     document.getElementById('health-check-domain').value = data.health_check_domain;
@@ -341,11 +536,48 @@ async function loadSettings() {
         const themes = ['light', 'dark', 'black'];
         btn.classList.toggle('active', themes[idx] === data.theme);
     });
+
+    // Load notification events and show/hide container based on service selection
+    const notificationEventsContainer = document.getElementById('notification-events-container');
+    if (data.notification_service && data.notification_service !== '') {
+        notificationEventsContainer.style.display = 'block';
+    } else {
+        notificationEventsContainer.style.display = 'none';
+    }
+
+    // Load notification event checkboxes
+    if (data.notification_events) {
+        Object.keys(data.notification_events).forEach(eventType => {
+            const checkbox = document.getElementById(`notif-${eventType}`);
+            if (checkbox) {
+                checkbox.checked = data.notification_events[eventType].enabled || false;
+            }
+        });
+    }
 }
+
+// Toggle notification events visibility when service changes
+document.getElementById('notification-service')?.addEventListener('change', function() {
+    const container = document.getElementById('notification-events-container');
+    container.style.display = (this.value && this.value !== '') ? 'block' : 'none';
+});
 
 async function saveSettings() {
     const currentSettings = await apiCall('/api/settings');
     const wasEnhancedSecurityOff = !currentSettings.enhanced_security;
+
+    // Collect notification events from checkboxes
+    const notificationEvents = {};
+    const eventCheckboxes = document.querySelectorAll('[id^="notif-"]');
+    eventCheckboxes.forEach(checkbox => {
+        const eventType = checkbox.id.replace('notif-', '');
+        // Preserve severity from current settings, only update enabled state
+        const currentEvent = currentSettings.notification_events?.[eventType] || {};
+        notificationEvents[eventType] = {
+            enabled: checkbox.checked,
+            severity: currentEvent.severity || 'info'
+        };
+    });
 
     const settings = {
         theme: document.body.className,
@@ -356,6 +588,7 @@ async function saveSettings() {
         notification_service: document.getElementById('notification-service').value,
         notification_url: document.getElementById('notification-url').value,
         notification_token: document.getElementById('notification-token').value,
+        notification_events: notificationEvents,
         php_enabled: document.getElementById('php-enabled').checked,
         php_path: document.getElementById('php-path').value,
         manager_port: parseInt(document.getElementById('manager-port').value),
@@ -854,6 +1087,7 @@ function openProxyModal() {
     document.getElementById('proxy-websocket').checked = false;
     document.getElementById('proxy-remove-origin').checked = false;
     document.getElementById('proxy-remove-referer').checked = false;
+    document.getElementById('proxy-custom-headers').value = '';
     document.getElementById('proxy-auto-https').checked = false;
     document.getElementById('proxy-enabled').checked = true;
     document.getElementById('proxy-additional-directives').value = '';
@@ -922,6 +1156,18 @@ async function saveProxy() {
 
             const accessGroups = JSON.parse(document.getElementById('proxy-access-groups').dataset.groups || '[]');
 
+            // Parse custom_headers JSON
+            let custom_headers = null;
+            const customHeadersInput = document.getElementById('proxy-custom-headers').value.trim();
+            if (customHeadersInput) {
+                try {
+                    custom_headers = JSON.parse(customHeadersInput);
+                } catch (e) {
+                    showAlert('Invalid JSON in Custom Headers: ' + e.message, 'error');
+                    return;
+                }
+            }
+
             proxy = {
                 id: editingProxyId || 'proxy_' + Date.now(),
                 domains: domains,
@@ -933,6 +1179,7 @@ async function saveProxy() {
                 websocket: document.getElementById('proxy-websocket').checked,
                 remove_origin: document.getElementById('proxy-remove-origin').checked,
                 remove_referer: document.getElementById('proxy-remove-referer').checked,
+                custom_headers: custom_headers,
                 auto_https: document.getElementById('proxy-auto-https').checked,
                 enabled: document.getElementById('proxy-enabled').checked,
                 additional_directives: document.getElementById('proxy-additional-directives').value.trim(),
@@ -1023,6 +1270,7 @@ async function editProxy(id) {
         document.getElementById('proxy-websocket').checked = proxy.websocket || false;
         document.getElementById('proxy-remove-origin').checked = proxy.remove_origin || false;
         document.getElementById('proxy-remove-referer').checked = proxy.remove_referer || false;
+        document.getElementById('proxy-custom-headers').value = proxy.custom_headers ? JSON.stringify(proxy.custom_headers, null, 2) : '';
         document.getElementById('proxy-auto-https').checked = proxy.auto_https || false;
         document.getElementById('proxy-enabled').checked = proxy.enabled;
         document.getElementById('proxy-additional-directives').value = proxy.additional_directives || '';
@@ -1321,3 +1569,9 @@ setTheme(savedTheme);
 
 // Initialize
 checkAuth();
+
+// Setup inactivity detection - reset timer on any user activity
+const activityEvents = ['mousedown', 'keydown', 'scroll', 'touchstart', 'click'];
+activityEvents.forEach(event => {
+    document.addEventListener(event, resetInactivityTimer, true);
+});

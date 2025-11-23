@@ -4,7 +4,7 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>CaddyMAN</title>
-    <link rel="stylesheet" href="/static/style.css?v=1.2.12">
+    <link rel="stylesheet" href="/static/style.css?v=1.2.23">
 
 </head>
 <body class="dark">
@@ -40,9 +40,15 @@
             <span>🎉 Update available!</span>
             <button class="btn btn-success" onclick="installUpdate()">Install Update</button>
         </div>
-        
+
+        <!-- Mobile Menu Toggle -->
+        <button class="mobile-menu-toggle" onclick="toggleMobileMenu()">☰</button>
+
+        <!-- Mobile Overlay -->
+        <div class="mobile-overlay" id="mobile-overlay" onclick="closeMobileMenu()"></div>
+
         <div class="container">
-            <div class="sidebar">
+            <div class="sidebar" id="sidebar">
                 <div class="logo">⚡ CaddyMAN</div>
                 <div class="nav-item active" onclick="showPage('dashboard', event)">
                     <span>📊</span> Dashboard
@@ -102,6 +108,12 @@
                         <h3>Recent Activity</h3>
                         <div id="activity-log" style="max-height: 400px; overflow-y: auto; font-family: monospace; font-size: 12px;">
                             <p style="color: var(--text-secondary);">Loading activity...</p>
+                        </div>
+                    </div>
+                    <div class="card">
+                        <h3>Recent Notifications</h3>
+                        <div id="notification-log" style="max-height: 400px; overflow-y: auto; font-family: monospace; font-size: 12px;">
+                            <p style="color: var(--text-secondary);">No notifications sent yet</p>
                         </div>
                     </div>
                 </div>
@@ -217,6 +229,68 @@
                             <label>Token</label>
                             <input type="text" id="notification-token" placeholder="API Token">
                         </div>
+
+                        <div id="notification-events-container" style="margin-top: 20px; display: none;">
+                            <h4 style="margin-bottom: 15px; color: var(--accent);">Notification Events</h4>
+                            <p style="font-size: 13px; color: var(--text-secondary); margin-bottom: 15px;">Select which events should trigger notifications</p>
+
+                            <details style="margin-bottom: 10px;" open>
+                                <summary style="cursor: pointer; font-weight: 500; color: var(--accent); margin-bottom: 10px;">Security Events</summary>
+                                <div style="margin-left: 20px;">
+                                    <div class="checkbox-wrapper"><input type="checkbox" id="notif-admin_login"><label>Admin Login</label></div>
+                                    <div class="checkbox-wrapper"><input type="checkbox" id="notif-failed_login"><label>Failed Login Attempts</label></div>
+                                    <div class="checkbox-wrapper"><input type="checkbox" id="notif-account_lockout"><label>Account Lockout</label></div>
+                                    <div class="checkbox-wrapper"><input type="checkbox" id="notif-user_created"><label>User Created</label></div>
+                                    <div class="checkbox-wrapper"><input type="checkbox" id="notif-user_deleted"><label>User Deleted</label></div>
+                                    <div class="checkbox-wrapper"><input type="checkbox" id="notif-password_changed"><label>Password Changed</label></div>
+                                </div>
+                            </details>
+
+                            <details style="margin-bottom: 10px;">
+                                <summary style="cursor: pointer; font-weight: 500; color: var(--accent); margin-bottom: 10px;">Website Authentication</summary>
+                                <div style="margin-left: 20px;">
+                                    <div class="checkbox-wrapper"><input type="checkbox" id="notif-website_login_success"><label>Successful Login</label></div>
+                                    <div class="checkbox-wrapper"><input type="checkbox" id="notif-website_login_failed"><label>Failed Login</label></div>
+                                </div>
+                            </details>
+
+                            <details style="margin-bottom: 10px;">
+                                <summary style="cursor: pointer; font-weight: 500; color: var(--accent); margin-bottom: 10px;">System Events</summary>
+                                <div style="margin-left: 20px;">
+                                    <div class="checkbox-wrapper"><input type="checkbox" id="notif-caddy_started"><label>Caddy Started</label></div>
+                                    <div class="checkbox-wrapper"><input type="checkbox" id="notif-caddy_stopped"><label>Caddy Stopped</label></div>
+                                    <div class="checkbox-wrapper"><input type="checkbox" id="notif-caddy_crashed"><label>Caddy Crashed</label></div>
+                                    <div class="checkbox-wrapper"><input type="checkbox" id="notif-caddy_reloaded"><label>Config Reloaded</label></div>
+                                    <div class="checkbox-wrapper"><input type="checkbox" id="notif-php_started"><label>PHP Started</label></div>
+                                    <div class="checkbox-wrapper"><input type="checkbox" id="notif-php_stopped"><label>PHP Stopped</label></div>
+                                    <div class="checkbox-wrapper"><input type="checkbox" id="notif-health_check_failed"><label>Health Check Failed</label></div>
+                                    <div class="checkbox-wrapper"><input type="checkbox" id="notif-system_restart"><label>System Restart</label></div>
+                                </div>
+                            </details>
+
+                            <details style="margin-bottom: 10px;">
+                                <summary style="cursor: pointer; font-weight: 500; color: var(--accent); margin-bottom: 10px;">Configuration Changes</summary>
+                                <div style="margin-left: 20px;">
+                                    <div class="checkbox-wrapper"><input type="checkbox" id="notif-website_added"><label>Website Added</label></div>
+                                    <div class="checkbox-wrapper"><input type="checkbox" id="notif-website_modified"><label>Website Modified</label></div>
+                                    <div class="checkbox-wrapper"><input type="checkbox" id="notif-website_deleted"><label>Website Deleted</label></div>
+                                    <div class="checkbox-wrapper"><input type="checkbox" id="notif-proxy_added"><label>Reverse Proxy Added</label></div>
+                                    <div class="checkbox-wrapper"><input type="checkbox" id="notif-proxy_modified"><label>Reverse Proxy Modified</label></div>
+                                    <div class="checkbox-wrapper"><input type="checkbox" id="notif-proxy_deleted"><label>Reverse Proxy Deleted</label></div>
+                                    <div class="checkbox-wrapper"><input type="checkbox" id="notif-settings_changed"><label>Settings Changed</label></div>
+                                </div>
+                            </details>
+
+                            <details style="margin-bottom: 10px;">
+                                <summary style="cursor: pointer; font-weight: 500; color: var(--accent); margin-bottom: 10px;">Updates & Logs</summary>
+                                <div style="margin-left: 20px;">
+                                    <div class="checkbox-wrapper"><input type="checkbox" id="notif-update_available"><label>Update Available</label></div>
+                                    <div class="checkbox-wrapper"><input type="checkbox" id="notif-update_installed"><label>Update Installed</label></div>
+                                    <div class="checkbox-wrapper"><input type="checkbox" id="notif-error_log"><label>Error Logs</label></div>
+                                    <div class="checkbox-wrapper"><input type="checkbox" id="notif-warning_log"><label>Warning Logs</label></div>
+                                </div>
+                            </details>
+                        </div>
                     </div>
                     <div class="card">
                         <h3>PHP Configuration</h3>
@@ -229,7 +303,7 @@
                         <div class="form-group">
                             <label>PHP-CGI Executable Path</label>
                             <input type="text" id="php-path" placeholder="C:\php\php-cgi.exe or /usr/bin/php-cgi">
-                            <small style="color: var(--text-secondary); font-size: 12px;">Full path to php-cgi executable (required for PHP support)</small>
+                            <small id="php-path-help" style="color: var(--text-secondary); font-size: 12px;">Full path to <span id="php-cgi-name">php-cgi</span> executable (required for PHP support)</small>
                         </div>
                     </div>
                     <div class="card">
@@ -262,10 +336,18 @@
                 <h3 style="color: var(--accent); margin-top: 20px;">First Time Setup</h3>
                 <ol style="line-height: 1.8;">
                     <li><strong>Login:</strong> Default credentials are username: <code>admin</code>, password: <code>changeme</code></li>
-                    <li><strong>Change Password:</strong> Go to Users page and update the admin password immediately</li>
+                    <li><strong>Change Password:</strong> You will be prompted to change the default password on first login (required for security)</li>
                     <li><strong>Enable 2FA:</strong> For enhanced security, enable Two-Factor Authentication in the Users page</li>
                     <li><strong>Configure Settings:</strong> Visit the Settings page to configure PHP, ports, and other options</li>
                 </ol>
+
+                <h3 style="color: var(--accent); margin-top: 20px;">Security Features</h3>
+                <ul style="line-height: 1.8;">
+                    <li><strong>CSRF Protection:</strong> All state-changing requests are protected against cross-site request forgery</li>
+                    <li><strong>Rate Limiting:</strong> 5 failed login attempts result in a 15-minute account lockout</li>
+                    <li><strong>Secure Sessions:</strong> Cryptographically secure session IDs with SameSite cookie protection</li>
+                    <li><strong>Password Security:</strong> Enhanced mode checks passwords against known breaches (HIBP)</li>
+                </ul>
             </div>
 
             <!-- Dashboard -->
@@ -275,7 +357,7 @@
                 <ul style="line-height: 1.8;">
                     <li><strong>Caddy Status:</strong> Shows if Caddy is running or stopped with the current process ID</li>
                     <li><strong>Statistics:</strong> Total count of reverse proxies, websites, users, and groups</li>
-                    <li><strong>Updates:</strong> Shows current version (v1.2.18) and checks for available updates</li>
+                    <li><strong>Updates:</strong> Shows current version (v1.2.23) and checks for available updates</li>
                 </ul>
             </div>
 
@@ -374,7 +456,7 @@
                 <h3 style="color: var(--accent); margin-top: 20px;">PHP Settings</h3>
                 <ul style="line-height: 1.8;">
                     <li><strong>Enable PHP:</strong> Master switch - must be ON for any site to use PHP</li>
-                    <li><strong>PHP Path:</strong> Full path to php-cgi.exe executable</li>
+                    <li id="help-php-path"><strong>PHP Path:</strong> Full path to <code id="help-php-cgi">php-cgi</code> executable</li>
                     <li><strong>PHP Port:</strong> FastCGI port for PHP processing (default: 9000)</li>
                     <li><strong>PHP Extensions:</strong> File extensions to process as PHP (e.g., .php, .phtml)</li>
                 </ul>
@@ -447,7 +529,7 @@ rate_limit {
                 <ul style="line-height: 1.8;">
                     <li><strong>Global Enable:</strong> Ensure PHP is enabled globally in Settings</li>
                     <li><strong>Site Enable:</strong> Ensure the specific website has PHP enabled</li>
-                    <li><strong>PHP Path:</strong> Verify the path to php-cgi.exe is correct in Settings</li>
+                    <li id="help-php-troubleshoot"><strong>PHP Path:</strong> Verify the path to <code id="help-php-cgi-troubleshoot">php-cgi</code> is correct in Settings</li>
                     <li><strong>Port Conflict:</strong> Check if another service is using the PHP FastCGI port (default: 9000)</li>
                     <li><strong>Restart Required:</strong> Restart Caddy after changing PHP settings</li>
                 </ul>
@@ -464,15 +546,15 @@ rate_limit {
                 <h3 style="color: var(--accent); margin-top: 20px;">Settings Not Persisting</h3>
                 <ul style="line-height: 1.8;">
                     <li><strong>Fixed in v1.2.11:</strong> Settings now properly persist across restarts</li>
-                    <li><strong>Database:</strong> All configuration is stored in caddy_manager.db (SQLite)</li>
-                    <li><strong>Backup:</strong> Back up caddy_manager.db regularly to preserve your configuration</li>
+                    <li><strong>Database:</strong> All configuration is stored in CaddyMAN.db (SQLite)</li>
+                    <li><strong>Backup:</strong> Back up CaddyMAN.db regularly to preserve your configuration</li>
                 </ul>
 
                 <h3 style="color: var(--accent); margin-top: 20px;">Can't Access Management Interface</h3>
                 <ul style="line-height: 1.8;">
                     <li><strong>Port Check:</strong> Verify CaddyMAN is running on the configured port (default: 8000)</li>
                     <li><strong>URL:</strong> Access via http://localhost:8000 or http://127.0.0.1:8000</li>
-                    <li><strong>Process Check:</strong> Run <code>tasklist | findstr python</code> to verify the process is running</li>
+                    <li id="help-process-check"><strong>Process Check:</strong> Run <code id="help-process-cmd">tasklist | findstr python</code> to verify the process is running</li>
                     <li><strong>Logs:</strong> Check app.log for startup errors</li>
                 </ul>
             </div>
@@ -484,9 +566,9 @@ rate_limit {
 
                 <h3 style="color: var(--accent); margin-top: 20px;">Authentication</h3>
                 <ul style="line-height: 1.8;">
-                    <li><code>POST /api/login</code> - Authenticate and receive session token</li>
-                    <li><code>POST /api/logout</code> - End current session</li>
-                    <li><code>GET /api/check-auth</code> - Verify authentication status</li>
+                    <li><code>POST /api/auth/login</code> - Authenticate and receive session token + CSRF token</li>
+                    <li><code>POST /api/auth/logout</code> - End current session</li>
+                    <li><code>GET /api/auth/me</code> - Get current user info</li>
                 </ul>
 
                 <h3 style="color: var(--accent); margin-top: 20px;">Caddy Control</h3>
@@ -500,17 +582,20 @@ rate_limit {
 
                 <h3 style="color: var(--accent); margin-top: 20px;">Configuration Management</h3>
                 <ul style="line-height: 1.8;">
-                    <li><code>GET /api/reverse-proxies</code> - List all reverse proxies</li>
-                    <li><code>POST /api/reverse-proxies</code> - Create/update reverse proxy</li>
-                    <li><code>DELETE /api/reverse-proxies/{id}</code> - Delete reverse proxy</li>
+                    <li><code>GET /api/proxies</code> - List all reverse proxies</li>
+                    <li><code>POST /api/proxies</code> - Create/update reverse proxy (requires X-CSRF-Token header)</li>
+                    <li><code>DELETE /api/proxies/{id}</code> - Delete reverse proxy (requires X-CSRF-Token header)</li>
                     <li><code>GET /api/websites</code> - List all websites</li>
-                    <li><code>POST /api/websites</code> - Create/update website</li>
-                    <li><code>DELETE /api/websites/{id}</code> - Delete website</li>
+                    <li><code>POST /api/websites</code> - Create/update website (requires X-CSRF-Token header)</li>
+                    <li><code>DELETE /api/websites/{id}</code> - Delete website (requires X-CSRF-Token header)</li>
                     <li><code>GET /api/users</code> - List all users</li>
                     <li><code>GET /api/groups</code> - List all groups</li>
                     <li><code>GET /api/settings</code> - Get all settings</li>
-                    <li><code>POST /api/settings</code> - Update settings</li>
+                    <li><code>POST /api/settings</code> - Update settings (requires X-CSRF-Token header)</li>
                 </ul>
+
+                <h3 style="color: var(--accent); margin-top: 20px;">CSRF Protection</h3>
+                <p>All POST, PUT, and DELETE requests require an <code>X-CSRF-Token</code> header. The token is returned in the login response and must be included in subsequent requests.</p>
             </div>
 
             <!-- Database Information -->
@@ -519,7 +604,7 @@ rate_limit {
                 <p>CaddyMAN uses SQLite for data storage, providing reliability and ease of backup.</p>
 
                 <h3 style="color: var(--accent); margin-top: 20px;">Database Location</h3>
-                <p>All configuration is stored in: <code>caddy_manager.db</code></p>
+                <p>All configuration is stored in: <code>CaddyMAN.db</code></p>
 
                 <h3 style="color: var(--accent); margin-top: 20px;">Database Tables</h3>
                 <ul style="line-height: 1.8;">
@@ -532,7 +617,7 @@ rate_limit {
 
                 <h3 style="color: var(--accent); margin-top: 20px;">Backup & Restore</h3>
                 <ul style="line-height: 1.8;">
-                    <li><strong>Backup:</strong> Simply copy <code>caddy_manager.db</code> to a safe location</li>
+                    <li><strong>Backup:</strong> Simply copy <code>CaddyMAN.db</code> to a safe location</li>
                     <li><strong>Restore:</strong> Stop CaddyMAN, replace the database file, then restart</li>
                     <li><strong>Automated:</strong> Consider setting up scheduled backups of the database file</li>
                 </ul>
@@ -541,11 +626,16 @@ rate_limit {
             <!-- Version Information -->
             <div class="card" style="margin-bottom: 20px;">
                 <h2 style="margin-top: 0; color: var(--accent);">Version Information</h2>
-                <p><strong>Current Version:</strong> v1.2.18</p>
+                <p><strong>Current Version:</strong> v1.2.23</p>
 
                 <h3 style="color: var(--accent); margin-top: 20px;">Recent Updates</h3>
                 <ul style="line-height: 1.8;">
-                    <li><strong>v1.2.18:</strong> Fixed header parsing for reverse proxies, stripped scheme from upstream dial addresses, added ACME challenge bypass for Let's Encrypt, default index files (index.html, index.htm) for static sites</li>
+                    <li><strong>v1.2.23:</strong> CRITICAL FIX - notification_events settings now persist correctly; Added Custom Headers (JSON) UI for reverse proxies; Enhanced notification system with 26 granular event types; Recent Notifications dashboard widget; Linux compatibility improvements; Removed unused http_port/https_port settings</li>
+                    <li><strong>v1.2.22:</strong> CRITICAL FIX - Settings persistence for WebSocket support, Custom Host Headers, Remove Origin/Referer, Custom Headers, Load Balancing; Fixed CSRF token on mobile browsers (tab suspension)</li>
+                    <li><strong>v1.2.21:</strong> Fixed CSRF token handling on logout, added auto-logout after 30 minutes of inactivity</li>
+                    <li><strong>v1.2.20:</strong> Settings caching - reduced disk I/O by keeping settings in memory, only reading from database on startup and when settings are saved</li>
+                    <li><strong>v1.2.19:</strong> Major security update - CSRF protection, rate limiting with account lockout, secure session IDs, SameSite cookie flags, open redirect prevention, forced password change for default admin</li>
+                    <li><strong>v1.2.18:</strong> Fixed header parsing, upstream dial addresses, ACME challenge bypass, default index files, mobile responsive UI</li>
                     <li><strong>v1.2.17:</strong> Added configurable Caddy admin port, fixed import port defaults, fixed auto_https redirects</li>
                     <li><strong>v1.2.16:</strong> Fixed website edit modal bugs, improved mode toggle handling</li>
                     <li><strong>v1.2.13:</strong> Added additional directives support for Simple mode, cleaned up advanced forms</li>
@@ -569,15 +659,15 @@ rate_limit {
                     <li><strong>Caddy logs:</strong> Controlled via Log Level setting</li>
                 </ul>
 
-                <h3 style="color: var(--accent); margin-top: 20px;">Command Line Options</h3>
-                <p>Start CaddyMAN with: <code>python caddy_manager.py</code></p>
+                <h3 style="color: var(--accent); margin-top: 20px;">Running CaddyMAN</h3>
+                <p id="help-command-line">Start CaddyMAN with: <code id="help-start-cmd">python CaddyMAN.py</code></p>
 
                 <h3 style="color: var(--accent); margin-top: 20px;">System Requirements</h3>
                 <ul style="line-height: 1.8;">
-                    <li><strong>Python:</strong> 3.7 or higher</li>
+                    <li id="help-python-req"><strong>Python:</strong> 3.7 or higher (required for script mode)</li>
                     <li><strong>Caddy:</strong> v2.x (latest stable recommended)</li>
                     <li><strong>PHP (optional):</strong> PHP-CGI for PHP website support</li>
-                    <li><strong>Operating System:</strong> Windows (Linux/macOS with minor modifications)</li>
+                    <li id="help-os-support"><strong>Operating System:</strong> <span id="help-os-list">Windows, Linux, macOS</span></li>
                 </ul>
 
                 <h3 style="color: var(--accent); margin-top: 20px;">Security Best Practices</h3>
@@ -586,7 +676,7 @@ rate_limit {
                     <li>Enable Enhanced Security Mode for production</li>
                     <li>Enable 2FA for all user accounts</li>
                     <li>Use strong, unique passwords (min 8 characters with complexity)</li>
-                    <li>Regular backups of caddy_manager.db</li>
+                    <li>Regular backups of CaddyMAN.db</li>
                     <li>Keep CaddyMAN and Caddy updated to latest versions</li>
                     <li>Restrict management interface to trusted networks</li>
                 </ul>
@@ -674,6 +764,13 @@ rate_limit {
                         <input type="checkbox" id="proxy-remove-referer">
                         <label>Remove Referer Header</label>
                     </div>
+                </div>
+                <div class="form-group">
+                    <label>Custom Headers (JSON)</label>
+                    <textarea id="proxy-custom-headers" placeholder='{"X-Custom-Header": "value", "X-Another-Header": "value"}' style="min-height: 80px; font-family: 'Consolas', 'Monaco', monospace; font-size: 13px;"></textarea>
+                    <small style="color: var(--text-secondary); font-size: 12px;">
+                        JSON object with custom headers to add to requests. Example: <code>{"X-Forwarded-Proto": "https"}</code>
+                    </small>
                 </div>
                 <div class="form-group">
                     <div class="checkbox-wrapper">
@@ -879,6 +976,6 @@ rate_limit {
         </div>
     </div>
 
-     <script src="/static/script.js?v=1.2.18">    </script>
+     <script src="/static/script.js?v=1.2.23">    </script>
 </body>
 </html>

@@ -173,3 +173,180 @@
             background: none; border: none; color: white;
             cursor: pointer; font-size: 16px; line-height: 1;
         }
+
+        /* Mobile Menu Toggle Button */
+        .mobile-menu-toggle {
+            display: none;
+            position: fixed;
+            top: 15px;
+            left: 15px;
+            z-index: 1001;
+            background: var(--accent);
+            color: white;
+            border: none;
+            border-radius: 8px;
+            padding: 12px 15px;
+            font-size: 20px;
+            cursor: pointer;
+            box-shadow: 0 2px 10px rgba(0, 0, 0, 0.3);
+        }
+
+        /* Mobile Responsive Styles */
+        @media (max-width: 768px) {
+            /* Show mobile menu toggle */
+            .mobile-menu-toggle {
+                display: block;
+            }
+
+            /* Sidebar becomes overlay menu */
+            .sidebar {
+                position: fixed;
+                left: -280px;
+                top: 0;
+                height: 100vh;
+                width: 280px;
+                z-index: 1000;
+                transition: left 0.3s ease;
+                padding-top: 70px;
+                overflow-y: auto;
+            }
+
+            .sidebar.mobile-open {
+                left: 0;
+                box-shadow: 5px 0 20px rgba(0, 0, 0, 0.5);
+            }
+
+            /* Mobile overlay backdrop */
+            .mobile-overlay {
+                display: none;
+                position: fixed;
+                top: 0;
+                left: 0;
+                right: 0;
+                bottom: 0;
+                background: rgba(0, 0, 0, 0.5);
+                z-index: 999;
+            }
+
+            .mobile-overlay.active {
+                display: block;
+            }
+
+            /* Content takes full width on mobile */
+            .container {
+                flex-direction: column;
+            }
+
+            .content {
+                padding: 70px 15px 20px 15px;
+                width: 100%;
+            }
+
+            /* Adjust header */
+            .header {
+                flex-direction: column;
+                align-items: flex-start;
+                gap: 15px;
+            }
+
+            .header h1 {
+                font-size: 22px;
+            }
+
+            /* Cards full width */
+            .card {
+                padding: 15px;
+            }
+
+            /* Items stack on mobile */
+            .item {
+                flex-direction: column;
+                align-items: flex-start;
+                gap: 15px;
+            }
+
+            .item-actions {
+                width: 100%;
+                justify-content: flex-end;
+            }
+
+            /* Buttons more touch-friendly */
+            .btn {
+                padding: 12px 20px;
+                font-size: 15px;
+            }
+
+            /* Form inputs larger for touch */
+            .form-group input,
+            .form-group select,
+            .form-group textarea {
+                padding: 12px;
+                font-size: 16px; /* Prevents zoom on iOS */
+            }
+
+            /* Modal full width on mobile */
+            .modal-content {
+                width: 95%;
+                max-width: none;
+                padding: 20px;
+                margin: 10px;
+                max-height: 85vh;
+            }
+
+            .modal-header h2 {
+                font-size: 18px;
+            }
+
+            /* Toggle groups wrap */
+            .toggle-group {
+                flex-wrap: wrap;
+            }
+
+            /* Login box adjustments */
+            .login-box {
+                padding: 30px 20px;
+                width: 95%;
+            }
+
+            /* Update banner stacks */
+            .update-banner {
+                flex-direction: column;
+                gap: 10px;
+                padding: 12px;
+            }
+
+            /* Nav items more touch-friendly */
+            .nav-item {
+                padding: 15px 16px;
+            }
+
+            /* Help page adjustments */
+            #help-page .card ul {
+                padding-left: 20px;
+            }
+
+            #help-page .card li {
+                margin-bottom: 8px;
+            }
+        }
+
+        /* Tablet adjustments */
+        @media (min-width: 769px) and (max-width: 1024px) {
+            .sidebar {
+                width: 200px;
+            }
+
+            .content {
+                padding: 20px;
+            }
+
+            .modal-content {
+                max-width: 80%;
+            }
+        }
+
+        /* Ensure tables scroll horizontally on small screens */
+        .table-responsive {
+            overflow-x: auto;
+            -webkit-overflow-scrolling: touch;
+        }
