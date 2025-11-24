@@ -33,7 +33,7 @@ import re
 import sqlite3
 from contextlib import closing
 
-VERSION = "1.2.23"
+VERSION = "1.2.24"
 
 def resource_path(relative_path):
     """Get absolute path to resource, works for dev and PyInstaller (including auto-py-to-exe)
@@ -380,7 +380,11 @@ class ReverseProxy(BaseModel):
     listen_port: Optional[int] = None
     tls: Optional[bool] = None
     @field_validator('domains')
-    def validate_domains(cls, v):
+    def validate_domains(cls, v, values):
+        # In advanced mode, domains are defined in the JSON config, not required here
+        if values.data.get('advanced'):
+            return v if v else []
+        # In simple mode, at least one domain is required
         if not v or len(v) == 0:
             raise ValueError('At least one domain is required for reverse proxy')
         return v

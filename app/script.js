@@ -323,7 +323,57 @@ async function loadDashboard() {
         await loadSecurityWarnings();
         await loadActivity();
         await loadNotifications();
+        await checkForUpdates();
     } catch {}
+}
+
+async function checkForUpdates() {
+    try {
+        const updateData = await apiCall('/api/update/check');
+        const updateStatus = document.getElementById('update-status');
+        const updateVersion = document.getElementById('update-version');
+        const updateButton = document.getElementById('update-button-text');
+
+        if (updateData.update_available) {
+            updateVersion.textContent = `v${updateData.update_available.version}`;
+            updateStatus.style.display = 'block';
+
+            // Check if running as executable or script
+            if (!runtimeInfo) {
+                await loadRuntimeInfo();
+            }
+
+            if (runtimeInfo && runtimeInfo.is_executable) {
+                // EXE mode: Can auto-update
+                updateButton.textContent = '⬇️ Download & Install Update';
+            } else {
+                // Script mode: Show download link
+                updateButton.textContent = '🔗 View Download Page';
+            }
+        } else {
+            updateStatus.style.display = 'none';
+        }
+    } catch (err) {
+        console.error('Failed to check for updates:', err);
+    }
+}
+
+async function handleUpdate() {
+    if (!runtimeInfo) {
+        await loadRuntimeInfo();
+    }
+
+    if (runtimeInfo && runtimeInfo.is_executable) {
+        // EXE mode: Auto-install
+        await installUpdate();
+    } else {
+        // Script mode: Open download page
+        const updateData = await apiCall('/api/update/check');
+        if (updateData.update_available && updateData.update_available.download_url) {
+            window.open(updateData.update_available.download_url, '_blank');
+            showAlert('Download the new version and replace your current files.', 'info');
+        }
+    }
 }
 
 async function loadSecurityWarnings() {

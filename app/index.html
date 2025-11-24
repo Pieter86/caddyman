@@ -100,7 +100,15 @@
                         <h3>System Info</h3>
                         <p>App: <strong>CaddyMAN</strong></p>
                         <p>Version: <strong id="app-version">""" + VERSION + """</strong></p>
-                        <p>Proxies: <strong id="proxy-count">0</strong></p>
+                        <div id="update-status" style="display: none; margin-top: 10px;">
+                            <p style="color: var(--success); margin-bottom: 10px;">
+                                <strong>🎉 Update Available:</strong> <span id="update-version"></span>
+                            </p>
+                            <button id="update-button" class="btn btn-primary" onclick="handleUpdate()" style="width: 100%;">
+                                <span id="update-button-text">Download & Install Update</span>
+                            </button>
+                        </div>
+                        <p style="margin-top: 10px;">Proxies: <strong id="proxy-count">0</strong></p>
                         <p>Websites: <strong id="website-count">0</strong></p>
                         <p>Users: <strong id="user-count">0</strong></p>
                     </div>
@@ -626,10 +634,11 @@ rate_limit {
             <!-- Version Information -->
             <div class="card" style="margin-bottom: 20px;">
                 <h2 style="margin-top: 0; color: var(--accent);">Version Information</h2>
-                <p><strong>Current Version:</strong> v1.2.23</p>
+                <p><strong>Current Version:</strong> v1.2.24</p>
 
                 <h3 style="color: var(--accent); margin-top: 20px;">Recent Updates</h3>
                 <ul style="line-height: 1.8;">
+                    <li><strong>v1.2.24:</strong> Fixed Advanced proxy mode validation (domains no longer required when using full Caddy JSON); Added dynamic help page that adapts to platform (Windows/Linux/macOS) and execution mode (script/executable); Improved update system with dashboard UI showing platform-appropriate update buttons; GitHub integration for updates; Platform-aware PHP-CGI paths</li>
                     <li><strong>v1.2.23:</strong> CRITICAL FIX - notification_events settings now persist correctly; Added Custom Headers (JSON) UI for reverse proxies; Enhanced notification system with 26 granular event types; Recent Notifications dashboard widget; Linux compatibility improvements; Removed unused http_port/https_port settings</li>
                     <li><strong>v1.2.22:</strong> CRITICAL FIX - Settings persistence for WebSocket support, Custom Host Headers, Remove Origin/Referer, Custom Headers, Load Balancing; Fixed CSRF token on mobile browsers (tab suspension)</li>
                     <li><strong>v1.2.21:</strong> Fixed CSRF token handling on logout, added auto-logout after 30 minutes of inactivity</li>
