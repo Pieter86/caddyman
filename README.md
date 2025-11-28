@@ -6,8 +6,7 @@
 
 ## What is CaddyMAN?
 
-CaddyMAN is a comprehensive management platform that wraps around the Caddy web server, adding a full-featured web UI, user management, OAuth/OIDC provider capabilities, and much more. It's designed for homelabbers who want enterprise-grade features without enterprise-grade complexity.
-
+CaddyMAN is a management platform that wraps around the Caddy web server, adding a web UI, user management, OAuth/OIDC provider capabilities, and more. 
 ### Key Features
 
 - **Web-Based Management Interface**: Manage your entire Caddy configuration through a clean, modern web UI
@@ -33,9 +32,6 @@ I got tired of:
 
 CaddyMAN consolidates all of this into one place. It's opinionated, it's specific to my homelab needs, but it might work for yours too.
 
-## Screenshots
-
-*(Coming soon - or contribute your own!)*
 
 ## Installation
 
@@ -65,7 +61,7 @@ pip install -r requirements.txt
 python CaddyMAN.py
 ```
 
-First-time login: `admin` / `admin` (you'll be prompted to change this immediately)
+First-time login: `admin` / `changeme` (you'll be prompted to change this immediately)
 
 ## Configuration
 
@@ -141,19 +137,6 @@ CaddyMAN includes an automatic update system:
 
 Updates are published at: [https://github.com/Pieter86/caddyman/releases](https://github.com/Pieter86/caddyman/releases)
 
-## Roadmap
-
-Things I might add (when I'm not lazy):
-
-- [ ] Multi-language support
-- [ ] Dark mode (probably)
-- [ ] API documentation
-- [ ] Docker container
-- [ ] LDAP/Active Directory integration
-- [ ] More OAuth client integrations
-- [ ] Certificate management UI
-- [ ] Log viewer in web UI
-
 ## Contributing
 
 This is primarily a personal homelab project, but PRs are welcome! If you find bugs or have feature requests, open an issue.
@@ -166,7 +149,7 @@ This project is provided as-is for personal and homelab use. No warranty, use at
 
 - Built with [Caddy](https://caddyserver.com/) - the amazing web server
 - Powered by [FastAPI](https://fastapi.tiangolo.com/)
-- Icons and UI inspired by too many dashboards to count
+- Claude.ai for lots of help. lol
 
 ## FAQ
 
@@ -191,9 +174,4 @@ A: Check `logs/app.log` first. Then open an issue on GitHub with details.
 - **Documentation**: Built-in help page at `/` (Help tab)
 - **Changelog**: See [CHANGELOG.md](CHANGELOG.md) or the help page
 
----
 
-Made with ☕ and mild frustration at managing too many services.
-
-**Current Version**: 1.3.2
-**Status**: Actively maintained (when I feel like it)
