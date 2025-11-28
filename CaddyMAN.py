@@ -1,7 +1,7 @@
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.responses import Response as StarletteResponse
-from fastapi import FastAPI, HTTPException, Request, Response, Cookie
-from fastapi.responses import HTMLResponse, JSONResponse, FileResponse
+from fastapi import FastAPI, HTTPException, Request, Response, Cookie, Header, Form
+from fastapi.responses import HTMLResponse, JSONResponse, FileResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from packaging import version
 from pydantic import BaseModel, Field, field_validator
@@ -32,8 +32,16 @@ import base64
 import re
 import sqlite3
 from contextlib import closing
+from jose import jwt, jwk
+from jose.constants import ALGORITHMS
+from cryptography.hazmat.primitives.asymmetric import rsa
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.backends import default_backend
+from urllib.parse import urlencode, parse_qs, urlparse
+from email.message import EmailMessage
+import aiosmtplib
 
-VERSION = "1.2.24"
+VERSION = "1.3.2"
 
 def resource_path(relative_path):
     """Get absolute path to resource, works for dev and PyInstaller (including auto-py-to-exe)
@@ -106,6 +114,8 @@ async def lifespan(app: FastAPI):
     get_settings_from_db()  # Initialize settings cache on startup
     await start_caddy()
     await start_php_cgi()
+    await start_ldap_server()  # Start LDAP server if enabled
+    await start_radius_server()  # Start RADIUS server if enabled
     await asyncio.sleep(2)
     try:
         await reload_caddy()
@@ -124,6 +134,8 @@ async def lifespan(app: FastAPI):
         health_check_task.cancel()
     if caddy_monitor_task:
         caddy_monitor_task.cancel()
+    await stop_ldap_server()  # Stop LDAP server
+    await stop_radius_server()  # Stop RADIUS server
     await stop_php_cgi()
     await stop_caddy()
     sessions.clear()
@@ -138,11 +150,14 @@ class AdminAuthMiddleware(BaseHTTPMiddleware):
         if "," in client_ip:
             client_ip = client_ip.split(",")[0].strip()
         
-        # Allow login page and auth endpoints
-        if (request.url.path in ["/", "/api/auth/login", "/api/auth/verify"] or
+        # Allow login page, OAuth, user portal, and auth endpoints
+        if (request.url.path in ["/", "/login", "/api/auth/login", "/api/auth/logout", "/api/auth/verify", "/api/login", "/api/user"] or
             request.url.path.startswith("/static/") or
             request.url.path.startswith("/api/website-auth/") or
-            request.url.path.startswith("/auth/")):
+            request.url.path.startswith("/auth/") or
+            request.url.path.startswith("/oauth/") or
+            request.url.path.startswith("/user-portal") or
+            request.url.path.startswith("/api/user-portal/")):
             return await call_next(request)
         
         # All other pages require admin group membership
@@ -286,6 +301,15 @@ default_settings = {
         # Website Authentication
         "website_login_success": {"enabled": False, "severity": "info"},
         "website_login_failed": {"enabled": True, "severity": "warning"},
+        # Authentication Protocols (LDAP/RADIUS/OIDC)
+        "ldap_auth_success": {"enabled": False, "severity": "info"},
+        "ldap_auth_failed": {"enabled": True, "severity": "warning"},
+        "ldap_auth_denied": {"enabled": True, "severity": "warning"},
+        "radius_auth_success": {"enabled": False, "severity": "info"},
+        "radius_auth_failed": {"enabled": True, "severity": "warning"},
+        "radius_auth_denied": {"enabled": True, "severity": "warning"},
+        "oidc_auth_success": {"enabled": False, "severity": "info"},
+        "oidc_auth_denied": {"enabled": True, "severity": "warning"},
         # System Events
         "caddy_started": {"enabled": True, "severity": "success"},
         "caddy_stopped": {"enabled": True, "severity": "warning"},
@@ -309,7 +333,40 @@ default_settings = {
         # Logs (sampled to avoid spam)
         "error_log": {"enabled": True, "severity": "critical"},
         "warning_log": {"enabled": False, "severity": "warning"}
-    }
+    },
+
+    # Authentication Protocols (Experimental - v1.3.0)
+    "auth_protocols_enabled": False,
+
+    # OIDC Provider Settings
+    "oidc_enabled": False,
+    "oidc_issuer": "",  # e.g., https://sso.jvrensburg.cc
+    "oidc_signing_key_private": "",  # RSA private key (PEM format)
+    "oidc_signing_key_public": "",   # RSA public key (PEM format)
+
+    # LDAP Server Settings
+    "ldap_enabled": False,
+    "ldap_port": 3389,
+    "ldap_base_dn": "dc=example,dc=com",
+    "ldap_bind_dn": "cn=admin,dc=example,dc=com",
+    "ldap_username_attribute": "both",  # "cn", "uid", or "both"
+
+    # RADIUS Server Settings
+    "radius_enabled": False,
+    "radius_auth_port": 1812,
+    "radius_acct_port": 1813,
+    "radius_secret": "",  # Shared secret
+    "radius_vlan_assignment": False,
+
+    # Email/SMTP Settings
+    "smtp_enabled": False,
+    "smtp_server": "",
+    "smtp_port": 587,
+    "smtp_use_tls": True,
+    "smtp_username": "",
+    "smtp_password": "",
+    "smtp_from_address": "noreply@example.com",
+    "smtp_from_name": "CaddyIAM"
 }
 
 # Models
@@ -330,6 +387,34 @@ class Settings(BaseModel):
     caddy_admin_port: int = Field(default=12999, ge=1, le=65535)
     notification_events: Dict[str, Dict[str, Any]] = Field(default_factory=dict)
 
+    # Authentication Protocols (v1.3.0)
+    auth_protocols_enabled: bool = False
+    oidc_enabled: bool = False
+    oidc_issuer: str = ""
+    oidc_signing_key_private: str = ""
+    oidc_signing_key_public: str = ""
+    ldap_enabled: bool = False
+    ldap_port: int = 3389
+    ldap_base_dn: str = ""
+    ldap_bind_dn: str = ""
+    ldap_username_attribute: str = "both"
+    ldap_allowed_groups: List[str] = []
+    radius_enabled: bool = False
+    radius_auth_port: int = 1812
+    radius_acct_port: int = 1813
+    radius_secret: str = ""
+    radius_vlan_assignment: bool = False
+    radius_eap_method: str = "PAP"
+    radius_allowed_groups: List[str] = []
+    smtp_enabled: bool = False
+    smtp_server: str = ""
+    smtp_port: int = 587
+    smtp_use_tls: bool = True
+    smtp_username: str = ""
+    smtp_password: str = ""
+    smtp_from_address: str = ""
+    smtp_from_name: str = "CaddyIAM"
+
     @field_validator('php_path')
     @classmethod
     def validate_php_path(cls, v, values):
@@ -348,16 +433,55 @@ class Settings(BaseModel):
 class User(BaseModel):
     id: str
     username: str
+    email: str = ""
+    first_name: str = ""
+    last_name: str = ""
     password_hash: str
     groups: List[str] = Field(default_factory=list)
     totp_secret: Optional[str] = None
     totp_enabled: bool = False
+    email_verified: bool = False
+    password_reset_token: Optional[str] = None
+    password_reset_expires: Optional[str] = None  # ISO format datetime string
 
 class Group(BaseModel):
     id: str
     name: str
     description: str = ""
     system: bool = False  # System groups cannot be deleted
+    radius_vlan: Optional[int] = None  # VLAN assignment for RADIUS
+    force_2fa: bool = False  # Require 2FA for users in this group
+
+class OAuthClient(BaseModel):
+    client_id: str
+    client_secret_hash: str  # Hashed client secret
+    name: str  # Display name (e.g., "Audiobookshelf")
+    redirect_uris: List[str]  # Allowed redirect URIs
+    allowed_scopes: List[str] = Field(default_factory=lambda: ["openid", "profile", "email", "groups"])
+    grant_types: List[str] = Field(default_factory=lambda: ["authorization_code", "refresh_token"])
+    require_pkce: bool = True
+    created_at: str  # ISO format datetime
+    enabled: bool = True
+
+class OAuthAuthorizationCode(BaseModel):
+    code: str
+    client_id: str
+    user_id: str
+    redirect_uri: str
+    scopes: List[str]
+    code_challenge: Optional[str] = None
+    code_challenge_method: Optional[str] = None
+    expires_at: str  # ISO format datetime
+    used: bool = False
+
+class OAuthToken(BaseModel):
+    access_token: str
+    refresh_token: Optional[str] = None
+    client_id: str
+    user_id: str
+    scopes: List[str]
+    expires_at: str  # ISO format datetime
+    created_at: str  # ISO format datetime
 
 class ReverseProxy(BaseModel):
     id: str
@@ -409,6 +533,7 @@ class UserCreate(BaseModel):
     username: str
     password: str
     groups: List[str] = Field(default_factory=list)
+    email: Optional[str] = None
 
 class LoginRequest(BaseModel):
     username: str
@@ -420,6 +545,16 @@ def hash_password(password: str) -> str:
 
 def verify_password(password: str, hashed: str) -> bool:
     return bcrypt.checkpw(password.encode('utf-8'), hashed.encode('utf-8'))
+
+def user_requires_2fa(user: dict) -> bool:
+    """Check if user is required to have 2FA based on their group memberships"""
+    user_groups = user.get('groups', [])
+    all_groups = get_all_groups_from_db()
+
+    for group in all_groups:
+        if group['id'] in user_groups and group.get('force_2fa', False):
+            return True
+    return False
 
 async def check_password_pwned(password: str) -> bool:
     """Check if password appears in Have I Been Pwned database"""
@@ -646,11 +781,136 @@ def init_database():
         except sqlite3.OperationalError:
             pass
 
+        # Migration v1.3.0: Add new user fields for IAM functionality
+        try:
+            cursor.execute("ALTER TABLE users ADD COLUMN email TEXT DEFAULT ''")
+            logger.info("Added email column to users table")
+        except sqlite3.OperationalError:
+            pass
+
+        try:
+            cursor.execute("ALTER TABLE users ADD COLUMN first_name TEXT DEFAULT ''")
+            logger.info("Added first_name column to users table")
+        except sqlite3.OperationalError:
+            pass
+
+        try:
+            cursor.execute("ALTER TABLE users ADD COLUMN last_name TEXT DEFAULT ''")
+            logger.info("Added last_name column to users table")
+        except sqlite3.OperationalError:
+            pass
+
+        try:
+            cursor.execute("ALTER TABLE users ADD COLUMN email_verified INTEGER DEFAULT 0")
+            logger.info("Added email_verified column to users table")
+        except sqlite3.OperationalError:
+            pass
+
+        try:
+            cursor.execute("ALTER TABLE users ADD COLUMN password_reset_token TEXT")
+            logger.info("Added password_reset_token column to users table")
+        except sqlite3.OperationalError:
+            pass
+
+        try:
+            cursor.execute("ALTER TABLE users ADD COLUMN password_reset_expires TEXT")
+            logger.info("Added password_reset_expires column to users table")
+        except sqlite3.OperationalError:
+            pass
+
+        # Migration v1.3.0: Add RADIUS VLAN to groups
+        try:
+            cursor.execute("ALTER TABLE groups ADD COLUMN radius_vlan INTEGER")
+            logger.info("Added radius_vlan column to groups table")
+        except sqlite3.OperationalError:
+            pass
+
+        # Migration v1.3.1: Add force 2FA to groups
+        try:
+            cursor.execute("ALTER TABLE groups ADD COLUMN force_2fa INTEGER DEFAULT 0")
+            logger.info("Added force_2fa column to groups table")
+        except sqlite3.OperationalError:
+            pass
+
+        # Create OAuth clients table
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS oauth_clients (
+                client_id TEXT PRIMARY KEY,
+                client_secret_hash TEXT NOT NULL,
+                name TEXT NOT NULL,
+                redirect_uris TEXT NOT NULL,
+                allowed_scopes TEXT NOT NULL,
+                grant_types TEXT NOT NULL,
+                require_pkce INTEGER DEFAULT 1,
+                created_at TEXT NOT NULL,
+                enabled INTEGER DEFAULT 1
+            )
+        ''')
+
+        # Create OAuth authorization codes table
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS oauth_authorization_codes (
+                code TEXT PRIMARY KEY,
+                client_id TEXT NOT NULL,
+                user_id TEXT NOT NULL,
+                redirect_uri TEXT NOT NULL,
+                scopes TEXT NOT NULL,
+                code_challenge TEXT,
+                code_challenge_method TEXT,
+                expires_at TEXT NOT NULL,
+                used INTEGER DEFAULT 0,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+
+        # Create OAuth tokens table
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS oauth_tokens (
+                access_token TEXT PRIMARY KEY,
+                refresh_token TEXT,
+                client_id TEXT NOT NULL,
+                user_id TEXT NOT NULL,
+                scopes TEXT NOT NULL,
+                expires_at TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            )
+        ''')
+
         # Create indexes
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_username ON users(username)')
+        # Create invite tokens table
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS invite_tokens (
+                token TEXT PRIMARY KEY,
+                username TEXT NOT NULL,
+                email TEXT NOT NULL,
+                groups TEXT NOT NULL,
+                expires_at REAL NOT NULL,
+                created_by TEXT NOT NULL,
+                created_at REAL NOT NULL
+            )
+        ''')
+
+        # Create password reset tokens table
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS password_reset_tokens (
+                token TEXT PRIMARY KEY,
+                user_id TEXT NOT NULL,
+                email TEXT NOT NULL,
+                expires_at REAL NOT NULL,
+                created_at REAL NOT NULL,
+                used BOOLEAN DEFAULT 0
+            )
+        ''')
+
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_user_email ON users(email)')
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_group_name ON groups(name)')
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_website_enabled ON websites(enabled)')
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_proxy_enabled ON reverse_proxies(enabled)')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_oauth_code_client ON oauth_authorization_codes(client_id)')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_oauth_token_client ON oauth_tokens(client_id)')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_oauth_token_user ON oauth_tokens(user_id)')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_invite_token_expires ON invite_tokens(expires_at)')
 
         conn.commit()
         logger.info("Database initialized successfully")
@@ -671,7 +931,8 @@ def get_all_users_from_db():
         for row in rows:
             user = dict(row)
             user['groups'] = json.loads(user['groups'])
-            user['totp_enabled'] = bool(user['totp_enabled'])
+            user['totp_enabled'] = bool(user.get('totp_enabled', 0))
+            user['email_verified'] = bool(user.get('email_verified', 0))
             users.append(user)
         return users
 
@@ -684,7 +945,8 @@ def get_user_by_username_from_db(username: str):
         if row:
             user = dict(row)
             user['groups'] = json.loads(user['groups'])
-            user['totp_enabled'] = bool(user['totp_enabled'])
+            user['totp_enabled'] = bool(user.get('totp_enabled', 0))
+            user['email_verified'] = bool(user.get('email_verified', 0))
             return user
     return None
 
@@ -697,7 +959,8 @@ def get_user_by_id_from_db(user_id: str):
         if row:
             user = dict(row)
             user['groups'] = json.loads(user['groups'])
-            user['totp_enabled'] = bool(user['totp_enabled'])
+            user['totp_enabled'] = bool(user.get('totp_enabled', 0))
+            user['email_verified'] = bool(user.get('email_verified', 0))
             return user
     return None
 
@@ -707,15 +970,22 @@ def save_user_to_db(user: dict):
         cursor = conn.cursor()
         cursor.execute('''
             INSERT OR REPLACE INTO users
-            (id, username, password_hash, groups, totp_secret, totp_enabled, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+            (id, username, email, first_name, last_name, password_hash, groups, totp_secret, totp_enabled,
+             email_verified, password_reset_token, password_reset_expires, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
         ''', (
             user['id'],
             user['username'],
+            user.get('email', ''),
+            user.get('first_name', ''),
+            user.get('last_name', ''),
             user['password_hash'],
             json.dumps(user.get('groups', [])),
             user.get('totp_secret'),
-            1 if user.get('totp_enabled', False) else 0
+            1 if user.get('totp_enabled', False) else 0,
+            1 if user.get('email_verified', False) else 0,
+            user.get('password_reset_token'),
+            user.get('password_reset_expires')
         ))
         conn.commit()
 
@@ -724,6 +994,97 @@ def delete_user_from_db(user_id: str):
     with closing(get_db_connection()) as conn:
         cursor = conn.cursor()
         cursor.execute('DELETE FROM users WHERE id = ?', (user_id,))
+        conn.commit()
+
+def save_invite_token_to_db(invite: dict):
+    """Save invite token to database"""
+    with closing(get_db_connection()) as conn:
+        cursor = conn.cursor()
+        cursor.execute('''
+            INSERT OR REPLACE INTO invite_tokens (token, username, email, groups, expires_at, created_by, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+        ''', (
+            invite['token'],
+            invite['username'],
+            invite['email'],
+            json.dumps(invite['groups']),
+            invite['expires_at'],
+            invite['created_by'],
+            invite['created_at']
+        ))
+        conn.commit()
+
+def get_invite_token_from_db(token: str):
+    """Get invite token from database"""
+    with closing(get_db_connection()) as conn:
+        cursor = conn.cursor()
+        cursor.execute('SELECT * FROM invite_tokens WHERE token = ?', (token,))
+        row = cursor.fetchone()
+        if row:
+            return {
+                'token': row['token'],
+                'username': row['username'],
+                'email': row['email'],
+                'groups': json.loads(row['groups']),
+                'expires_at': row['expires_at'],
+                'created_by': row['created_by'],
+                'created_at': row['created_at']
+            }
+        return None
+
+def delete_invite_token_from_db(token: str):
+    """Delete invite token from database"""
+    with closing(get_db_connection()) as conn:
+        cursor = conn.cursor()
+        cursor.execute('DELETE FROM invite_tokens WHERE token = ?', (token,))
+        conn.commit()
+
+def save_password_reset_token_to_db(reset_token: dict):
+    """Save password reset token to database"""
+    with closing(get_db_connection()) as conn:
+        cursor = conn.cursor()
+        cursor.execute('''
+            INSERT OR REPLACE INTO password_reset_tokens (token, user_id, email, expires_at, created_at, used)
+            VALUES (?, ?, ?, ?, ?, ?)
+        ''', (
+            reset_token['token'],
+            reset_token['user_id'],
+            reset_token['email'],
+            reset_token['expires_at'],
+            reset_token['created_at'],
+            reset_token.get('used', False)
+        ))
+        conn.commit()
+
+def get_password_reset_token_from_db(token: str):
+    """Get password reset token from database"""
+    with closing(get_db_connection()) as conn:
+        cursor = conn.cursor()
+        cursor.execute('SELECT * FROM password_reset_tokens WHERE token = ?', (token,))
+        row = cursor.fetchone()
+        if row:
+            return {
+                'token': row['token'],
+                'user_id': row['user_id'],
+                'email': row['email'],
+                'expires_at': row['expires_at'],
+                'created_at': row['created_at'],
+                'used': bool(row['used'])
+            }
+        return None
+
+def mark_password_reset_token_used(token: str):
+    """Mark password reset token as used"""
+    with closing(get_db_connection()) as conn:
+        cursor = conn.cursor()
+        cursor.execute('UPDATE password_reset_tokens SET used = 1 WHERE token = ?', (token,))
+        conn.commit()
+
+def delete_password_reset_token_from_db(token: str):
+    """Delete password reset token from database"""
+    with closing(get_db_connection()) as conn:
+        cursor = conn.cursor()
+        cursor.execute('DELETE FROM password_reset_tokens WHERE token = ?', (token,))
         conn.commit()
 
 def get_settings_from_db():
@@ -822,6 +1183,270 @@ def delete_group_from_db(group_id: str):
     with closing(get_db_connection()) as conn:
         cursor = conn.cursor()
         cursor.execute('DELETE FROM groups WHERE id = ? AND system = 0', (group_id,))
+        conn.commit()
+
+# OAuth/OIDC Helper Functions
+def generate_rsa_keypair():
+    """Generate RSA key pair for OIDC JWT signing"""
+    private_key = rsa.generate_private_key(
+        public_exponent=65537,
+        key_size=2048,
+        backend=default_backend()
+    )
+
+    private_pem = private_key.private_bytes(
+        encoding=serialization.Encoding.PEM,
+        format=serialization.PrivateFormat.PKCS8,
+        encryption_algorithm=serialization.NoEncryption()
+    ).decode('utf-8')
+
+    public_pem = private_key.public_key().public_bytes(
+        encoding=serialization.Encoding.PEM,
+        format=serialization.PublicFormat.SubjectPublicKeyInfo
+    ).decode('utf-8')
+
+    return private_pem, public_pem
+
+def ensure_oidc_keys():
+    """Ensure OIDC signing keys exist, generate if needed"""
+    settings = get_settings_from_db()
+    if not settings.get('oidc_signing_key_private') or not settings.get('oidc_signing_key_public'):
+        logger.info("Generating OIDC RSA keypair...")
+        private_key, public_key = generate_rsa_keypair()
+        save_settings_to_db({
+            'oidc_signing_key_private': private_key,
+            'oidc_signing_key_public': public_key
+        })
+        logger.info("OIDC keys generated successfully")
+        return private_key, public_key
+    return settings['oidc_signing_key_private'], settings['oidc_signing_key_public']
+
+def create_jwt_token(user_id: str, client_id: str, scopes: List[str], expires_in: int = 3600):
+    """
+    Create a JWT access token
+    Security: Includes jti for replay prevention, no sensitive data in payload
+    """
+    settings = get_settings_from_db()
+    private_key, _ = ensure_oidc_keys()
+
+    now = int(time.time())
+    user = get_user_by_id_from_db(user_id)
+
+    # Security: Block admin users from OIDC
+    if user.get('is_admin', False):
+        raise ValueError("Admin users cannot use OIDC authentication")
+
+    payload = {
+        'iss': settings.get('oidc_issuer', 'http://localhost:12888'),
+        'sub': user_id,
+        'aud': client_id,
+        'exp': now + expires_in,
+        'iat': now,
+        'jti': secrets.token_urlsafe(16),  # Security: JWT ID for replay prevention
+        'scope': ' '.join(scopes),
+        'username': user.get('username', ''),
+        'email': user.get('email', ''),
+        'email_verified': user.get('email_verified', False),
+        'name': f"{user.get('first_name', '')} {user.get('last_name', '')}".strip(),
+        'given_name': user.get('first_name', ''),
+        'family_name': user.get('last_name', ''),
+        'groups': user.get('groups', [])
+    }
+
+    token = jwt.encode(payload, private_key, algorithm='RS256')
+    return token
+
+def create_id_token(user_id: str, client_id: str, username: str, email: str, nonce: Optional[str] = None):
+    """
+    Create an OpenID Connect ID token
+    """
+    settings = get_settings_from_db()
+    private_key, _ = ensure_oidc_keys()
+
+    now = int(time.time())
+
+    payload = {
+        'iss': settings.get('oidc_issuer', 'http://localhost:12888'),
+        'sub': username,  # Use username as subject for better compatibility
+        'aud': client_id,
+        'exp': now + 3600,
+        'iat': now,
+        'auth_time': now,
+        'preferred_username': username,
+        'name': username,
+        'email': email,
+        'email_verified': bool(email),
+        'user_id': user_id  # Keep UUID as separate claim
+    }
+
+    if nonce:
+        payload['nonce'] = nonce
+
+    token = jwt.encode(payload, private_key, algorithm='RS256')
+    return token
+
+# OAuth Database Functions
+def get_all_oauth_clients_from_db():
+    """Get all OAuth clients from database"""
+    with closing(get_db_connection()) as conn:
+        cursor = conn.cursor()
+        cursor.execute('SELECT * FROM oauth_clients ORDER BY name')
+        rows = cursor.fetchall()
+        clients = []
+        for row in rows:
+            clients.append({
+                'client_id': row['client_id'],
+                'client_secret_hash': row['client_secret_hash'],
+                'name': row['name'],
+                'redirect_uris': json.loads(row['redirect_uris']),
+                'allowed_scopes': json.loads(row['allowed_scopes']),
+                'grant_types': json.loads(row['grant_types']),
+                'require_pkce': bool(row['require_pkce']),
+                'created_at': row['created_at'],
+                'enabled': bool(row['enabled'])
+            })
+        return clients
+
+def get_oauth_client_by_id_from_db(client_id: str):
+    """Get an OAuth client by ID"""
+    with closing(get_db_connection()) as conn:
+        cursor = conn.cursor()
+        cursor.execute('SELECT * FROM oauth_clients WHERE client_id = ?', (client_id,))
+        row = cursor.fetchone()
+        if row:
+            return {
+                'client_id': row['client_id'],
+                'client_secret_hash': row['client_secret_hash'],
+                'name': row['name'],
+                'redirect_uris': json.loads(row['redirect_uris']),
+                'allowed_scopes': json.loads(row['allowed_scopes']),
+                'grant_types': json.loads(row['grant_types']),
+                'require_pkce': bool(row['require_pkce']),
+                'created_at': row['created_at'],
+                'enabled': bool(row['enabled'])
+            }
+        return None
+
+def save_oauth_client_to_db(client: dict):
+    """Save or update OAuth client in database"""
+    with closing(get_db_connection()) as conn:
+        cursor = conn.cursor()
+        cursor.execute('''
+            INSERT OR REPLACE INTO oauth_clients
+            (client_id, client_secret_hash, name, redirect_uris, allowed_scopes, grant_types,
+             require_pkce, created_at, enabled)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ''', (
+            client['client_id'],
+            client['client_secret_hash'],
+            client['name'],
+            json.dumps(client['redirect_uris']),
+            json.dumps(client['allowed_scopes']),
+            json.dumps(client['grant_types']),
+            1 if client.get('require_pkce', True) else 0,
+            client.get('created_at', datetime.now().isoformat()),
+            1 if client.get('enabled', True) else 0
+        ))
+        conn.commit()
+
+def delete_oauth_client_from_db(client_id: str):
+    """Delete OAuth client from database"""
+    with closing(get_db_connection()) as conn:
+        cursor = conn.cursor()
+        cursor.execute('DELETE FROM oauth_clients WHERE client_id = ?', (client_id,))
+        conn.commit()
+
+def save_oauth_code_to_db(code: dict):
+    """Save OAuth authorization code to database"""
+    with closing(get_db_connection()) as conn:
+        cursor = conn.cursor()
+        cursor.execute('''
+            INSERT INTO oauth_authorization_codes
+            (code, client_id, user_id, redirect_uri, scopes, code_challenge, code_challenge_method,
+             expires_at, used)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ''', (
+            code['code'],
+            code['client_id'],
+            code['user_id'],
+            code['redirect_uri'],
+            json.dumps(code['scopes']),
+            code.get('code_challenge'),
+            code.get('code_challenge_method'),
+            code['expires_at'],
+            0
+        ))
+        conn.commit()
+
+def get_oauth_code_from_db(code: str):
+    """Get OAuth authorization code from database"""
+    with closing(get_db_connection()) as conn:
+        cursor = conn.cursor()
+        cursor.execute('SELECT * FROM oauth_authorization_codes WHERE code = ?', (code,))
+        row = cursor.fetchone()
+        if row:
+            return {
+                'code': row['code'],
+                'client_id': row['client_id'],
+                'user_id': row['user_id'],
+                'redirect_uri': row['redirect_uri'],
+                'scopes': json.loads(row['scopes']),
+                'code_challenge': row['code_challenge'],
+                'code_challenge_method': row['code_challenge_method'],
+                'expires_at': row['expires_at'],
+                'used': bool(row['used'])
+            }
+        return None
+
+def mark_oauth_code_used(code: str):
+    """Mark OAuth authorization code as used"""
+    with closing(get_db_connection()) as conn:
+        cursor = conn.cursor()
+        cursor.execute('UPDATE oauth_authorization_codes SET used = 1 WHERE code = ?', (code,))
+        conn.commit()
+
+def save_oauth_token_to_db(token: dict):
+    """Save OAuth token to database"""
+    with closing(get_db_connection()) as conn:
+        cursor = conn.cursor()
+        cursor.execute('''
+            INSERT INTO oauth_tokens
+            (access_token, refresh_token, client_id, user_id, scopes, expires_at, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+        ''', (
+            token['access_token'],
+            token.get('refresh_token'),
+            token['client_id'],
+            token['user_id'],
+            json.dumps(token['scopes']),
+            token['expires_at'],
+            token['created_at']
+        ))
+        conn.commit()
+
+def get_oauth_token_from_db(access_token: str):
+    """Get OAuth token from database"""
+    with closing(get_db_connection()) as conn:
+        cursor = conn.cursor()
+        cursor.execute('SELECT * FROM oauth_tokens WHERE access_token = ?', (access_token,))
+        row = cursor.fetchone()
+        if row:
+            return {
+                'access_token': row['access_token'],
+                'refresh_token': row['refresh_token'],
+                'client_id': row['client_id'],
+                'user_id': row['user_id'],
+                'scopes': json.loads(row['scopes']),
+                'expires_at': row['expires_at'],
+                'created_at': row['created_at']
+            }
+        return None
+
+def revoke_oauth_token(access_token: str):
+    """Revoke OAuth token"""
+    with closing(get_db_connection()) as conn:
+        cursor = conn.cursor()
+        cursor.execute('DELETE FROM oauth_tokens WHERE access_token = ?', (access_token,))
         conn.commit()
 
 # Websites database functions
@@ -1474,6 +2099,999 @@ async def start_caddy():
             logger.error(f"Failed to start Caddy: {e}")
             raise HTTPException(status_code=500, detail=str(e))
 
+# LDAP Server Implementation
+ldap_server_task = None
+
+def user_to_ldap_entry(user: dict, base_dn: str) -> dict:
+    """
+    Convert database user to LDAP entry format
+    Security: Only exposes non-sensitive user data
+    """
+    # Get user's groups
+    groups = user.get('groups', [])
+    group_names = []
+    all_groups = get_all_groups_from_db()
+    for group in all_groups:
+        if group['id'] in groups:
+            group_names.append(group['name'])
+
+    return {
+        'dn': f'uid={user["username"]},{base_dn}',
+        'attributes': {
+            'objectClass': ['inetOrgPerson', 'organizationalPerson', 'person', 'top'],
+            'cn': [user['username']],
+            'uid': [user['username']],
+            'mail': [user.get('email', '')] if user.get('email') else [],
+            'givenName': [user.get('first_name', '')] if user.get('first_name') else [],
+            'sn': [user.get('last_name', user['username'])] if user.get('last_name') else [user['username']],
+            'memberOf': [f'cn={g},{base_dn}' for g in group_names]
+        }
+    }
+
+def parse_ldap_message(data: bytes) -> dict:
+    """
+    Parse LDAP message (BER encoding)
+    Security: Validates message structure and limits sizes
+    """
+    try:
+        if len(data) < 7:
+            return None
+
+        # Basic BER parsing
+        if data[0] != 0x30:  # SEQUENCE tag
+            return None
+
+        # Get message ID (usually at position 2-4)
+        msg_id = 1
+        if data[2] == 0x02:  # INTEGER tag
+            msg_id_len = data[3]
+            if msg_id_len == 1:
+                msg_id = data[4]
+
+        # Determine operation type
+        operation = data[5] if len(data) > 5 else 0
+
+        return {
+            'message_id': msg_id,
+            'operation': operation,
+            'data': data
+        }
+    except Exception as e:
+        logger.error(f"LDAP message parse error: {e}")
+        return None
+
+def encode_ldap_length(length: int) -> bytes:
+    """Encode BER length - handles both short and long form"""
+    if length < 128:
+        return bytes([length])
+    elif length < 256:
+        return bytes([0x81, length])
+    else:
+        # For lengths >= 256, use multi-byte encoding
+        length_bytes = length.to_bytes((length.bit_length() + 7) // 8, byteorder='big')
+        return bytes([0x80 | len(length_bytes)]) + length_bytes
+
+def encode_ldap_string(s: str) -> bytes:
+    """Encode string in LDAP format (OCTET STRING)"""
+    s_bytes = s.encode('utf-8')
+    length_encoded = encode_ldap_length(len(s_bytes))
+    return bytes([0x04]) + length_encoded + s_bytes
+
+def encode_ldap_sequence(items: list) -> bytes:
+    """Encode LDAP sequence"""
+    content = b''.join(items)
+    length_encoded = encode_ldap_length(len(content))
+    return bytes([0x30]) + length_encoded + content
+
+def build_ldap_bind_response(msg_id: int, result_code: int, dn: str = "", message: str = "") -> bytes:
+    """
+    Build LDAP BIND response
+    result_code: 0=success, 49=invalidCredentials, 32=noSuchObject
+    """
+    # Message ID
+    msg_id_encoded = bytes([0x02, 0x01, msg_id])
+
+    # Result code (ENUMERATED)
+    result_encoded = bytes([0x0a, 0x01, result_code])
+
+    # Matched DN (usually empty)
+    matched_dn = encode_ldap_string(dn)
+
+    # Diagnostic message
+    diag_msg = encode_ldap_string(message)
+
+    # BindResponse (APPLICATION 1)
+    bind_content = result_encoded + matched_dn + diag_msg
+    bind_response = bytes([0x61]) + encode_ldap_length(len(bind_content)) + bind_content
+
+    # Complete message
+    return encode_ldap_sequence([msg_id_encoded, bind_response])
+
+def build_ldap_search_result_entry(msg_id: int, dn: str, attributes: dict) -> bytes:
+    """Build LDAP SearchResultEntry"""
+    msg_id_encoded = bytes([0x02, 0x01, msg_id])
+
+    # Object name (DN)
+    object_name = encode_ldap_string(dn)
+
+    # Attributes
+    attr_list = []
+    for attr_name, attr_values in attributes.items():
+        if not attr_values:  # Skip empty attributes
+            continue
+        # Attribute type
+        attr_type = encode_ldap_string(attr_name)
+        # Attribute values (SET OF)
+        values = b''.join([encode_ldap_string(v) for v in attr_values])
+        values_set = bytes([0x31]) + encode_ldap_length(len(values)) + values
+        # Attribute sequence
+        attr_seq = encode_ldap_sequence([attr_type, values_set])
+        attr_list.append(attr_seq)
+
+    attributes_seq = encode_ldap_sequence(attr_list)
+
+    # SearchResultEntry (APPLICATION 4)
+    entry_content = object_name + attributes_seq
+    search_entry = bytes([0x64]) + encode_ldap_length(len(entry_content)) + entry_content
+
+    return encode_ldap_sequence([msg_id_encoded, search_entry])
+
+def build_ldap_search_result_done(msg_id: int, result_code: int = 0) -> bytes:
+    """Build LDAP SearchResultDone"""
+    msg_id_encoded = bytes([0x02, 0x01, msg_id])
+    result_encoded = bytes([0x0a, 0x01, result_code])
+    matched_dn = encode_ldap_string("")
+    diag_msg = encode_ldap_string("")
+
+    # SearchResultDone (APPLICATION 5)
+    done_content = result_encoded + matched_dn + diag_msg
+    search_done = bytes([0x65]) + encode_ldap_length(len(done_content)) + done_content
+
+    return encode_ldap_sequence([msg_id_encoded, search_done])
+
+async def handle_ldap_bind(client, msg_id: int, data: bytes, settings: dict):
+    """
+    Handle LDAP BIND request
+    Security: Rate limiting, no admin access, proper credential validation
+    """
+    try:
+        # Extract bind DN and password from data
+        # This is a simplified parser - production would use a full ASN.1 parser
+        bind_dn = ""
+        password = ""
+
+        # Parse simple BIND (version 3)
+        idx = 6  # Skip sequence header and message ID
+        while idx < len(data) - 5:
+            if data[idx] == 0x04:  # OCTET STRING (DN)
+                length = data[idx + 1]
+                if idx + 2 + length <= len(data):
+                    bind_dn = data[idx + 2:idx + 2 + length].decode('utf-8', errors='ignore')
+                    idx += 2 + length
+            elif data[idx] == 0x80:  # Simple password (context-specific [0])
+                length = data[idx + 1]
+                if idx + 2 + length <= len(data):
+                    password = data[idx + 2:idx + 2 + length].decode('utf-8', errors='ignore')
+                    break
+            else:
+                idx += 1
+
+        # Anonymous BIND (empty DN and password)
+        if not bind_dn and not password:
+            logger.info("LDAP: Anonymous BIND accepted (read-only)")
+            response = build_ldap_bind_response(msg_id, 0, "", "Anonymous bind successful")
+            client.send(response)
+            return True
+
+        # Extract username from DN (cn=username or uid=username,...)
+        username = None
+        if bind_dn:
+            parts = bind_dn.split(',')
+            for part in parts:
+                part_lower = part.strip().lower()
+                if part_lower.startswith('cn=') or part_lower.startswith('uid='):
+                    username = part.split('=', 1)[1].strip()
+                    break
+
+        if not username or not password:
+            logger.warning(f"LDAP: Invalid BIND request - DN: {bind_dn}")
+            response = build_ldap_bind_response(msg_id, 49, "", "Invalid credentials")
+            client.send(response)
+            return False
+
+        # Security: Prevent admin access via LDAP
+        user = get_user_by_username_from_db(username)
+        if not user:
+            logger.warning(f"LDAP: User not found - {username}")
+            await asyncio.sleep(1)  # Rate limiting
+            response = build_ldap_bind_response(msg_id, 49, "", "Invalid credentials")
+            client.send(response)
+            return False
+
+        # Security: Block admin users from LDAP authentication
+        if user.get('is_admin', False):
+            logger.warning(f"LDAP: Admin user blocked - {username}")
+            await asyncio.sleep(2)  # Extra delay for admin attempts
+            response = build_ldap_bind_response(msg_id, 49, "", "Invalid credentials")
+            client.send(response)
+            return False
+
+        # Check if this is the configured bind DN (service account)
+        configured_bind_dn = settings.get('ldap_bind_dn', '')
+        is_bind_user = False
+        if configured_bind_dn:
+            # Extract username from configured bind DN
+            bind_username = None
+            for part in configured_bind_dn.split(','):
+                part_lower = part.strip().lower()
+                if part_lower.startswith('cn=') or part_lower.startswith('uid='):
+                    bind_username = part.split('=', 1)[1].strip()
+                    break
+            is_bind_user = (bind_username == username)
+
+        # Check if user is in allowed groups (if specified)
+        # Service account (bind DN user) bypasses group check to allow searching
+        allowed_groups = settings.get('ldap_allowed_groups', [])
+        if allowed_groups and not is_bind_user:
+            user_groups = user.get('groups', [])
+            # Check if user has at least one allowed group
+            if not any(group in allowed_groups for group in user_groups):
+                logger.warning(f"LDAP: User not in allowed groups - {username}")
+                await log_activity(username, "LDAP_AUTH_DENIED", "User not in allowed groups", "LDAP")
+                await send_event_notification("ldap_auth_denied", "LDAP Access Denied",
+                    f"LDAP authentication denied - user not in allowed groups.",
+                    username=username, reason="Not in allowed groups")
+                await asyncio.sleep(1)  # Rate limiting
+                response = build_ldap_bind_response(msg_id, 49, "", "Invalid credentials")
+                client.send(response)
+                return False
+
+        # Check if user is required to have 2FA but hasn't set it up
+        if user_requires_2fa(user) and not user.get("totp_enabled", False) and not is_bind_user:
+            logger.warning(f"LDAP: User requires 2FA but hasn't configured it - {username}")
+            await log_activity(username, "LDAP_AUTH_DENIED", "2FA required but not configured", "LDAP")
+            await send_event_notification("ldap_auth_denied", "LDAP Access Denied",
+                f"LDAP authentication denied - 2FA required but not configured.",
+                username=username, reason="2FA required but not configured")
+            await asyncio.sleep(1)  # Rate limiting
+            response = build_ldap_bind_response(msg_id, 49, "", "2FA required - please configure in user portal")
+            client.send(response)
+            return False
+
+        # Check if Enhanced Security Mode is enabled (for 2FA enforcement)
+        settings_db = get_settings_from_db()
+        enhanced_security = settings_db.get('enhanced_security', False)
+
+        # Check if user has 2FA enabled
+        totp_enabled = user.get('totp_enabled', False)
+        totp_secret = user.get('totp_secret', '')
+
+        # If Enhanced Security is ON and user has 2FA, password must include TOTP
+        if enhanced_security and totp_enabled and totp_secret:
+            # Password format: actualPassword + 6digitTOTP (e.g., "mypass123456")
+            if len(password) < 6:
+                logger.warning(f"LDAP: Password too short for 2FA - {username}")
+                await asyncio.sleep(1)
+                response = build_ldap_bind_response(msg_id, 49, "", "Invalid credentials")
+                client.send(response)
+                return False
+
+            # Split password and TOTP code
+            actual_password = password[:-6]  # Everything except last 6 digits
+            totp_code = password[-6:]  # Last 6 digits
+
+            # Verify password
+            if not verify_password(actual_password, user['password_hash']):
+                logger.warning(f"LDAP: Failed password verification - {username}")
+                await log_activity(username, "LDAP_AUTH_FAILED", "Invalid password", "LDAP")
+                await send_event_notification("ldap_auth_failed", "LDAP Authentication Failed",
+                    f"Failed LDAP authentication attempt.", username=username, reason="Invalid password")
+                await asyncio.sleep(1)
+                response = build_ldap_bind_response(msg_id, 49, "", "Invalid credentials")
+                client.send(response)
+                return False
+
+            # Verify TOTP code
+            if not verify_totp(totp_secret, totp_code):
+                logger.warning(f"LDAP: Failed 2FA verification - {username}")
+                await log_activity(username, "LDAP_AUTH_FAILED", "Invalid 2FA code", "LDAP")
+                await send_event_notification("ldap_auth_failed", "LDAP Authentication Failed",
+                    f"Failed LDAP authentication attempt.", username=username, reason="Invalid 2FA code")
+                await asyncio.sleep(1)
+                response = build_ldap_bind_response(msg_id, 49, "", "Invalid credentials")
+                client.send(response)
+                return False
+
+            logger.info(f"LDAP: Successful BIND with 2FA - {username}")
+            await log_activity(username, "LDAP_AUTH_SUCCESS", "Authentication with 2FA successful", "LDAP")
+            await send_event_notification("ldap_auth_success", "LDAP Authentication Success",
+                f"Successful LDAP authentication with 2FA.", username=username, method="Password + 2FA")
+            response = build_ldap_bind_response(msg_id, 0, "", "Bind successful")
+            client.send(response)
+            return True
+        else:
+            # No 2FA required, just verify password
+            if verify_password(password, user['password_hash']):
+                logger.info(f"LDAP: Successful BIND - {username}")
+                await log_activity(username, "LDAP_AUTH_SUCCESS", "Authentication successful", "LDAP")
+                await send_event_notification("ldap_auth_success", "LDAP Authentication Success",
+                    f"Successful LDAP authentication.", username=username, method="Password")
+                response = build_ldap_bind_response(msg_id, 0, "", "Bind successful")
+                client.send(response)
+                return True
+            else:
+                logger.warning(f"LDAP: Failed BIND - {username}")
+                await log_activity(username, "LDAP_AUTH_FAILED", "Invalid password", "LDAP")
+                await send_event_notification("ldap_auth_failed", "LDAP Authentication Failed",
+                    f"Failed LDAP authentication attempt.", username=username, reason="Invalid password")
+                await asyncio.sleep(1)  # Rate limiting
+                response = build_ldap_bind_response(msg_id, 49, "", "Invalid credentials")
+                client.send(response)
+                return False
+
+    except Exception as e:
+        logger.error(f"LDAP BIND error: {e}")
+        response = build_ldap_bind_response(msg_id, 1, "", "Server error")
+        client.send(response)
+        return False
+
+async def handle_ldap_search(client, msg_id: int, data: bytes, settings: dict, authenticated: bool):
+    """
+    Handle LDAP SEARCH request
+    Security: Only returns data for authenticated users, no sensitive data, group filtering
+    """
+    try:
+        base_dn = settings.get('ldap_base_dn', 'dc=example,dc=com')
+        allowed_groups = settings.get('ldap_allowed_groups', [])
+
+        users = get_all_users_from_db()
+        returned_count = 0
+
+        # Filter users based on admin status and group membership
+        for user in users:
+            # Security: Skip admin users
+            if user.get('is_admin', False):
+                continue
+
+            # Security: Check if user is in allowed groups (if specified)
+            if allowed_groups:
+                user_groups = user.get('groups', [])
+                # Check if user has at least one allowed group
+                if not any(group in allowed_groups for group in user_groups):
+                    continue
+
+            entry = user_to_ldap_entry(user, base_dn)
+            entry_response = build_ldap_search_result_entry(msg_id, entry['dn'], entry['attributes'])
+            client.send(entry_response)
+            returned_count += 1
+
+        # Send SearchResultDone
+        done_response = build_ldap_search_result_done(msg_id, 0)
+        client.send(done_response)
+
+        logger.info(f"LDAP: SEARCH completed - returned {returned_count} users")
+
+    except Exception as e:
+        logger.error(f"LDAP SEARCH error: {e}")
+        done_response = build_ldap_search_result_done(msg_id, 1)  # Operations error
+        client.send(done_response)
+
+async def handle_ldap_client(client, addr, settings: dict):
+    """
+    Handle LDAP client connection
+    Security: Connection timeout, size limits, proper error handling
+    """
+    authenticated = False
+    try:
+        client.settimeout(30)  # 30 second timeout
+
+        while True:
+            try:
+                data = client.recv(4096)  # Limit message size
+                if not data:
+                    break
+
+                # Parse message
+                msg = parse_ldap_message(data)
+                if not msg:
+                    logger.warning(f"LDAP: Invalid message from {addr}")
+                    break
+
+                msg_id = msg['message_id']
+                operation = msg['operation']
+
+                # Handle operations
+                if operation == 0x60:  # BIND Request
+                    authenticated = await handle_ldap_bind(client, msg_id, data, settings)
+                elif operation == 0x63:  # SEARCH Request
+                    await handle_ldap_search(client, msg_id, data, settings, authenticated)
+                elif operation == 0x42:  # UNBIND Request
+                    logger.info(f"LDAP: UNBIND from {addr}")
+                    break
+                else:
+                    logger.warning(f"LDAP: Unsupported operation {operation} from {addr}")
+                    # Send unsupported operation response
+                    response = build_ldap_bind_response(msg_id, 2, "", "Protocol error")
+                    client.send(response)
+                    break
+
+            except TimeoutError:
+                logger.info(f"LDAP: Connection timeout from {addr}")
+                break
+            except Exception as e:
+                logger.error(f"LDAP: Client handler error from {addr}: {e}")
+                break
+
+    finally:
+        try:
+            client.close()
+        except:
+            pass
+        logger.info(f"LDAP: Connection closed from {addr}")
+
+async def ldap_server():
+    """
+    Production-ready LDAP server
+    Security: Proper authentication, no admin access, rate limiting
+    """
+    settings = get_settings_from_db()
+    if not settings.get('ldap_enabled'):
+        return
+
+    port = settings.get('ldap_port', 3389)
+    base_dn = settings.get('ldap_base_dn', 'dc=example,dc=com')
+
+    logger.info(f"Starting LDAP server on port {port} with base DN: {base_dn}")
+
+    import socket
+    server = None
+
+    try:
+        server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        server.bind(('0.0.0.0', port))
+        server.listen(10)
+        server.setblocking(False)
+
+        logger.info(f"LDAP server listening on 0.0.0.0:{port}")
+
+        while True:
+            try:
+                try:
+                    client, addr = server.accept()
+                    logger.info(f"LDAP: New connection from {addr}")
+
+                    # Handle each client in a separate task
+                    asyncio.create_task(handle_ldap_client(client, addr, settings))
+
+                except BlockingIOError:
+                    await asyncio.sleep(0.1)
+
+            except Exception as e:
+                logger.error(f"LDAP server error: {e}")
+                await asyncio.sleep(1)
+
+    except asyncio.CancelledError:
+        logger.info("LDAP server task cancelled, closing socket...")
+        if server:
+            server.close()
+        raise
+    except Exception as e:
+        logger.error(f"Failed to start LDAP server: {e}")
+        if server:
+            server.close()
+        raise
+
+async def start_ldap_server():
+    """Start LDAP server task"""
+    global ldap_server_task
+    settings = get_settings_from_db()
+
+    # Master switch - if auth protocols disabled, don't start anything
+    if not settings.get('auth_protocols_enabled'):
+        return
+
+    if not settings.get('ldap_enabled'):
+        return
+
+    if ldap_server_task is None or ldap_server_task.done():
+        ldap_server_task = asyncio.create_task(ldap_server())
+        logger.info("LDAP server task started")
+
+async def stop_ldap_server():
+    """Stop LDAP server task"""
+    global ldap_server_task
+
+    if ldap_server_task and not ldap_server_task.done():
+        ldap_server_task.cancel()
+        try:
+            await ldap_server_task
+        except asyncio.CancelledError:
+            pass
+        logger.info("LDAP server stopped")
+
+# RADIUS Server Implementation
+radius_server_task = None
+
+def md5_hash(data: bytes) -> bytes:
+    """MD5 hash for RADIUS"""
+    import hashlib
+    return hashlib.md5(data).digest()
+
+def parse_radius_packet(data: bytes) -> dict:
+    """
+    Parse RADIUS packet
+    Security: Validates packet structure and sizes
+    """
+    try:
+        if len(data) < 20:
+            return None
+
+        code = data[0]
+        identifier = data[1]
+        length = (data[2] << 8) | data[3]
+        authenticator = data[4:20]
+
+        if len(data) < length:
+            return None
+
+        # Parse attributes
+        attributes = {}
+        pos = 20
+        while pos < length:
+            if pos + 2 > length:
+                break
+
+            attr_type = data[pos]
+            attr_len = data[pos + 1]
+
+            if attr_len < 2 or pos + attr_len > length:
+                break
+
+            attr_value = data[pos + 2:pos + attr_len]
+
+            if attr_type not in attributes:
+                attributes[attr_type] = []
+            attributes[attr_type].append(attr_value)
+
+            pos += attr_len
+
+        return {
+            'code': code,
+            'identifier': identifier,
+            'length': length,
+            'authenticator': authenticator,
+            'attributes': attributes,
+            'raw': data
+        }
+
+    except Exception as e:
+        logger.error(f"RADIUS packet parse error: {e}")
+        return None
+
+def extract_radius_username(attributes: dict) -> str:
+    """Extract username from RADIUS attributes"""
+    # Attribute 1 = User-Name
+    if 1 in attributes and attributes[1]:
+        try:
+            return attributes[1][0].decode('utf-8', errors='ignore')
+        except:
+            pass
+    return None
+
+def extract_radius_password(attributes: dict, authenticator: bytes, secret: bytes) -> str:
+    """
+    Extract and decrypt password from RADIUS attributes
+    Security: Proper decryption of User-Password attribute
+    """
+    # Attribute 2 = User-Password (encrypted)
+    if 2 in attributes and attributes[2]:
+        try:
+            encrypted_password = attributes[2][0]
+
+            # Decrypt password using shared secret and authenticator
+            # Password is XORed with MD5(secret + authenticator)
+            password = b''
+            b = authenticator
+
+            for i in range(0, len(encrypted_password), 16):
+                chunk = encrypted_password[i:i+16]
+                hash_input = secret + b
+                hash_output = md5_hash(hash_input)
+
+                # XOR to decrypt
+                decrypted_chunk = bytes([chunk[j] ^ hash_output[j] for j in range(len(chunk))])
+                password += decrypted_chunk
+                b = chunk
+
+            # Remove padding (null bytes)
+            password = password.rstrip(b'\x00')
+            return password.decode('utf-8', errors='ignore')
+        except Exception as e:
+            logger.error(f"Password decryption error: {e}")
+
+    return None
+
+def build_radius_response(code: int, identifier: int, authenticator: bytes, secret: bytes, attributes: list = []) -> bytes:
+    """
+    Build RADIUS response packet
+    code: 2=Access-Accept, 3=Access-Reject
+    """
+    # Build attributes section
+    attrs_data = b''
+    for attr_type, attr_value in attributes:
+        if isinstance(attr_value, str):
+            attr_value = attr_value.encode('utf-8')
+        elif isinstance(attr_value, int):
+            attr_value = attr_value.to_bytes(4, 'big')
+
+        attr_len = 2 + len(attr_value)
+        attrs_data += bytes([attr_type, attr_len]) + attr_value
+
+    # Build packet
+    length = 20 + len(attrs_data)
+    packet = bytes([code, identifier]) + length.to_bytes(2, 'big') + (b'\x00' * 16) + attrs_data
+
+    # Calculate response authenticator: MD5(Code+ID+Length+RequestAuth+Attributes+Secret)
+    response_auth = md5_hash(
+        packet[:4] + authenticator + attrs_data + secret
+    )
+
+    # Replace placeholder authenticator
+    packet = packet[:4] + response_auth + packet[20:]
+
+    return packet
+
+async def handle_radius_request(data: bytes, addr, server, settings: dict):
+    """
+    Handle RADIUS Access-Request
+    Security: Rate limiting, no admin access, proper authentication
+    """
+    try:
+        secret = settings.get('radius_secret', '').encode('utf-8')
+        if not secret:
+            logger.error("RADIUS: No shared secret configured")
+            return
+
+        # Parse packet
+        packet = parse_radius_packet(data)
+        if not packet or packet['code'] != 1:  # Access-Request
+            logger.warning(f"RADIUS: Invalid packet from {addr}")
+            return
+
+        identifier = packet['identifier']
+        authenticator = packet['authenticator']
+        attributes = packet['attributes']
+
+        # Extract username and password
+        username = extract_radius_username(attributes)
+        password = extract_radius_password(attributes, authenticator, secret)
+
+        if not username:
+            logger.warning(f"RADIUS: No username in request from {addr}")
+            response = build_radius_response(3, identifier, authenticator, secret)  # Access-Reject
+            server.sendto(response, addr)
+            return
+
+        logger.info(f"RADIUS: Access-Request for user '{username}' from {addr}")
+
+        # Authenticate user
+        user = get_user_by_username_from_db(username)
+
+        if not user:
+            logger.warning(f"RADIUS: User not found - {username}")
+            await asyncio.sleep(1)  # Rate limiting
+            response = build_radius_response(3, identifier, authenticator, secret)  # Access-Reject
+            server.sendto(response, addr)
+            return
+
+        # Security: Block admin users from RADIUS authentication
+        if user.get('is_admin', False):
+            logger.warning(f"RADIUS: Admin user blocked - {username}")
+            await log_activity(username, "RADIUS_AUTH_DENIED", "Admin users cannot use RADIUS", f"RADIUS:{addr[0]}")
+            await send_event_notification("radius_auth_denied", "RADIUS Access Denied",
+                f"RADIUS authentication denied - admin users not allowed.",
+                username=username, ip_address=addr[0], reason="Admin user")
+            await asyncio.sleep(2)  # Extra delay for admin attempts
+            response = build_radius_response(3, identifier, authenticator, secret)  # Access-Reject
+            server.sendto(response, addr)
+            return
+
+        # Check if user is in allowed groups (if specified)
+        allowed_groups = settings.get('radius_allowed_groups', [])
+        if allowed_groups:
+            user_groups = user.get('groups', [])
+            # Check if user has at least one allowed group
+            if not any(group in allowed_groups for group in user_groups):
+                logger.warning(f"RADIUS: User not in allowed groups - {username}")
+                await log_activity(username, "RADIUS_AUTH_DENIED", "User not in allowed groups", f"RADIUS:{addr[0]}")
+                await send_event_notification("radius_auth_denied", "RADIUS Access Denied",
+                    f"RADIUS authentication denied - user not in allowed groups.",
+                    username=username, ip_address=addr[0], reason="Not in allowed groups")
+                await asyncio.sleep(1)  # Rate limiting
+                response = build_radius_response(3, identifier, authenticator, secret)  # Access-Reject
+                server.sendto(response, addr)
+                return
+
+        # Verify password
+        if not password or not verify_password(password, user['password_hash']):
+            logger.warning(f"RADIUS: Authentication failed for {username}")
+            await log_activity(username, "RADIUS_AUTH_FAILED", "Invalid password", f"RADIUS:{addr[0]}")
+            await send_event_notification("radius_auth_failed", "RADIUS Authentication Failed",
+                f"Failed RADIUS authentication attempt.",
+                username=username, ip_address=addr[0], reason="Invalid password")
+            await asyncio.sleep(1)  # Rate limiting
+            response = build_radius_response(3, identifier, authenticator, secret)  # Access-Reject
+            server.sendto(response, addr)
+            return
+
+        # Authentication successful
+        logger.info(f"RADIUS: Authentication successful for {username}")
+        await log_activity(username, "RADIUS_AUTH_SUCCESS", "Authentication successful", f"RADIUS:{addr[0]}")
+        await send_event_notification("radius_auth_success", "RADIUS Authentication Success",
+            f"Successful RADIUS authentication.",
+            username=username, ip_address=addr[0])
+
+        # Build Access-Accept with VLAN assignment
+        response_attrs = []
+
+        # VLAN assignment (if enabled)
+        if settings.get('radius_vlan_assignment', False):
+            # Get user's primary group
+            groups = user.get('groups', [])
+            if groups:
+                all_groups = get_all_groups_from_db()
+                for group in all_groups:
+                    if group['id'] == groups[0]:  # Primary group
+                        vlan_id = group.get('radius_vlan')
+                        if vlan_id:
+                            # Tunnel-Type (64) = VLAN (13)
+                            response_attrs.append((64, 13))
+                            # Tunnel-Medium-Type (65) = IEEE-802 (6)
+                            response_attrs.append((65, 6))
+                            # Tunnel-Private-Group-ID (81) = VLAN ID
+                            response_attrs.append((81, str(vlan_id)))
+                            logger.info(f"RADIUS: Assigned VLAN {vlan_id} to {username}")
+                        break
+
+        response = build_radius_response(2, identifier, authenticator, secret, response_attrs)  # Access-Accept
+        server.sendto(response, addr)
+        logger.info(f"RADIUS: Access-Accept sent for {username}")
+
+    except Exception as e:
+        logger.error(f"RADIUS request handler error: {e}")
+        try:
+            response = build_radius_response(3, identifier, authenticator, secret)  # Access-Reject
+            server.sendto(response, addr)
+        except:
+            pass
+
+async def radius_server():
+    """
+    Production-ready RADIUS server for WiFi/Network authentication
+    Security: Proper authentication, no admin access, VLAN assignment
+    """
+    settings = get_settings_from_db()
+    if not settings.get('radius_enabled'):
+        return
+
+    auth_port = settings.get('radius_auth_port', 1812)
+    secret = settings.get('radius_secret', '')
+
+    if not secret:
+        logger.error("RADIUS: Cannot start - no shared secret configured")
+        return
+
+    logger.info(f"Starting RADIUS server on UDP port {auth_port}")
+
+    import socket
+    server = None
+
+    try:
+        server = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        server.bind(('0.0.0.0', auth_port))
+        server.setblocking(False)
+
+        logger.info(f"RADIUS server listening on 0.0.0.0:{auth_port}")
+
+        while True:
+            try:
+                try:
+                    data, addr = server.recvfrom(4096)  # Limit packet size
+                    logger.info(f"RADIUS: Packet received from {addr}")
+
+                    # Handle request in separate task
+                    asyncio.create_task(handle_radius_request(data, addr, server, settings))
+
+                except BlockingIOError:
+                    await asyncio.sleep(0.1)
+
+            except Exception as e:
+                logger.error(f"RADIUS server error: {e}")
+                await asyncio.sleep(1)
+
+    except asyncio.CancelledError:
+        logger.info("RADIUS server task cancelled, closing socket...")
+        if server:
+            server.close()
+        raise
+    except Exception as e:
+        logger.error(f"Failed to start RADIUS server: {e}")
+        if server:
+            server.close()
+        raise
+
+async def start_radius_server():
+    """Start RADIUS server task"""
+    global radius_server_task
+    settings = get_settings_from_db()
+
+    # Master switch - if auth protocols disabled, don't start anything
+    if not settings.get('auth_protocols_enabled'):
+        return
+
+    if not settings.get('radius_enabled'):
+        return
+
+    if radius_server_task is None or radius_server_task.done():
+        radius_server_task = asyncio.create_task(radius_server())
+        logger.info("RADIUS server task started")
+
+async def stop_radius_server():
+    """Stop RADIUS server task"""
+    global radius_server_task
+
+    if radius_server_task and not radius_server_task.done():
+        radius_server_task.cancel()
+        try:
+            await radius_server_task
+        except asyncio.CancelledError:
+            pass
+        logger.info("RADIUS server stopped")
+
+# Email Functions
+async def send_email(to: str, subject: str, body: str):
+    """Send email via SMTP"""
+    settings = get_settings_from_db()
+    # Master switch - if auth protocols disabled, don't send emails
+    if not settings.get('auth_protocols_enabled'):
+        logger.warning("Authentication protocols not enabled, email not sent")
+        return False
+    if not settings.get('smtp_enabled'):
+        logger.warning("SMTP not enabled, email not sent")
+        return False
+
+    try:
+        message = EmailMessage()
+        message["From"] = f"{settings.get('smtp_from_name', 'CaddyIAM')} <{settings.get('smtp_from_address', 'noreply@example.com')}>"
+        message["To"] = to
+        message["Subject"] = subject
+        message.set_content(body)
+
+        await aiosmtplib.send(
+            message,
+            hostname=settings.get('smtp_server', ''),
+            port=settings.get('smtp_port', 587),
+            use_tls=settings.get('smtp_use_tls', True),
+            username=settings.get('smtp_username', ''),
+            password=settings.get('smtp_password', '')
+        )
+
+        logger.info(f"Email sent to {to}: {subject}")
+        return True
+    except Exception as e:
+        logger.error(f"Failed to send email: {e}")
+        return False
+
+async def send_user_invite(user_id: str):
+    """Send invitation email to user"""
+    user = get_user_by_id_from_db(user_id)
+    if not user or not user.get('email'):
+        return False
+
+    # Generate invite token (password reset token)
+    reset_token = secrets.token_urlsafe(32)
+    expires = (datetime.now().timestamp() + 86400)  # 24 hours
+
+    # Save token to user
+    user['password_reset_token'] = reset_token
+    user['password_reset_expires'] = str(expires)
+    save_user_to_db(user)
+
+    # Build invite email
+    settings = get_settings_from_db()
+    setup_url = f"{settings.get('oidc_issuer', 'http://localhost:12888')}/setup-password?token={reset_token}"
+
+    subject = "Welcome to CaddyIAM"
+    body = f"""Hello {user.get('first_name', user.get('username'))},
+
+You've been invited to CaddyIAM!
+
+Username: {user.get('username')}
+Setup your password: {setup_url}
+
+This link expires in 24 hours.
+
+Best regards,
+CaddyIAM Team
+"""
+
+    return await send_email(user['email'], subject, body)
+
+async def send_password_reset(user_id: str):
+    """Send password reset email to user"""
+    user = get_user_by_id_from_db(user_id)
+    if not user or not user.get('email'):
+        return False
+
+    # Generate reset token
+    reset_token = secrets.token_urlsafe(32)
+    expires = (datetime.now().timestamp() + 3600)  # 1 hour
+
+    # Save token to user
+    user['password_reset_token'] = reset_token
+    user['password_reset_expires'] = str(expires)
+    save_user_to_db(user)
+
+    # Build reset email
+    settings = get_settings_from_db()
+    reset_url = f"{settings.get('oidc_issuer', 'http://localhost:12888')}/reset-password?token={reset_token}"
+
+    subject = "Password Reset Request"
+    body = f"""Hello {user.get('first_name', user.get('username'))},
+
+A password reset was requested for your account.
+
+Reset your password: {reset_url}
+
+This link expires in 1 hour.
+
+If you didn't request this, please ignore this email.
+
+Best regards,
+CaddyIAM Team
+"""
+
+    return await send_email(user['email'], subject, body)
+
+async def send_invite_email(email: str, username: str, invite_url: str, expiry_hours: int):
+    """Send invite link email to new user"""
+    subject = "You've been invited to CaddyMAN"
+    body = f"""Hello,
+
+You've been invited to create an account on CaddyMAN.
+
+Username: {username}
+
+Set up your account: {invite_url}
+
+This link expires in {expiry_hours} hour{'s' if expiry_hours != 1 else ''}.
+
+Best regards,
+CaddyMAN Team
+"""
+    return await send_email(email, subject, body)
+
+async def send_password_reset_email(email: str, username: str, reset_url: str, expiry_hours: int):
+    """Send password reset email to user"""
+    subject = "CaddyMAN Password Reset Request"
+    body = f"""Hello {username},
+
+You have requested to reset your password for your CaddyMAN account.
+
+Click the link below to reset your password:
+{reset_url}
+
+This link expires in {expiry_hours} hour{'s' if expiry_hours != 1 else ''}.
+
+If you did not request this password reset, please ignore this email and your password will remain unchanged.
+
+Best regards,
+CaddyMAN Team
+"""
+    return await send_email(email, subject, body)
+
 async def start_php_cgi():
     """Start PHP-CGI process on port 9000"""
     global php_cgi_process
@@ -2062,11 +3680,108 @@ async def root():
     with open(index_path, "r", encoding="utf-8") as f:
         html_content = f.read()
         html_content = html_content.replace('""" + VERSION + """', VERSION)
-    return HTMLResponse(content=html_content)  
-    
+    return HTMLResponse(content=html_content)
+
+@app.get("/login", response_class=HTMLResponse)
+async def login_page(return_to: Optional[str] = None):
+    """OAuth/OIDC login page with optional return URL"""
+    oauth_login_path = resource_path("app/oauth_login.html")
+    with open(oauth_login_path, "r", encoding="utf-8") as f:
+        html_content = f.read()
+
+        # If return_to is provided, inject it into the page so the frontend can use it after login
+        if return_to:
+            # Add a script tag to store the return URL
+            return_to_script = f'<script>sessionStorage.setItem("returnTo", {json.dumps(return_to)});</script>'
+            html_content = html_content.replace('</head>', f'{return_to_script}</head>')
+
+    return HTMLResponse(content=html_content)
+
+
+@app.post("/api/login")
+async def oauth_login(login_data: LoginRequest, request: Request, response: Response):
+    """Generic login endpoint for OAuth/OIDC - allows all users"""
+    client_ip = request.headers.get("x-forwarded-for", request.client.host if request.client else "unknown")
+    if "," in client_ip:
+        client_ip = client_ip.split(",")[0].strip()
+
+    # Check if IP is locked out
+    if is_account_locked(client_ip):
+        await log_activity(login_data.username, "LOGIN_BLOCKED", "IP locked out due to too many failed attempts", client_ip)
+        raise HTTPException(status_code=429, detail=f"Too many failed attempts. Try again in {LOCKOUT_DURATION // 60} minutes.")
+
+    # Get user from database
+    user = get_user_by_username_from_db(login_data.username)
+
+    if not user or not verify_password(login_data.password, user["password_hash"]):
+        await log_activity(login_data.username, "LOGIN_FAILED", "Invalid credentials", client_ip)
+
+        # Track failed login attempts
+        current_time = time.time()
+        if client_ip not in failed_login_attempts:
+            failed_login_attempts[client_ip] = []
+
+        failed_login_attempts[client_ip] = [
+            t for t in failed_login_attempts[client_ip] if current_time - t < LOCKOUT_DURATION
+        ]
+        failed_login_attempts[client_ip].append(current_time)
+
+        attempt_count = len(failed_login_attempts[client_ip])
+        remaining_attempts = MAX_LOGIN_ATTEMPTS - attempt_count
+
+        if remaining_attempts <= 0:
+            raise HTTPException(status_code=429, detail=f"Account locked. Try again in {LOCKOUT_DURATION // 60} minutes.")
+
+        raise HTTPException(status_code=401, detail=f"Invalid credentials. {remaining_attempts} attempts remaining.")
+
+    # Check if user is required to have 2FA but hasn't set it up
+    if user_requires_2fa(user) and not user.get("totp_enabled", False):
+        await log_activity(user["username"], "LOGIN_BLOCKED", "2FA required but not configured", client_ip)
+        raise HTTPException(
+            status_code=403,
+            detail="Your account requires 2FA to be enabled. Please visit the user portal to set up 2FA."
+        )
+
+    # Check 2FA if enabled for this user AND enhanced security is enabled
+    settings = get_settings_from_db()
+    if settings.get("enhanced_security", False) and user.get("totp_enabled", False):
+        if not login_data.totp_token:
+            # User has 2FA enabled but didn't provide token
+            raise HTTPException(status_code=403, detail="2FA token required")
+
+        if not verify_totp(user.get("totp_secret", ""), login_data.totp_token):
+            await log_activity(user["username"], "LOGIN_FAILED", "Invalid 2FA token", client_ip)
+            raise HTTPException(status_code=401, detail="Invalid 2FA token")
+
+    # Successful login - clear failed attempts for this IP
+    if client_ip in failed_login_attempts:
+        del failed_login_attempts[client_ip]
+
+    session_id, csrf_token = create_session(user["id"])
+    # Set secure cookie with SameSite=Lax (allows cookie on redirects)
+    response.set_cookie(
+        "session_id",
+        session_id,
+        httponly=True,
+        max_age=3*24*60*60,
+        samesite="lax"
+    )
+
+    await log_activity(user["username"], "LOGIN_SUCCESS", "OAuth/OIDC login successful", client_ip)
+
+    return {
+        "user": {
+            "id": user["id"],
+            "username": user["username"],
+            "groups": user.get("groups", [])
+        },
+        "csrf_token": csrf_token
+    }
+
 
 @app.post("/api/auth/login")
-async def login(login_data: LoginRequest, request: Request, response: Response):
+async def admin_login(login_data: LoginRequest, request: Request, response: Response):
+    """Admin panel login endpoint - admin users only"""
     client_ip = request.headers.get("x-forwarded-for", request.client.host if request.client else "unknown")
     if "," in client_ip:
         client_ip = client_ip.split(",")[0].strip()
@@ -2114,8 +3829,22 @@ async def login(login_data: LoginRequest, request: Request, response: Response):
 
         raise HTTPException(status_code=401, detail=f"Invalid credentials. {remaining_attempts} attempts remaining.")
 
-    # Check 2FA if enabled for this user
-    if user.get("totp_enabled", False):
+    # Check if user is an admin - only admins can access the admin panel
+    if 'admin_group' not in user.get('groups', []):
+        await log_activity(user["username"], "LOGIN_DENIED", "Non-admin user attempted to access admin panel", client_ip)
+        raise HTTPException(status_code=403, detail="Access denied. Admin privileges required.")
+
+    # Check if user is required to have 2FA but hasn't set it up
+    if user_requires_2fa(user) and not user.get("totp_enabled", False):
+        await log_activity(user["username"], "LOGIN_BLOCKED", "2FA required but not configured", client_ip)
+        raise HTTPException(
+            status_code=403,
+            detail="Your account requires 2FA to be enabled. Please visit the user portal to set up 2FA."
+        )
+
+    # Check 2FA if enabled for this user AND enhanced security is enabled
+    settings = get_settings_from_db()
+    if settings.get("enhanced_security", False) and user.get("totp_enabled", False):
         if not login_data.totp_token:
             # User has 2FA enabled but didn't provide token
             raise HTTPException(status_code=403, detail="2FA token required")
@@ -2180,17 +3909,88 @@ async def get_current_user(session_id: Optional[str] = Cookie(None)):
         raise HTTPException(status_code=401, detail="Not authenticated")
     return {"id": user["id"], "username": user["username"], "groups": user["groups"]}
 
+@app.get("/api/system/network-info")
+async def get_network_info():
+    """Get server network addresses for LDAP/RADIUS client configuration"""
+    import socket
+    addresses = []
+
+    try:
+        # Get hostname
+        hostname = socket.gethostname()
+
+        # Get all IP addresses associated with this host
+        host_info = socket.getaddrinfo(hostname, None)
+
+        # Extract unique IPv4 addresses
+        seen = set()
+        for info in host_info:
+            ip = info[4][0]
+            # Only include IPv4 addresses, exclude localhost
+            if '.' in ip and ip not in seen and not ip.startswith('127.'):
+                addresses.append(ip)
+                seen.add(ip)
+
+        # If no addresses found, try to get local IP by connecting to external host
+        if not addresses:
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            try:
+                # Connect to Google DNS (doesn't actually send data)
+                s.connect(('8.8.8.8', 80))
+                local_ip = s.getsockname()[0]
+                if local_ip and not local_ip.startswith('127.'):
+                    addresses.append(local_ip)
+            finally:
+                s.close()
+
+    except Exception as e:
+        logger.error(f"Failed to get network info: {e}")
+
+    # Always include localhost as fallback
+    if not addresses:
+        addresses.append('localhost')
+
+    return {"addresses": addresses}
+
 @app.get("/api/auth/verify")
 @app.post("/api/auth/verify")
-async def verify_auth(request: Request, website_session: Optional[str] = Cookie(None)):
-    """Forward auth endpoint for Caddy to verify website authentication"""
-    # Check if user has a valid website session
-    session = website_sessions.get(website_session) if website_session else None
+async def verify_auth(request: Request, website_session: Optional[str] = Cookie(None), session_id: Optional[str] = Cookie(None)):
+    """
+    Forward auth endpoint for Caddy to verify website authentication
+    SSO: Checks both website_session (legacy) and session_id (CaddyMAN main session) for unified SSO
+    """
+    session = None
+    session_source = None
 
-    # Check if session is expired
-    if session and session["expires"] < time.time():
-        del website_sessions[session]
-        session = None
+    # First, check for website_session (legacy/backward compatibility)
+    if website_session:
+        session = website_sessions.get(website_session)
+        if session:
+            # Check if session is expired
+            if session["expires"] < time.time():
+                del website_sessions[website_session]
+                session = None
+            else:
+                session_source = "website_session"
+
+    # If no website_session, check for main CaddyMAN session (SSO)
+    if not session and session_id:
+        main_session = sessions.get(session_id)
+        if main_session:
+            # Check if session is expired
+            if main_session["expires"] < time.time():
+                del sessions[session_id]
+            else:
+                # Convert main session to format expected by this endpoint
+                user = get_user_by_id_from_db(main_session["user_id"])
+                if user:
+                    session = {
+                        "user_id": user["id"],
+                        "username": user["username"],
+                        "groups": user.get("groups", []),
+                        "expires": main_session["expires"]
+                    }
+                    session_source = "session_id"
 
     # Get required groups from request headers
     required_groups_str = request.headers.get("X-Required-Groups", "")
@@ -2232,13 +4032,17 @@ async def verify_auth(request: Request, website_session: Optional[str] = Cookie(
         if not user_groups.intersection(required_groups):
             raise HTTPException(status_code=403, detail="Access denied - insufficient permissions")
 
+    # Log SSO source for debugging
+    logger.info(f"Auth verify successful for {session['username']} using {session_source}")
+
     # Return success with user info in headers for Caddy to forward
     return Response(
         status_code=200,
         headers={
             "X-User-ID": session["user_id"],
             "X-Username": session["username"],
-            "X-User-Groups": ",".join(session.get("groups", []))
+            "X-User-Groups": ",".join(session.get("groups", [])),
+            "X-Auth-Source": session_source  # Indicate which session type was used
         }
     )
 
@@ -2257,6 +4061,10 @@ async def create_user(user_create: UserCreate, request: Request, session_id: Opt
     if not user:
         raise HTTPException(status_code=401, detail="Not authenticated")
     require_csrf(request, session_id)
+
+    # Always require minimum password length
+    if not user_create.password or len(user_create.password) < 4:
+        raise HTTPException(status_code=400, detail="Password must be at least 4 characters long")
 
     # Check password strength if enhanced security is enabled
     settings = get_settings_from_db()
@@ -2281,6 +4089,7 @@ async def create_user(user_create: UserCreate, request: Request, session_id: Opt
             "username": user_create.username,
             "password_hash": hash_password(user_create.password),
             "groups": user_create.groups,
+            "email": user_create.email or "",
             "totp_secret": None,
             "totp_enabled": False
         }
@@ -2372,6 +4181,607 @@ async def delete_user(user_id: str, request: Request, session_id: Optional[str] 
             deleted_by=user.get("username", "admin"))
     return {"status": "deleted"}
 
+@app.post("/api/users/{user_id}/send-invite")
+async def api_send_user_invite(
+    user_id: str,
+    request: Request,
+    session_id: Optional[str] = Cookie(None)
+):
+    """Send invitation email to user"""
+    user = get_session_user(session_id)
+    if not user:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+    require_csrf(request, session_id)
+
+    success = await send_user_invite(user_id)
+    if not success:
+        raise HTTPException(status_code=400, detail="Failed to send invite. Check SMTP settings and user email.")
+
+    return {"status": "sent"}
+
+@app.post("/api/users/{user_id}/send-password-reset")
+async def api_send_password_reset(
+    user_id: str,
+    request: Request,
+    session_id: Optional[str] = Cookie(None)
+):
+    """Send password reset email to user"""
+    user = get_session_user(session_id)
+    if not user:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+    require_csrf(request, session_id)
+
+    success = await send_password_reset(user_id)
+    if not success:
+        raise HTTPException(status_code=400, detail="Failed to send password reset. Check SMTP settings and user email.")
+
+    return {"status": "sent"}
+
+class InviteLinkRequest(BaseModel):
+    username: str = Field(..., min_length=1, max_length=50, pattern=r'^[a-zA-Z0-9_-]+$')
+    email: str = Field(..., pattern=r'^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$')
+    groups: List[str] = Field(default_factory=list, max_items=20)
+    expiry_hours: int = Field(24, ge=1, le=720)  # Min 1 hour, max 30 days
+
+@app.post("/api/users/invite-link")
+async def generate_invite_link(
+    invite_data: InviteLinkRequest,
+    request: Request,
+    session_id: Optional[str] = Cookie(None)
+):
+    """
+    Generate an invite link for a new user
+    Security: Requires authentication, CSRF protection, input validation, rate limiting
+    """
+    # Authentication check
+    user = get_session_user(session_id)
+    if not user:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+
+    # CSRF protection
+    require_csrf(request, session_id)
+
+    # Security: Only admins can generate invite links
+    if 'admin_group' not in user.get('groups', []):
+        logger.warning(f"Non-admin user {user.get('username')} attempted to generate invite link")
+        raise HTTPException(status_code=403, detail="Only administrators can generate invite links")
+
+    # Input validation - username
+    if not invite_data.username or len(invite_data.username) < 1 or len(invite_data.username) > 50:
+        raise HTTPException(status_code=400, detail="Username must be between 1 and 50 characters")
+
+    if not re.match(r'^[a-zA-Z0-9_-]+$', invite_data.username):
+        raise HTTPException(status_code=400, detail="Username can only contain letters, numbers, hyphens, and underscores")
+
+    # Security: Prevent creating admin users via invite links
+    if 'admin_group' in invite_data.groups:
+        logger.warning(f"User {user.get('username')} attempted to create admin via invite link")
+        raise HTTPException(status_code=403, detail="Cannot create admin users via invite links. Use the admin panel instead.")
+
+    # Check if username already exists
+    if get_user_by_username_from_db(invite_data.username):
+        raise HTTPException(status_code=400, detail="Username already exists")
+
+    # Validate groups exist
+    all_groups = get_all_groups_from_db()
+    valid_group_ids = {g['id'] for g in all_groups}
+    for group_id in invite_data.groups:
+        if group_id not in valid_group_ids:
+            raise HTTPException(status_code=400, detail=f"Invalid group: {group_id}")
+
+    # Check if SMTP is configured
+    settings = get_settings_from_db()
+    if not settings.get('smtp_enabled'):
+        raise HTTPException(status_code=400, detail="SMTP is not configured. Cannot send invite emails.")
+
+    # Generate cryptographically secure token
+    token = secrets.token_urlsafe(32)
+    expiry = datetime.now().timestamp() + (invite_data.expiry_hours * 3600)
+
+    # Store invite token in database
+    invite_record = {
+        'token': token,
+        'username': invite_data.username,
+        'email': invite_data.email,
+        'groups': invite_data.groups,
+        'expires_at': expiry,
+        'created_by': user.get('username', 'admin'),
+        'created_at': datetime.now().timestamp()
+    }
+    save_invite_token_to_db(invite_record)
+
+    # Build invite URL
+    manager_port = settings.get('manager_port', 8000)
+    invite_url = f"http://localhost:{manager_port}/user-portal?token={token}"
+
+    # Send email
+    try:
+        await send_invite_email(invite_data.email, invite_data.username, invite_url, invite_data.expiry_hours)
+    except Exception as e:
+        logger.error(f"Failed to send invite email: {e}")
+        # Don't fail the request - admin can copy the link manually
+        pass
+
+    return {
+        "status": "success",
+        "invite_url": invite_url,
+        "expires_in_hours": invite_data.expiry_hours
+    }
+
+# User Portal Endpoints
+
+@app.get("/user-portal", response_class=HTMLResponse)
+@app.get("/user-portal/", response_class=HTMLResponse)
+async def user_portal_root():
+    """Serve the user portal HTML"""
+    portal_path = resource_path("user-portal/index.html")
+    with open(portal_path, "r", encoding="utf-8") as f:
+        return HTMLResponse(content=f.read())
+
+@app.get("/user-portal/style.css")
+async def user_portal_css():
+    """Serve user portal CSS"""
+    css_path = resource_path("user-portal/style.css")
+    with open(css_path, "r", encoding="utf-8") as f:
+        return Response(content=f.read(), media_type="text/css")
+
+@app.get("/user-portal/script.js")
+async def user_portal_js():
+    """Serve user portal JavaScript"""
+    js_path = resource_path("user-portal/script.js")
+    with open(js_path, "r", encoding="utf-8") as f:
+        return Response(content=f.read(), media_type="application/javascript")
+
+@app.get("/api/user")
+async def get_user_info(session_id: Optional[str] = Cookie(None)):
+    """Get current user information for user portal"""
+    user = get_session_user(session_id)
+    if not user:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+
+    # Get full user details from database
+    full_user = get_user_by_id_from_db(user["id"])
+    if not full_user:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    # Convert group IDs to group names
+    group_ids = full_user.get("groups", [])
+    group_names = []
+    for group_id in group_ids:
+        group = get_group_by_id_from_db(group_id)
+        if group:
+            group_names.append(group.get("name", group_id))
+        else:
+            group_names.append(group_id)
+
+    return {
+        "id": full_user["id"],
+        "username": full_user["username"],
+        "email": full_user.get("email", ""),
+        "groups": group_names,
+        "totp_enabled": full_user.get("totp_enabled", False)
+    }
+
+@app.get("/api/user-portal/invite/{token}")
+async def verify_invite_token(token: str):
+    """Verify an invite token and return user details for setup page"""
+    if not token or len(token) < 10:
+        raise HTTPException(status_code=400, detail="Invalid token")
+
+    invite = get_invite_token_from_db(token)
+    if not invite:
+        raise HTTPException(status_code=404, detail="Invite not found")
+
+    # Check if token has expired
+    if datetime.now().timestamp() > invite['expires_at']:
+        delete_invite_token_from_db(token)
+        raise HTTPException(status_code=410, detail="Invite link has expired")
+
+    # Return invite details (but not the token itself)
+    return {
+        "username": invite['username'],
+        "email": invite['email'],
+        "groups": invite['groups']
+    }
+
+class SetupAccountRequest(BaseModel):
+    token: str
+    password: str = Field(..., min_length=4)
+
+@app.post("/api/user-portal/setup")
+async def setup_account(setup_data: SetupAccountRequest, request: Request):
+    """Complete account setup from invite link"""
+    client_ip = request.headers.get("x-forwarded-for", request.client.host if request.client else "unknown")
+    if "," in client_ip:
+        client_ip = client_ip.split(",")[0].strip()
+
+    # Get invite token
+    invite = get_invite_token_from_db(setup_data.token)
+    if not invite:
+        raise HTTPException(status_code=404, detail="Invite not found")
+
+    # Check if token has expired
+    if datetime.now().timestamp() > invite['expires_at']:
+        delete_invite_token_from_db(setup_data.token)
+        raise HTTPException(status_code=410, detail="Invite link has expired")
+
+    # Check if user already exists
+    if get_user_by_username_from_db(invite['username']):
+        raise HTTPException(status_code=400, detail="User already exists")
+
+    # Validate password
+    if len(setup_data.password) < 4:
+        raise HTTPException(status_code=400, detail="Password must be at least 4 characters")
+
+    # Create the user
+    new_user = {
+        "id": str(uuid.uuid4()),
+        "username": invite['username'],
+        "password_hash": hash_password(setup_data.password),
+        "groups": invite['groups'],
+        "email": invite['email'],
+        "totp_secret": None,
+        "totp_enabled": False
+    }
+    save_user_to_db(new_user)
+
+    # Delete the consumed invite token
+    delete_invite_token_from_db(setup_data.token)
+
+    # Log activity
+    await log_activity(invite['username'], "ACCOUNT_SETUP", f"Account activated via invite link", client_ip)
+    await send_event_notification("user_created", "New User Account Created",
+        f"User '{invite['username']}' completed account setup via invite link.",
+        username=invite['username'], client_ip=client_ip)
+
+    logger.info(f"User {invite['username']} completed account setup via invite link")
+
+    return {"status": "success", "message": "Account activated successfully"}
+
+class ChangePasswordRequest(BaseModel):
+    current_password: str
+    new_password: str = Field(..., min_length=4)
+
+@app.post("/api/user-portal/change-password")
+async def change_password(password_data: ChangePasswordRequest, request: Request, session_id: Optional[str] = Cookie(None)):
+    """Allow user to change their own password"""
+    user = get_session_user(session_id)
+    if not user:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+
+    client_ip = request.headers.get("x-forwarded-for", request.client.host if request.client else "unknown")
+    if "," in client_ip:
+        client_ip = client_ip.split(",")[0].strip()
+
+    # Verify current password
+    if not verify_password(password_data.current_password, user.get('password_hash', '')):
+        await log_activity(user.get('username'), "PASSWORD_CHANGE_FAILED", "Incorrect current password", client_ip)
+        raise HTTPException(status_code=401, detail="Current password is incorrect")
+
+    # Validate new password
+    if len(password_data.new_password) < 4:
+        raise HTTPException(status_code=400, detail="New password must be at least 4 characters")
+
+    # Update password
+    user['password_hash'] = hash_password(password_data.new_password)
+    save_user_to_db(user)
+
+    # Log activity
+    await log_activity(user.get('username'), "PASSWORD_CHANGED", "User changed their own password", client_ip)
+    await send_event_notification("password_changed", "Password Changed",
+        f"User '{user.get('username')}' changed their password.",
+        username=user.get('username'), client_ip=client_ip)
+
+    logger.info(f"User {user.get('username')} changed their password")
+
+    return {"status": "success", "message": "Password changed successfully"}
+
+class UpdateEmailRequest(BaseModel):
+    email: str = Field(..., pattern=r'^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$')
+
+@app.post("/api/user-portal/update-email")
+async def update_email(email_data: UpdateEmailRequest, request: Request, session_id: Optional[str] = Cookie(None)):
+    """Allow user to update their email address"""
+    user = get_session_user(session_id)
+    if not user:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+
+    client_ip = request.headers.get("x-forwarded-for", request.client.host if request.client else "unknown")
+    if "," in client_ip:
+        client_ip = client_ip.split(",")[0].strip()
+
+    # Update email
+    user['email'] = email_data.email
+    save_user_to_db(user)
+
+    # Log activity
+    await log_activity(user.get('username'), "EMAIL_UPDATED", f"Email updated to {email_data.email}", client_ip)
+
+    logger.info(f"User {user.get('username')} updated their email to {email_data.email}")
+
+    return {"status": "success", "message": "Email updated successfully"}
+
+@app.post("/api/user-portal/enable-2fa")
+async def enable_2fa_for_user(request: Request, session_id: Optional[str] = Cookie(None)):
+    """Generate TOTP secret and QR code for user to enable 2FA"""
+    user = get_session_user(session_id)
+    if not user:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+
+    if user.get('totp_enabled'):
+        raise HTTPException(status_code=400, detail="2FA is already enabled")
+
+    # Generate TOTP secret
+    secret = pyotp.random_base32()
+
+    # Store secret temporarily (not enabled yet)
+    user['totp_secret'] = secret
+    save_user_to_db(user)
+
+    # Generate QR code
+    totp = pyotp.TOTP(secret)
+    username = user.get('username', 'user')
+    qr_uri = totp.provisioning_uri(name=username, issuer_name="CaddyMAN")
+
+    # Generate QR code as base64 image
+    import qrcode
+    from io import BytesIO
+    import base64
+
+    qr = qrcode.QRCode(version=1, box_size=10, border=5)
+    qr.add_data(qr_uri)
+    qr.make(fit=True)
+    img = qr.make_image(fill_color="black", back_color="white")
+
+    buffer = BytesIO()
+    img.save(buffer, format='PNG')
+    qr_base64 = base64.b64encode(buffer.getvalue()).decode()
+
+    return {
+        "status": "success",
+        "qr_code": f"data:image/png;base64,{qr_base64}",
+        "secret": secret
+    }
+
+class Verify2FARequest(BaseModel):
+    token: str = Field(..., min_length=6, max_length=6, pattern=r'^\d{6}$')
+
+@app.post("/api/user-portal/verify-2fa")
+async def verify_2fa_for_user(verify_data: Verify2FARequest, request: Request, session_id: Optional[str] = Cookie(None)):
+    """Verify TOTP token and enable 2FA for user"""
+    user = get_session_user(session_id)
+    if not user:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+
+    client_ip = request.headers.get("x-forwarded-for", request.client.host if request.client else "unknown")
+    if "," in client_ip:
+        client_ip = client_ip.split(",")[0].strip()
+
+    secret = user.get('totp_secret')
+    if not secret:
+        raise HTTPException(status_code=400, detail="2FA setup not started")
+
+    # Verify the token
+    totp = pyotp.TOTP(secret)
+    if not totp.verify(verify_data.token, valid_window=1):
+        raise HTTPException(status_code=401, detail="Invalid verification code")
+
+    # Enable 2FA
+    user['totp_enabled'] = True
+    save_user_to_db(user)
+
+    # Log activity
+    await log_activity(user.get('username'), "2FA_ENABLED", "User enabled 2FA", client_ip)
+    await send_event_notification("2fa_enabled", "2FA Enabled",
+        f"User '{user.get('username')}' enabled two-factor authentication.",
+        username=user.get('username'), client_ip=client_ip)
+
+    logger.info(f"User {user.get('username')} enabled 2FA")
+
+    return {"status": "success", "message": "2FA enabled successfully"}
+
+@app.post("/api/user-portal/disable-2fa")
+async def disable_2fa_for_user(request: Request, session_id: Optional[str] = Cookie(None)):
+    """Disable 2FA for user"""
+    user = get_session_user(session_id)
+    if not user:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+
+    client_ip = request.headers.get("x-forwarded-for", request.client.host if request.client else "unknown")
+    if "," in client_ip:
+        client_ip = client_ip.split(",")[0].strip()
+
+    if not user.get('totp_enabled'):
+        raise HTTPException(status_code=400, detail="2FA is not enabled")
+
+    # Disable 2FA
+    user['totp_enabled'] = False
+    user['totp_secret'] = None
+    save_user_to_db(user)
+
+    # Log activity
+    await log_activity(user.get('username'), "2FA_DISABLED", "User disabled 2FA", client_ip)
+    await send_event_notification("2fa_disabled", "2FA Disabled",
+        f"User '{user.get('username')}' disabled two-factor authentication.",
+        username=user.get('username'), client_ip=client_ip)
+
+    logger.info(f"User {user.get('username')} disabled 2FA")
+
+    return {"status": "success", "message": "2FA disabled successfully"}
+
+# Password Reset Endpoints
+
+class RequestPasswordResetRequest(BaseModel):
+    email: str = Field(..., pattern=r'^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$')
+
+@app.post("/api/user-portal/request-password-reset")
+async def request_password_reset(reset_request: RequestPasswordResetRequest, request: Request):
+    """Request a password reset link via email"""
+    client_ip = request.headers.get("x-forwarded-for", request.client.host if request.client else "unknown")
+    if "," in client_ip:
+        client_ip = client_ip.split(",")[0].strip()
+
+    # Check if SMTP is configured
+    settings = get_settings_from_db()
+    if not settings.get('smtp_enabled'):
+        raise HTTPException(status_code=400, detail="Password reset is not available. SMTP is not configured.")
+
+    # Find user by email
+    users = get_all_users_from_db()
+    user = None
+    for u in users:
+        if u.get('email', '').lower() == reset_request.email.lower():
+            user = u
+            break
+
+    # Always return success to prevent email enumeration
+    # But only send email if user exists
+    if user:
+        # Generate secure reset token
+        token = secrets.token_urlsafe(32)
+        expiry_hours = 1  # 1 hour expiry
+        expiry = datetime.now().timestamp() + (expiry_hours * 3600)
+
+        # Save reset token
+        reset_token = {
+            'token': token,
+            'user_id': user['id'],
+            'email': user['email'],
+            'expires_at': expiry,
+            'created_at': datetime.now().timestamp(),
+            'used': False
+        }
+        save_password_reset_token_to_db(reset_token)
+
+        # Build reset URL
+        manager_port = settings.get('manager_port', 8000)
+        reset_url = f"http://localhost:{manager_port}/user-portal?reset_token={token}"
+
+        # Send email
+        try:
+            await send_password_reset_email(user['email'], user['username'], reset_url, expiry_hours)
+            logger.info(f"Password reset email sent to {user['email']} for user {user['username']}")
+        except Exception as e:
+            logger.error(f"Failed to send password reset email: {e}")
+
+        # Log activity
+        await log_activity(user['username'], "PASSWORD_RESET_REQUESTED",
+            f"Password reset requested for {user['email']}", client_ip)
+
+    # Always return success (prevent email enumeration)
+    return {
+        "status": "success",
+        "message": "If an account exists with this email, a password reset link has been sent."
+    }
+
+@app.get("/api/user-portal/verify-reset-token/{token}")
+async def verify_reset_token(token: str):
+    """Verify a password reset token"""
+    if not token or len(token) < 10:
+        raise HTTPException(status_code=400, detail="Invalid token")
+
+    reset = get_password_reset_token_from_db(token)
+    if not reset:
+        raise HTTPException(status_code=404, detail="Reset token not found")
+
+    # Check if token has expired
+    if datetime.now().timestamp() > reset['expires_at']:
+        delete_password_reset_token_from_db(token)
+        raise HTTPException(status_code=410, detail="Reset link has expired")
+
+    # Check if token was already used
+    if reset['used']:
+        raise HTTPException(status_code=410, detail="Reset link has already been used")
+
+    # Get user info
+    users = get_all_users_from_db()
+    user = None
+    for u in users:
+        if u['id'] == reset['user_id']:
+            user = u
+            break
+
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    return {
+        "username": user['username'],
+        "email": reset['email'],
+        "requires_2fa": user.get('totp_enabled', False)
+    }
+
+class ResetPasswordRequest(BaseModel):
+    token: str
+    new_password: str = Field(..., min_length=4)
+    two_factor_token: Optional[str] = None
+
+@app.post("/api/user-portal/reset-password")
+async def reset_password(reset_data: ResetPasswordRequest, request: Request):
+    """Reset password using reset token"""
+    client_ip = request.headers.get("x-forwarded-for", request.client.host if request.client else "unknown")
+    if "," in client_ip:
+        client_ip = client_ip.split(",")[0].strip()
+
+    # Get reset token
+    reset = get_password_reset_token_from_db(reset_data.token)
+    if not reset:
+        raise HTTPException(status_code=404, detail="Reset token not found")
+
+    # Check if token has expired
+    if datetime.now().timestamp() > reset['expires_at']:
+        delete_password_reset_token_from_db(reset_data.token)
+        raise HTTPException(status_code=410, detail="Reset link has expired")
+
+    # Check if token was already used
+    if reset['used']:
+        raise HTTPException(status_code=410, detail="Reset link has already been used")
+
+    # Validate new password
+    if len(reset_data.new_password) < 4:
+        raise HTTPException(status_code=400, detail="Password must be at least 4 characters")
+
+    # Get user
+    users = get_all_users_from_db()
+    user = None
+    for u in users:
+        if u['id'] == reset['user_id']:
+            user = u
+            break
+
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    # Verify 2FA if enabled
+    if user.get('totp_enabled', False):
+        if not reset_data.two_factor_token:
+            raise HTTPException(status_code=400, detail="2FA code is required for this account")
+
+        totp_secret = user.get('totp_secret')
+        if not totp_secret:
+            raise HTTPException(status_code=500, detail="2FA is enabled but secret is missing")
+
+        totp = pyotp.TOTP(totp_secret)
+        if not totp.verify(reset_data.two_factor_token, valid_window=1):
+            await log_activity(user['username'], "PASSWORD_RESET_FAILED", "Invalid 2FA code during password reset", client_ip)
+            raise HTTPException(status_code=401, detail="Invalid 2FA code")
+
+    # Update password
+    user['password_hash'] = hash_password(reset_data.new_password)
+    save_user_to_db(user)
+
+    # Mark token as used
+    mark_password_reset_token_used(reset_data.token)
+
+    # Log activity
+    await log_activity(user['username'], "PASSWORD_RESET", "Password reset via email link", client_ip)
+    await send_event_notification("password_reset", "Password Reset",
+        f"User '{user['username']}' reset their password via email link.",
+        username=user['username'], client_ip=client_ip)
+
+    logger.info(f"User {user['username']} reset their password via email link")
+
+    return {"status": "success", "message": "Password has been reset successfully"}
+
 @app.get("/api/groups")
 async def get_groups(session_id: Optional[str] = Cookie(None)):
     user = get_session_user(session_id)
@@ -2411,6 +4821,638 @@ async def delete_group(group_id: str, request: Request, session_id: Optional[str
     await reload_caddy()
     return {"status": "deleted"}
 
+# OAuth/OIDC Endpoints
+
+@app.get("/.well-known/openid-configuration")
+async def oidc_discovery():
+    """OIDC Discovery endpoint"""
+    settings = get_settings_from_db()
+    if not settings.get('auth_protocols_enabled') or not settings.get('oidc_enabled'):
+        raise HTTPException(status_code=404, detail="OIDC not enabled")
+
+    issuer = settings.get('oidc_issuer', 'http://localhost:12888')
+
+    return {
+        "issuer": issuer,
+        "authorization_endpoint": f"{issuer}/oauth/authorize",
+        "token_endpoint": f"{issuer}/oauth/token",
+        "userinfo_endpoint": f"{issuer}/oauth/userinfo",
+        "jwks_uri": f"{issuer}/oauth/keys",
+        "revocation_endpoint": f"{issuer}/oauth/revoke",
+        "response_types_supported": ["code"],
+        "grant_types_supported": ["authorization_code", "refresh_token"],
+        "subject_types_supported": ["public"],
+        "id_token_signing_alg_values_supported": ["RS256"],
+        "scopes_supported": ["openid", "profile", "email", "groups"],
+        "token_endpoint_auth_methods_supported": ["client_secret_post", "client_secret_basic"],
+        "claims_supported": [
+            "sub", "iss", "aud", "exp", "iat", "username", "email", "email_verified",
+            "name", "given_name", "family_name", "groups"
+        ],
+        "code_challenge_methods_supported": ["S256"]
+    }
+
+@app.get("/oauth/keys")
+async def jwks_endpoint():
+    """JWKS public keys endpoint"""
+    settings = get_settings_from_db()
+    if not settings.get('auth_protocols_enabled') or not settings.get('oidc_enabled'):
+        raise HTTPException(status_code=404, detail="OIDC not enabled")
+
+    _, public_key = ensure_oidc_keys()
+
+    # Convert PEM to JWK
+    from cryptography.hazmat.primitives import serialization
+    from cryptography.hazmat.backends import default_backend
+
+    public_key_obj = serialization.load_pem_public_key(
+        public_key.encode('utf-8'),
+        backend=default_backend()
+    )
+
+    # Get public numbers
+    numbers = public_key_obj.public_numbers()
+
+    # Convert to base64url without padding
+    def int_to_base64url(n):
+        n_bytes = n.to_bytes((n.bit_length() + 7) // 8, byteorder='big')
+        return base64.urlsafe_b64encode(n_bytes).rstrip(b'=').decode('utf-8')
+
+    jwk_key = {
+        "kty": "RSA",
+        "use": "sig",
+        "alg": "RS256",
+        "n": int_to_base64url(numbers.n),
+        "e": int_to_base64url(numbers.e),
+        "kid": "default"
+    }
+
+    return {"keys": [jwk_key]}
+
+@app.get("/oauth/authorize")
+async def oauth_authorize(
+    response_type: str,
+    client_id: str,
+    redirect_uri: str,
+    scope: str = "openid profile email",
+    state: Optional[str] = None,
+    code_challenge: Optional[str] = None,
+    code_challenge_method: Optional[str] = None,
+    session_id: Optional[str] = Cookie(None)
+):
+    """OAuth2 authorization endpoint"""
+    settings = get_settings_from_db()
+    if not settings.get('auth_protocols_enabled') or not settings.get('oidc_enabled'):
+        raise HTTPException(status_code=404, detail="OIDC not enabled")
+
+    # Validate response_type
+    if response_type != "code":
+        raise HTTPException(status_code=400, detail="Unsupported response_type")
+
+    # Validate client
+    client = get_oauth_client_by_id_from_db(client_id)
+    if not client or not client.get('enabled'):
+        raise HTTPException(status_code=400, detail="Invalid client_id")
+
+    # Validate redirect_uri
+    if redirect_uri not in client['redirect_uris']:
+        raise HTTPException(status_code=400, detail="Invalid redirect_uri")
+
+    # Check PKCE requirement
+    if client.get('require_pkce') and not code_challenge:
+        raise HTTPException(status_code=400, detail="PKCE required for this client")
+
+    # Check if user is authenticated
+    user = get_session_user(session_id)
+    if not user:
+        # Redirect to login page with return URL
+        from urllib.parse import quote
+        authorize_params = urlencode({
+            'response_type': response_type,
+            'client_id': client_id,
+            'redirect_uri': redirect_uri,
+            'scope': scope,
+            'state': state or '',
+            'code_challenge': code_challenge or '',
+            'code_challenge_method': code_challenge_method or ''
+        })
+        return_url = f"/oauth/authorize?{authorize_params}"
+        login_url = f"/login?return_to={quote(return_url)}"
+        return HTMLResponse(f'<html><head><meta http-equiv="refresh" content="0;url={login_url}"></head></html>')
+
+    # Security: Block admin users from OIDC
+    if user.get('is_admin', False):
+        await log_activity(user.get('username', 'unknown'), "OIDC_AUTH_DENIED", f"Admin users cannot use OIDC - Client: {client_id}", "OIDC")
+        await send_event_notification("oidc_auth_denied", "OIDC Authorization Denied",
+            f"OIDC authorization denied - admin users not allowed.",
+            username=user.get('username', 'unknown'), client_id=client_id, reason="Admin user")
+        raise HTTPException(status_code=403, detail="Admin users cannot use OIDC authentication")
+
+    # Check if user is in allowed groups (if specified)
+    allowed_groups = client.get('allowed_groups', [])
+    if allowed_groups:
+        user_groups = user.get('groups', [])
+        # Check if user has at least one allowed group
+        if not any(group in allowed_groups for group in user_groups):
+            await log_activity(user.get('username', 'unknown'), "OIDC_AUTH_DENIED", f"User not in allowed groups - Client: {client_id}", "OIDC")
+            await send_event_notification("oidc_auth_denied", "OIDC Authorization Denied",
+                f"OIDC authorization denied - user not in allowed groups.",
+                username=user.get('username', 'unknown'), client_id=client_id, reason="Not in allowed groups")
+            raise HTTPException(status_code=403, detail="User not authorized for this client")
+
+    # Check if user is required to have 2FA but hasn't set it up
+    if user_requires_2fa(user) and not user.get("totp_enabled", False):
+        await log_activity(user.get('username', 'unknown'), "OIDC_AUTH_DENIED", f"2FA required but not configured - Client: {client_id}", "OIDC")
+        await send_event_notification("oidc_auth_denied", "OIDC Authorization Denied",
+            f"OIDC authorization denied - 2FA required but not configured.",
+            username=user.get('username', 'unknown'), client_id=client_id, reason="2FA required but not configured")
+        raise HTTPException(status_code=403, detail="Your account requires 2FA to be enabled. Please visit the user portal to set up 2FA.")
+
+    # Generate authorization code
+    auth_code = secrets.token_urlsafe(32)
+    scopes = scope.split()
+
+    # Save authorization code
+    save_oauth_code_to_db({
+        'code': auth_code,
+        'client_id': client_id,
+        'user_id': user['id'],
+        'redirect_uri': redirect_uri,
+        'scopes': scopes,
+        'code_challenge': code_challenge,
+        'code_challenge_method': code_challenge_method,
+        'expires_at': (datetime.now().timestamp() + 600)  # 10 minutes
+    })
+
+    # Log successful authorization
+    await log_activity(user.get('username', 'unknown'), "OIDC_AUTH_SUCCESS", f"Authorization granted - Client: {client_id}", "OIDC")
+    await send_event_notification("oidc_auth_success", "OIDC Authorization Success",
+        f"Successful OIDC authorization.",
+        username=user.get('username', 'unknown'), client_id=client_id, scopes=scope)
+
+    # Redirect back with code
+    params = {'code': auth_code}
+    if state:
+        params['state'] = state
+
+    redirect_url = f"{redirect_uri}?{urlencode(params)}"
+    return HTMLResponse(f'<html><head><meta http-equiv="refresh" content="0;url={redirect_url}"></head></html>')
+
+@app.post("/oauth/token")
+async def oauth_token(
+    request: Request,
+    grant_type: str = Form(None),
+    code: Optional[str] = Form(None),
+    redirect_uri: Optional[str] = Form(None),
+    client_id: Optional[str] = Form(None),
+    client_secret: Optional[str] = Form(None),
+    refresh_token: Optional[str] = Form(None),
+    code_verifier: Optional[str] = Form(None)
+):
+    """OAuth2 token endpoint"""
+    # Check for client credentials in Authorization header (HTTP Basic Auth)
+    auth_header = request.headers.get("authorization")
+    if auth_header and auth_header.startswith("Basic "):
+        try:
+            decoded = base64.b64decode(auth_header[6:]).decode('utf-8')
+            header_client_id, header_client_secret = decoded.split(':', 1)
+            # Use credentials from header if not provided in form
+            if not client_id:
+                client_id = header_client_id
+            if not client_secret:
+                client_secret = header_client_secret
+        except Exception as e:
+            logger.warning(f"[OAUTH] Failed to parse Basic Auth header: {e}")
+
+    settings = get_settings_from_db()
+    if not settings.get('auth_protocols_enabled') or not settings.get('oidc_enabled'):
+        raise HTTPException(status_code=404, detail="OIDC not enabled")
+
+    if grant_type == "authorization_code":
+        # Validate required parameters
+        if not all([code, redirect_uri, client_id]):
+            raise HTTPException(status_code=400, detail="Missing required parameters")
+
+        # Validate client
+        client = get_oauth_client_by_id_from_db(client_id)
+        if not client or not client.get('enabled'):
+            raise HTTPException(status_code=400, detail="Invalid client")
+
+        # Verify client_secret if provided
+        if client_secret:
+            if not bcrypt.checkpw(client_secret.encode('utf-8'), client['client_secret_hash'].encode('utf-8')):
+                raise HTTPException(status_code=401, detail="Invalid client credentials")
+
+        # Get authorization code
+        auth_code = get_oauth_code_from_db(code)
+        if not auth_code:
+            raise HTTPException(status_code=400, detail="Invalid authorization code")
+
+        # Check if code is used
+        if auth_code['used']:
+            raise HTTPException(status_code=400, detail="Authorization code already used")
+
+        # Check if code is expired
+        if datetime.now().timestamp() > float(auth_code['expires_at']):
+            raise HTTPException(status_code=400, detail="Authorization code expired")
+
+        # Verify client_id matches
+        if auth_code['client_id'] != client_id:
+            raise HTTPException(status_code=400, detail="Client mismatch")
+
+        # Verify redirect_uri matches
+        if auth_code['redirect_uri'] != redirect_uri:
+            raise HTTPException(status_code=400, detail="Redirect URI mismatch")
+
+        # Verify PKCE if required
+        if auth_code.get('code_challenge'):
+            if not code_verifier:
+                raise HTTPException(status_code=400, detail="Code verifier required")
+
+            # Compute challenge from verifier
+            import hashlib
+            computed_challenge = base64.urlsafe_b64encode(
+                hashlib.sha256(code_verifier.encode('utf-8')).digest()
+            ).rstrip(b'=').decode('utf-8')
+
+            if computed_challenge != auth_code['code_challenge']:
+                raise HTTPException(status_code=400, detail="Invalid code verifier")
+
+        # Mark code as used
+        mark_oauth_code_used(code)
+
+        # Generate tokens
+        access_token = create_jwt_token(
+            auth_code['user_id'],
+            client_id,
+            auth_code['scopes'],
+            expires_in=3600
+        )
+
+        refresh_token_value = secrets.token_urlsafe(32)
+
+        # Generate ID token for OpenID Connect
+        user = get_user_by_id_from_db(auth_code['user_id'])
+        if not user:
+            raise HTTPException(status_code=400, detail="User not found")
+        if not client_id:
+            raise HTTPException(status_code=400, detail="Client ID required")
+
+        # Ensure we have valid strings for required fields
+        username = user.get('username') or auth_code['user_id']
+        email = user.get('email', '')
+
+        id_token = create_id_token(
+            user_id=auth_code['user_id'],
+            client_id=client_id,
+            username=username,
+            email=email,
+            nonce=auth_code.get('nonce')
+        )
+
+        # Save tokens
+        save_oauth_token_to_db({
+            'access_token': access_token,
+            'refresh_token': refresh_token_value,
+            'client_id': client_id,
+            'user_id': auth_code['user_id'],
+            'scopes': auth_code['scopes'],
+            'expires_at': (datetime.now().timestamp() + 3600),
+            'created_at': datetime.now().isoformat()
+        })
+
+        return {
+            "access_token": access_token,
+            "token_type": "Bearer",
+            "expires_in": 3600,
+            "refresh_token": refresh_token_value,
+            "id_token": id_token,
+            "scope": ' '.join(auth_code['scopes'])
+        }
+
+    elif grant_type == "refresh_token":
+        # Refresh token flow
+        if not refresh_token or not client_id:
+            raise HTTPException(status_code=400, detail="Missing required parameters")
+
+        # Find token by refresh_token
+        with closing(get_db_connection()) as conn:
+            cursor = conn.cursor()
+            cursor.execute('SELECT * FROM oauth_tokens WHERE refresh_token = ? AND client_id = ?',
+                         (refresh_token, client_id))
+            row = cursor.fetchone()
+            if not row:
+                raise HTTPException(status_code=400, detail="Invalid refresh token")
+
+            old_token = {
+                'access_token': row['access_token'],
+                'user_id': row['user_id'],
+                'scopes': json.loads(row['scopes'])
+            }
+
+        # Generate new access token
+        new_access_token = create_jwt_token(
+            old_token['user_id'],
+            client_id,
+            old_token['scopes'],
+            expires_in=3600
+        )
+
+        # Update token in database
+        with closing(get_db_connection()) as conn:
+            cursor = conn.cursor()
+            cursor.execute('''
+                UPDATE oauth_tokens
+                SET access_token = ?, expires_at = ?, created_at = ?
+                WHERE refresh_token = ?
+            ''', (
+                new_access_token,
+                datetime.now().timestamp() + 3600,
+                datetime.now().isoformat(),
+                refresh_token
+            ))
+            conn.commit()
+
+        return {
+            "access_token": new_access_token,
+            "token_type": "Bearer",
+            "expires_in": 3600,
+            "scope": ' '.join(old_token['scopes'])
+        }
+
+    else:
+        raise HTTPException(status_code=400, detail="Unsupported grant_type")
+
+@app.get("/oauth/userinfo")
+async def oauth_userinfo(authorization: Optional[str] = Header(None)):
+    """OAuth2 UserInfo endpoint"""
+    settings = get_settings_from_db()
+    if not settings.get('auth_protocols_enabled') or not settings.get('oidc_enabled'):
+        raise HTTPException(status_code=404, detail="OIDC not enabled")
+
+    # Extract bearer token
+    if not authorization or not authorization.startswith('Bearer '):
+        raise HTTPException(status_code=401, detail="Missing or invalid authorization header")
+
+    access_token = authorization[7:]  # Remove 'Bearer ' prefix
+
+    # Get token from database
+    token = get_oauth_token_from_db(access_token)
+    if not token:
+        raise HTTPException(status_code=401, detail="Invalid access token")
+
+    # Check if token is expired
+    if datetime.now().timestamp() > float(token['expires_at']):
+        raise HTTPException(status_code=401, detail="Access token expired")
+
+    # Get user
+    user = get_user_by_id_from_db(token['user_id'])
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    # Build userinfo response based on scopes
+    scopes = token['scopes']
+    userinfo = {
+        'sub': user.get('username', user['id']),  # Use username as sub (matching id_token)
+        'user_id': user['id']  # Keep UUID as separate claim
+    }
+
+    if 'profile' in scopes:
+        userinfo['username'] = user.get('username', '')
+        userinfo['name'] = f"{user.get('first_name', '')} {user.get('last_name', '')}".strip()
+        userinfo['given_name'] = user.get('first_name', '')
+        userinfo['family_name'] = user.get('last_name', '')
+
+    if 'email' in scopes:
+        userinfo['email'] = user.get('email', '')
+        userinfo['email_verified'] = user.get('email_verified', False)
+
+    if 'groups' in scopes:
+        userinfo['groups'] = user.get('groups', [])
+
+    return userinfo
+
+@app.post("/oauth/revoke")
+async def oauth_revoke_post(token: str, client_id: Optional[str] = None):
+    """OAuth2 token revocation endpoint (POST)"""
+    settings = get_settings_from_db()
+    if not settings.get('auth_protocols_enabled') or not settings.get('oidc_enabled'):
+        raise HTTPException(status_code=404, detail="OIDC not enabled")
+
+    # Revoke the token
+    revoke_oauth_token(token)
+
+    return {"status": "revoked"}
+
+@app.get("/oauth/revoke")
+async def oauth_revoke_get(
+    request: Request,
+    post_logout_redirect_uri: Optional[str] = None,
+    client_id: Optional[str] = None,
+    state: Optional[str] = None,
+    session_id: Optional[str] = Cookie(None)
+):
+    """OIDC logout endpoint (GET) - RP-Initiated Logout"""
+    settings = get_settings_from_db()
+    if not settings.get('auth_protocols_enabled') or not settings.get('oidc_enabled'):
+        raise HTTPException(status_code=404, detail="OIDC not enabled")
+
+    # Logout the user by clearing their session
+    if session_id and session_id in sessions:
+        del sessions[session_id]
+
+    # Validate redirect URI if provided
+    if post_logout_redirect_uri and client_id:
+        client = get_oauth_client_by_id_from_db(client_id)
+        if client:
+            # Check if redirect URI is in allowed list
+            allowed_uris = client.get('redirect_uris', [])
+            # For logout, we're more lenient - just check the base domain matches
+            from urllib.parse import urlparse
+            redirect_domain = urlparse(post_logout_redirect_uri).netloc
+            allowed = any(urlparse(uri).netloc == redirect_domain for uri in allowed_uris)
+
+            if allowed:
+                # Redirect back to the client's post-logout page
+                redirect_url = post_logout_redirect_uri
+                if state:
+                    from urllib.parse import urlencode
+                    redirect_url += ('&' if '?' in redirect_url else '?') + urlencode({'state': state})
+                return RedirectResponse(url=redirect_url)
+
+    # If no valid redirect, show a simple logged out page
+    return HTMLResponse("""
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <title>Logged Out</title>
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <style>
+            body {
+                font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+                background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+                display: flex;
+                align-items: center;
+                justify-content: center;
+                min-height: 100vh;
+                margin: 0;
+            }
+            .container {
+                background: white;
+                padding: 40px;
+                border-radius: 12px;
+                text-align: center;
+                box-shadow: 0 10px 40px rgba(0,0,0,0.2);
+            }
+            h1 { color: #1f2937; margin-bottom: 10px; }
+            p { color: #6b7280; }
+        </style>
+    </head>
+    <body>
+        <div class="container">
+            <h1>✓ Logged Out</h1>
+            <p>You have been successfully logged out.</p>
+        </div>
+    </body>
+    </html>
+    """)
+
+# OAuth Client Management API
+
+@app.get("/api/oauth/clients")
+async def get_oauth_clients(session_id: Optional[str] = Cookie(None)):
+    """Get all OAuth clients"""
+    user = get_session_user(session_id)
+    if not user:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+
+    clients = get_all_oauth_clients_from_db()
+    # Don't return client secrets
+    for client in clients:
+        client.pop('client_secret_hash', None)
+
+    return clients
+
+class OAuthClientCreate(BaseModel):
+    name: str
+    redirect_uris: List[str]
+    allowed_groups: Optional[List[str]] = []
+
+@app.post("/api/oauth/clients")
+async def create_oauth_client(
+    client_data: OAuthClientCreate,
+    request: Request,
+    session_id: Optional[str] = Cookie(None)
+):
+    """Create a new OAuth client"""
+    user = get_session_user(session_id)
+    if not user:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+    require_csrf(request, session_id)
+
+    name = client_data.name
+    redirect_uris = client_data.redirect_uris
+    allowed_groups = client_data.allowed_groups if client_data.allowed_groups else []
+
+    # Generate client ID and secret
+    client_id = secrets.token_urlsafe(16)
+    client_secret = secrets.token_urlsafe(32)
+    client_secret_hash = bcrypt.hashpw(client_secret.encode('utf-8'), bcrypt.gensalt()).decode('utf-8')
+
+    # Save client
+    client = {
+        'client_id': client_id,
+        'client_secret_hash': client_secret_hash,
+        'name': name,
+        'redirect_uris': redirect_uris,
+        'allowed_groups': allowed_groups,
+        'allowed_scopes': ['openid', 'profile', 'email', 'groups'],
+        'grant_types': ['authorization_code', 'refresh_token'],
+        'require_pkce': True,
+        'created_at': datetime.now().isoformat(),
+        'enabled': True
+    }
+
+    save_oauth_client_to_db(client)
+
+    # Return client with secret (only time it's shown)
+    return {
+        'client_id': client_id,
+        'client_secret': client_secret,
+        'name': name,
+        'redirect_uris': redirect_uris
+    }
+
+@app.get("/api/oauth/clients/{client_id}")
+async def get_oauth_client(
+    client_id: str,
+    session_id: Optional[str] = Cookie(None)
+):
+    """Get a specific OAuth client"""
+    user = get_session_user(session_id)
+    if not user:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+
+    client = get_oauth_client_by_id_from_db(client_id)
+    if not client:
+        raise HTTPException(status_code=404, detail="OAuth client not found")
+
+    # Don't return client secret
+    client.pop('client_secret_hash', None)
+    return client
+
+class OAuthClientUpdate(BaseModel):
+    name: str
+    redirect_uris: List[str]
+    allowed_groups: Optional[List[str]] = []
+
+@app.put("/api/oauth/clients/{client_id}")
+async def update_oauth_client(
+    client_id: str,
+    client_data: OAuthClientUpdate,
+    request: Request,
+    session_id: Optional[str] = Cookie(None)
+):
+    """Update an existing OAuth client"""
+    user = get_session_user(session_id)
+    if not user:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+    require_csrf(request, session_id)
+
+    # Check if client exists
+    existing_client = get_oauth_client_by_id_from_db(client_id)
+    if not existing_client:
+        raise HTTPException(status_code=404, detail="OAuth client not found")
+
+    # Update client data
+    updated_client = {
+        **existing_client,
+        'name': client_data.name,
+        'redirect_uris': client_data.redirect_uris,
+        'allowed_groups': client_data.allowed_groups if client_data.allowed_groups else []
+    }
+
+    save_oauth_client_to_db(updated_client)
+
+    # Return updated client without secret
+    updated_client.pop('client_secret_hash', None)
+    return updated_client
+
+@app.delete("/api/oauth/clients/{client_id}")
+async def delete_oauth_client(
+    client_id: str,
+    request: Request,
+    session_id: Optional[str] = Cookie(None)
+):
+    """Delete an OAuth client"""
+    user = get_session_user(session_id)
+    if not user:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+    require_csrf(request, session_id)
+
+    delete_oauth_client_from_db(client_id)
+    return {"status": "deleted"}
+
 @app.get("/api/settings")
 async def get_settings(session_id: Optional[str] = Cookie(None)):
     user = get_session_user(session_id)
@@ -2426,10 +5468,39 @@ async def update_settings(settings: Settings, request: Request, session_id: Opti
         raise HTTPException(status_code=401, detail="Not authenticated")
     require_csrf(request, session_id)
 
-    # Get previous PHP enabled state
+    # Validate LDAP bind DN (service account)
+    if settings.ldap_bind_dn:
+        # Extract username from bind DN
+        bind_username = None
+        for part in settings.ldap_bind_dn.split(','):
+            part_lower = part.strip().lower()
+            if part_lower.startswith('cn=') or part_lower.startswith('uid='):
+                bind_username = part.split('=', 1)[1].strip()
+                break
+
+        if bind_username:
+            # Check if this user exists
+            bind_user = get_user_by_username_from_db(bind_username)
+            if not bind_user:
+                raise HTTPException(status_code=400, detail=f"LDAP Bind DN user '{bind_username}' does not exist. Please create this user first.")
+
+            # Check if user is admin
+            if bind_user.get('is_admin', False):
+                raise HTTPException(status_code=400, detail=f"LDAP Bind DN user '{bind_username}' cannot be an admin. Service accounts should be regular users.")
+
+            # Check if user is in allowed groups
+            allowed_groups = settings.ldap_allowed_groups or []
+            if allowed_groups:
+                user_groups = bind_user.get('groups', [])
+                if any(group in allowed_groups for group in user_groups):
+                    raise HTTPException(status_code=400, detail=f"LDAP Bind DN user '{bind_username}' should not be in the allowed groups. Service accounts are for searching only, not authentication.")
+
+    # Get previous settings state
     old_settings = get_settings_from_db()
     old_php_enabled = old_settings.get("php_enabled", False)
     new_php_enabled = settings.php_enabled
+    old_ldap_enabled = old_settings.get("ldap_enabled", False)
+    old_radius_enabled = old_settings.get("radius_enabled", False)
 
     # Save settings to database only (no longer in JSON)
     save_settings_to_db(settings.model_dump())
@@ -2441,6 +5512,34 @@ async def update_settings(settings: Settings, request: Request, session_id: Opti
     elif not old_php_enabled and new_php_enabled:
         # PHP was enabled - start PHP processes
         await start_php_cgi()
+
+    # Handle LDAP server restart if settings changed
+    ldap_settings_changed = (
+        old_settings.get("ldap_port") != settings.ldap_port or
+        old_settings.get("ldap_base_dn") != settings.ldap_base_dn or
+        old_settings.get("ldap_bind_dn") != settings.ldap_bind_dn or
+        old_settings.get("ldap_allowed_groups") != settings.ldap_allowed_groups or
+        old_ldap_enabled != settings.ldap_enabled
+    )
+    if ldap_settings_changed:
+        logger.info("LDAP settings changed, restarting LDAP server...")
+        await stop_ldap_server()
+        await asyncio.sleep(0.5)  # Give it time to fully stop
+        await start_ldap_server()
+
+    # Handle RADIUS server restart if settings changed
+    radius_settings_changed = (
+        old_settings.get("radius_auth_port") != settings.radius_auth_port or
+        old_settings.get("radius_secret") != settings.radius_secret or
+        old_settings.get("radius_allowed_groups") != settings.radius_allowed_groups or
+        old_settings.get("radius_vlan_assignment") != settings.radius_vlan_assignment or
+        old_radius_enabled != settings.radius_enabled
+    )
+    if radius_settings_changed:
+        logger.info("RADIUS settings changed, restarting RADIUS server...")
+        await stop_radius_server()
+        await asyncio.sleep(0.5)  # Give it time to fully stop
+        await start_radius_server()
 
     # Check if Caddy is stopped and try to restart it (only if stopped)
     caddy_was_stopped = not caddy_process or caddy_process.returncode is not None

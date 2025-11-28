@@ -60,6 +60,16 @@ function showAlert(message, type = 'success') {
     setTimeout(() => alert.remove(), 16000);
 }
 
+function escapeHtml(unsafe) {
+    if (typeof unsafe !== 'string') return '';
+    return unsafe
+        .replace(/&/g, "&amp;")
+        .replace(/</g, "&lt;")
+        .replace(/>/g, "&gt;")
+        .replace(/"/g, "&quot;")
+        .replace(/'/g, "&#039;");
+}
+
 async function apiCall(url, options = {}, showErrors = true) {
     try {
         // Add CSRF token header for state-changing requests
@@ -105,8 +115,9 @@ async function apiCall(url, options = {}, showErrors = true) {
         }
         return await response.json();
     } catch (err) {
-        console.error('API Call Error:', err);
+        // Only log errors to console if showErrors is true (suppress on login page)
         if (showErrors) {
+            console.error('API Call Error:', err);
             showAlert(err.message, 'error');
         }
         throw err;
@@ -182,9 +193,19 @@ async function login() {
             // Could redirect to settings or show password change modal here
         }
 
+        // Check if there's a return URL from OAuth flow
+        const returnTo = sessionStorage.getItem('returnTo');
+        if (returnTo) {
+            sessionStorage.removeItem('returnTo');
+            window.location.href = returnTo;
+            return;
+        }
+
         showApp();
         await checkForUpdates();
         await loadDashboard();
+        // Update authentication nav visibility after successful login
+        await initAuthNav();
     } catch (err) {
         console.error('Login error:', err);
         document.getElementById('login-alert').innerHTML =
@@ -272,6 +293,7 @@ function showPage(page, sourceEvent = null) {
     if (page === 'users') loadUsers();
     if (page === 'groups') loadGroups();
     if (page === 'settings') loadSettings();
+    if (page === 'authentication') loadAuthenticationPage();
     if (page === 'help') loadRuntimeInfo();
 }
 
@@ -323,6 +345,7 @@ async function loadDashboard() {
         await loadSecurityWarnings();
         await loadActivity();
         await loadNotifications();
+        await updateAuthServicesStatus();
         await checkForUpdates();
     } catch {}
 }
@@ -473,6 +496,77 @@ async function loadNotifications() {
     } catch {}
 }
 
+async function updateAuthServicesStatus() {
+    try {
+        const settings = await apiCall('/api/settings', {}, false);
+        const authCard = document.getElementById('auth-services-card');
+
+        // Check if authentication protocols are enabled
+        if (!settings.auth_protocols_enabled) {
+            authCard.style.display = 'none';
+            return;
+        }
+
+        // Track if any service is enabled
+        let anyServiceEnabled = false;
+
+        // OIDC Provider
+        const oidcStatus = document.getElementById('oidc-service-status');
+        if (settings.oidc_enabled) {
+            oidcStatus.style.display = 'block';
+            anyServiceEnabled = true;
+        } else {
+            oidcStatus.style.display = 'none';
+        }
+
+        // LDAP Server
+        const ldapStatus = document.getElementById('ldap-service-status');
+        const ldapPortInfo = document.getElementById('ldap-port-info');
+        if (settings.ldap_enabled) {
+            const port = settings.ldap_port || 389;
+            ldapPortInfo.textContent = `✅ Running on port ${port}`;
+            ldapStatus.style.display = 'block';
+            anyServiceEnabled = true;
+        } else {
+            ldapStatus.style.display = 'none';
+        }
+
+        // RADIUS Server
+        const radiusStatus = document.getElementById('radius-service-status');
+        const radiusPortInfo = document.getElementById('radius-port-info');
+        if (settings.radius_enabled) {
+            const port = settings.radius_auth_port || 1812;
+            radiusPortInfo.textContent = `✅ Running on port ${port}`;
+            radiusStatus.style.display = 'block';
+            anyServiceEnabled = true;
+        } else {
+            radiusStatus.style.display = 'none';
+        }
+
+        // SMTP/Email
+        const smtpStatus = document.getElementById('smtp-service-status');
+        if (settings.smtp_enabled) {
+            smtpStatus.style.display = 'block';
+            anyServiceEnabled = true;
+        } else {
+            smtpStatus.style.display = 'none';
+        }
+
+        // Show card only if at least one service is enabled
+        if (anyServiceEnabled) {
+            authCard.style.display = 'block';
+        } else {
+            authCard.style.display = 'none';
+        }
+    } catch (err) {
+        // Hide card on error (user not authenticated yet, etc.)
+        const authCard = document.getElementById('auth-services-card');
+        if (authCard) {
+            authCard.style.display = 'none';
+        }
+    }
+}
+
 // Load runtime info and update help page dynamically
 let runtimeInfo = null;
 async function loadRuntimeInfo() {
@@ -580,7 +674,12 @@ async function loadSettings() {
     document.getElementById('manager-port').value = data.manager_port || 8000;
     document.getElementById('caddy-admin-port').value = data.caddy_admin_port || 12999;
     document.getElementById('enhanced-security').checked = data.enhanced_security || false;
+    document.getElementById('auth-protocols-enabled').checked = data.auth_protocols_enabled || false;
     document.getElementById('caddy-log-level').value = data.caddy_log_level || 'WARN';
+
+    // Show/hide Authentication nav item based on setting
+    updateAuthenticationNavVisibility(data.auth_protocols_enabled || false);
+
     document.body.className = data.theme;
     document.querySelectorAll('#theme-toggle .toggle-btn').forEach((btn, idx) => {
         const themes = ['light', 'dark', 'black'];
@@ -644,6 +743,7 @@ async function saveSettings() {
         manager_port: parseInt(document.getElementById('manager-port').value),
         caddy_admin_port: parseInt(document.getElementById('caddy-admin-port').value),
         enhanced_security: document.getElementById('enhanced-security').checked,
+        auth_protocols_enabled: document.getElementById('auth-protocols-enabled').checked,
         caddy_log_level: document.getElementById('caddy-log-level').value
     };
     await apiCall('/api/settings', {
@@ -651,6 +751,9 @@ async function saveSettings() {
         headers: {'Content-Type': 'application/json'},
         body: JSON.stringify(settings)
     });
+
+    // Update Authentication nav visibility after saving
+    updateAuthenticationNavVisibility(settings.auth_protocols_enabled);
 
     // Check if Enhanced Security was just enabled
     if (wasEnhancedSecurityOff && settings.enhanced_security) {
@@ -697,6 +800,7 @@ function openGroupModal() {
     document.getElementById('group-modal-title').textContent = 'Add Group';
     document.getElementById('group-name').value = '';
     document.getElementById('group-description').value = '';
+    document.getElementById('group-force-2fa').checked = false;
     document.getElementById('group-modal').classList.add('active');
 }
 
@@ -709,15 +813,16 @@ async function saveGroup() {
         const group = {
             id: editingGroupId || 'group_' + Date.now(),
             name: document.getElementById('group-name').value,
-            description: document.getElementById('group-description').value
+            description: document.getElementById('group-description').value,
+            force_2fa: document.getElementById('group-force-2fa').checked
         };
-        
+
         await apiCall('/api/groups', {
             method: 'POST',
             headers: {'Content-Type': 'application/json'},
             body: JSON.stringify(group)
         });
-        
+
         showAlert('Group saved!');
         closeGroupModal();
         loadGroups();
@@ -729,11 +834,12 @@ async function saveGroup() {
 async function editGroup(id) {
     const groups = await apiCall('/api/groups');
     const group = groups.find(g => g.id === id);
-    
+
     editingGroupId = id;
     document.getElementById('group-modal-title').textContent = 'Edit Group';
     document.getElementById('group-name').value = group.name;
     document.getElementById('group-description').value = group.description;
+    document.getElementById('group-force-2fa').checked = group.force_2fa || false;
     document.getElementById('group-modal').classList.add('active');
 }
 
@@ -748,6 +854,16 @@ async function deleteGroup(id) {
 // Users
 async function loadUsers() {
     const users = await apiCall('/api/users');
+
+    // Check if SMTP is enabled to show invite link button
+    const settings = await apiCall('/api/settings', {}, false);
+    const inviteBtn = document.getElementById('invite-link-btn');
+    if (settings && settings.smtp_enabled) {
+        inviteBtn.style.display = 'inline-block';
+    } else {
+        inviteBtn.style.display = 'none';
+    }
+
     const list = document.getElementById('user-list');
     list.innerHTML = users.map(u => {
         // Map group IDs to group names
@@ -781,6 +897,7 @@ function openUserModal() {
     document.getElementById('user-modal-title').textContent = 'Add User';
     document.getElementById('user-username').value = '';
     document.getElementById('user-password').value = '';
+    document.getElementById('user-email').value = '';
     renderGroupSelector('user-groups', []);
     document.getElementById('user-2fa-section').classList.add('hidden');
     document.getElementById('user-modal').classList.add('active');
@@ -801,9 +918,9 @@ function renderGroupSelector(elementId, selectedGroups) {
                 </div>
             `).join('')}
         </div>
-        <select id="${elementId}-select" onchange="addGroupToUser('${elementId}')">
+        <select id="${elementId}-select" onchange="addGroupToUser('${elementId}')" style="width: 100%; padding: 10px; border: 1px solid var(--border); border-radius: 6px; background: var(--bg-tertiary); color: var(--text-primary); font-size: 14px; margin-top: 8px; cursor: pointer;">
             <option value="">+ Add group</option>
-            ${allGroups.filter(g => !selectedGroups.includes(g.id)).map(g => 
+            ${allGroups.filter(g => !selectedGroups.includes(g.id)).map(g =>
                 `<option value="${g.id}">${g.name}</option>`
             ).join('')}
         </select>
@@ -827,6 +944,11 @@ function removeGroupFromUser(elementId, groupId) {
     const current = JSON.parse(container.dataset.groups || '[]');
     const updated = current.filter(g => g !== groupId);
     renderGroupSelector(elementId, updated);
+}
+
+function getSelectedGroups(elementId) {
+    const container = document.getElementById(elementId);
+    return JSON.parse(container.dataset.groups || '[]');
 }
 
 async function saveUser() {
@@ -861,9 +983,10 @@ async function saveUser() {
                 id: editingUserId,
                 username: document.getElementById('user-username').value,
                 password: document.getElementById('user-password').value,
+                email: document.getElementById('user-email').value || '',
                 groups: groups
             };
-            
+
             await apiCall(`/api/users/${editingUserId}`, {
                 method: 'PUT',
                 headers: {'Content-Type': 'application/json'},
@@ -874,9 +997,10 @@ async function saveUser() {
             const user = {
                 username: document.getElementById('user-username').value,
                 password: document.getElementById('user-password').value,
+                email: document.getElementById('user-email').value || '',
                 groups: groups
             };
-            
+
             await apiCall('/api/users', {
                 method: 'POST',
                 headers: {'Content-Type': 'application/json'},
@@ -901,6 +1025,7 @@ async function editUser(id) {
     document.getElementById('user-username').value = user.username;
     document.getElementById('user-password').value = '';
     document.getElementById('user-password').placeholder = 'Leave empty to keep current';
+    document.getElementById('user-email').value = user.email || '';
     renderGroupSelector('user-groups', user.groups);
     await update2FASection(user);
     document.getElementById('user-modal').classList.add('active');
@@ -1040,6 +1165,60 @@ function cancel2FASetup() {
     document.getElementById('user-2fa-qr-section').classList.add('hidden');
     document.getElementById('user-2fa-enable-section').classList.remove('hidden');
     document.getElementById('user-2fa-token').value = '';
+}
+
+// Invite Link Functions
+function openInviteLinkModal() {
+    document.getElementById('invite-username').value = '';
+    document.getElementById('invite-email').value = '';
+    renderGroupSelector('invite-groups', []);
+    document.getElementById('invite-expiry').value = '24';
+    document.getElementById('invite-link-result').classList.add('hidden');
+    document.getElementById('invite-link-modal').classList.add('active');
+}
+
+function closeInviteLinkModal() {
+    document.getElementById('invite-link-modal').classList.remove('active');
+}
+
+async function generateInviteLink() {
+    try {
+        const container = document.getElementById('invite-groups');
+        const groups = JSON.parse(container.dataset.groups || '[]');
+
+        const inviteData = {
+            username: document.getElementById('invite-username').value,
+            email: document.getElementById('invite-email').value,
+            groups: groups,
+            expiry_hours: parseInt(document.getElementById('invite-expiry').value)
+        };
+
+        const result = await apiCall('/api/users/invite-link', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify(inviteData)
+        });
+
+        // Show the generated link
+        document.getElementById('invite-link-url').value = result.invite_url;
+        document.getElementById('invite-link-result').classList.remove('hidden');
+
+        showAlert('Invite link generated and sent!', 'success');
+    } catch (err) {
+        showAlert('Failed to generate invite link: ' + err.message, 'error');
+    }
+}
+
+async function copyInviteLink() {
+    const linkInput = document.getElementById('invite-link-url');
+    try {
+        await navigator.clipboard.writeText(linkInput.value);
+        showAlert('Invite link copied to clipboard!', 'success');
+    } catch (err) {
+        // Fallback for older browsers
+        linkInput.select();
+        showAlert('Please copy the link manually (Ctrl+C)', 'info');
+    }
 }
 
 // Proxies
@@ -1617,6 +1796,19 @@ function startAutoRefresh() {
 const savedTheme = localStorage.getItem('caddy-manager-theme') || 'dark';
 setTheme(savedTheme);
 
+// Initialize authentication nav visibility from settings
+async function initAuthNav() {
+    try {
+        // Suppress error alerts for unauthenticated users on login page
+        const settings = await apiCall('/api/settings', {}, false);
+        updateAuthenticationNavVisibility(settings.auth_protocols_enabled || false);
+    } catch (e) {
+        // If settings can't be loaded yet (not authenticated), hide by default
+        updateAuthenticationNavVisibility(false);
+    }
+}
+initAuthNav();
+
 // Initialize
 checkAuth();
 
@@ -1625,3 +1817,395 @@ const activityEvents = ['mousedown', 'keydown', 'scroll', 'touchstart', 'click']
 activityEvents.forEach(event => {
     document.addEventListener(event, resetInactivityTimer, true);
 });
+
+// ========================================
+// Authentication Page Functions
+// ========================================
+
+async function loadAuthenticationPage() {
+    // Load groups if not already loaded
+    if (allGroups.length === 0) {
+        try {
+            const groups = await apiCall('/api/groups');
+            allGroups = groups;
+        } catch (error) {
+            console.error('Failed to load groups:', error);
+        }
+    }
+
+    // Load OAuth clients
+    await loadOAuthClients();
+
+    // Load settings and populate form
+    const settings = await apiCall('/api/settings');
+
+    // Update protocol status indicators
+    updateProtocolStatus('oidc', settings.oidc_enabled);
+    updateProtocolStatus('ldap', settings.ldap_enabled);
+    updateProtocolStatus('radius', settings.radius_enabled);
+    updateProtocolStatus('smtp', settings.smtp_enabled);
+
+    // Populate OIDC settings
+    document.getElementById('oidc_enabled').checked = settings.oidc_enabled || false;
+    document.getElementById('oidc_issuer').value = settings.oidc_issuer || '';
+
+    // Populate LDAP settings
+    document.getElementById('ldap_enabled').checked = settings.ldap_enabled || false;
+    document.getElementById('ldap_port').value = settings.ldap_port || 389;
+    document.getElementById('ldap_base_dn').value = settings.ldap_base_dn || '';
+    document.getElementById('ldap_bind_dn').value = settings.ldap_bind_dn || '';
+    renderGroupSelector('ldap-allowed-groups', settings.ldap_allowed_groups || []);
+
+    // Update LDAP client configuration display
+    updateLDAPConfigDisplay();
+
+    // Populate RADIUS settings
+    document.getElementById('radius_enabled').checked = settings.radius_enabled || false;
+    document.getElementById('radius_auth_port').value = settings.radius_auth_port || 1812;
+    document.getElementById('radius_acct_port').value = settings.radius_acct_port || 1813;
+    document.getElementById('radius_secret').value = settings.radius_secret || '';
+    document.getElementById('radius_vlan_assignment').checked = settings.radius_vlan_assignment || false;
+    document.getElementById('radius_eap_method').value = settings.radius_eap_method || 'PAP';
+    renderGroupSelector('radius-allowed-groups', settings.radius_allowed_groups || []);
+
+    // Populate SMTP settings
+    document.getElementById('smtp_enabled').checked = settings.smtp_enabled || false;
+    document.getElementById('smtp_server').value = settings.smtp_server || '';
+    document.getElementById('smtp_port').value = settings.smtp_port || 587;
+    document.getElementById('smtp_use_tls').checked = settings.smtp_use_tls !== false;
+    document.getElementById('smtp_username').value = settings.smtp_username || '';
+    document.getElementById('smtp_password').value = settings.smtp_password || '';
+    document.getElementById('smtp_from_address').value = settings.smtp_from_address || '';
+    document.getElementById('smtp_from_name').value = settings.smtp_from_name || 'CaddyIAM';
+}
+
+function updateProtocolStatus(protocol, enabled) {
+    const statusEl = document.getElementById(`${protocol}-status`);
+    if (enabled) {
+        statusEl.innerHTML = '<span style="color: var(--success);">● Enabled</span>';
+    } else {
+        statusEl.innerHTML = '<span style="color: var(--danger);">● Disabled</span>';
+    }
+}
+
+async function saveAuthenticationSettings() {
+    try {
+        const settings = await apiCall('/api/settings');
+
+        // Update authentication settings
+        settings.oidc_enabled = document.getElementById('oidc_enabled').checked;
+        settings.oidc_issuer = document.getElementById('oidc_issuer').value;
+
+        settings.ldap_enabled = document.getElementById('ldap_enabled').checked;
+        settings.ldap_port = parseInt(document.getElementById('ldap_port').value);
+        settings.ldap_base_dn = document.getElementById('ldap_base_dn').value;
+        settings.ldap_bind_dn = document.getElementById('ldap_bind_dn').value;
+        settings.ldap_allowed_groups = getSelectedGroups('ldap-allowed-groups');
+
+        settings.radius_enabled = document.getElementById('radius_enabled').checked;
+        settings.radius_auth_port = parseInt(document.getElementById('radius_auth_port').value);
+        settings.radius_acct_port = parseInt(document.getElementById('radius_acct_port').value);
+        settings.radius_secret = document.getElementById('radius_secret').value;
+        settings.radius_vlan_assignment = document.getElementById('radius_vlan_assignment').checked;
+        settings.radius_eap_method = document.getElementById('radius_eap_method').value;
+        settings.radius_allowed_groups = getSelectedGroups('radius-allowed-groups');
+
+        settings.smtp_enabled = document.getElementById('smtp_enabled').checked;
+        settings.smtp_server = document.getElementById('smtp_server').value;
+        settings.smtp_port = parseInt(document.getElementById('smtp_port').value);
+        settings.smtp_use_tls = document.getElementById('smtp_use_tls').checked;
+        settings.smtp_username = document.getElementById('smtp_username').value;
+        settings.smtp_password = document.getElementById('smtp_password').value;
+        settings.smtp_from_address = document.getElementById('smtp_from_address').value;
+        settings.smtp_from_name = document.getElementById('smtp_from_name').value;
+
+        await apiCall('/api/settings', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(settings)
+        });
+
+        alert('Authentication settings saved successfully');
+        await loadAuthenticationPage(); // Reload to update status
+    } catch (error) {
+        alert(`Failed to save settings: ${error.message}`);
+    }
+}
+
+async function loadOAuthClients() {
+    try {
+        const clients = await apiCall('/api/oauth/clients');
+        const container = document.getElementById('oauth-clients-list');
+
+        if (clients.length === 0) {
+            container.innerHTML = '<p style="color: var(--text-muted); text-align: center; padding: 20px;">No OAuth clients configured</p>';
+            return;
+        }
+
+        container.innerHTML = clients.map(client => {
+            // Get group names for display
+            const groupNames = (client.allowed_groups || []).map(groupId => {
+                const group = allGroups.find(g => g.id === groupId);
+                return group ? group.name : groupId;
+            });
+            const groupsDisplay = groupNames.length > 0
+                ? groupNames.map(name => `<span style="background: var(--primary); color: white; padding: 2px 8px; border-radius: 3px; display: inline-block; margin: 2px; font-size: 0.85em;">${escapeHtml(name)}</span>`).join('')
+                : '<span style="color: var(--text-muted); font-style: italic;">All groups</span>';
+
+            return `
+            <div style="padding: 15px; background: var(--bg-secondary); border-radius: 6px; margin-bottom: 10px;">
+                <div style="display: flex; justify-content: space-between; align-items: flex-start;">
+                    <div style="flex: 1;">
+                        <h4 style="margin: 0 0 10px 0;">${escapeHtml(client.name)}</h4>
+                        <p style="margin: 5px 0; font-size: 0.9em; color: var(--text-muted);">
+                            <strong>Client ID:</strong> <code style="background: var(--bg-primary); padding: 2px 6px; border-radius: 3px;">${escapeHtml(client.client_id)}</code>
+                        </p>
+                        <p style="margin: 5px 0; font-size: 0.9em; color: var(--text-muted);">
+                            <strong>Redirect URIs:</strong><br>
+                            ${client.redirect_uris.map(uri => `<code style="background: var(--bg-primary); padding: 2px 6px; border-radius: 3px; display: inline-block; margin: 2px;">${escapeHtml(uri)}</code>`).join('')}
+                        </p>
+                        <p style="margin: 5px 0; font-size: 0.9em; color: var(--text-muted);">
+                            <strong>Allowed Groups:</strong><br>
+                            ${groupsDisplay}
+                        </p>
+                    </div>
+                    <div style="display: flex; gap: 8px;">
+                        <button class="btn btn-secondary" onclick="editOAuthClient('${client.client_id}')">Edit</button>
+                        <button class="btn btn-danger" onclick="deleteOAuthClient('${client.client_id}')">Delete</button>
+                    </div>
+                </div>
+            </div>
+            `;
+        }).join('');
+    } catch (error) {
+        alert(`Failed to load OAuth clients: ${error.message}`);
+    }
+}
+
+async function openOAuthClientModal() {
+    // Load groups if not already loaded
+    if (allGroups.length === 0) {
+        try {
+            const groups = await apiCall('/api/groups');
+            allGroups = groups;
+        } catch (error) {
+            console.error('Failed to load groups:', error);
+        }
+    }
+
+    document.getElementById('oauth-client-name').value = '';
+    document.getElementById('oauth-redirect-uris').value = '';
+
+    // Render group selector for OAuth client
+    renderGroupSelector('oauth-client-groups', []);
+
+    // Reset modal title for creating new client
+    document.querySelector('#oauth-client-modal .modal-header h2').textContent = 'Create OAuth Client';
+
+    // Clear any editing state
+    document.getElementById('oauth-client-modal').dataset.editingClientId = '';
+
+    document.getElementById('oauth-client-modal').classList.add('active');
+}
+
+function closeOAuthClientModal() {
+    document.getElementById('oauth-client-modal').classList.remove('active');
+    // Clear the editing client ID
+    document.getElementById('oauth-client-modal').dataset.editingClientId = '';
+}
+
+async function editOAuthClient(clientId) {
+    try {
+        // Load groups if not already loaded
+        if (allGroups.length === 0) {
+            try {
+                const groups = await apiCall('/api/groups');
+                allGroups = groups;
+            } catch (error) {
+                console.error('Failed to load groups:', error);
+            }
+        }
+
+        // Fetch the existing client data
+        const client = await apiCall(`/api/oauth/clients/${clientId}`);
+
+        // Populate the modal with existing data
+        document.getElementById('oauth-client-name').value = client.name;
+        document.getElementById('oauth-redirect-uris').value = client.redirect_uris.join('\n');
+
+        // Select the allowed groups - this will now properly render with the loaded groups
+        renderGroupSelector('oauth-client-groups', client.allowed_groups || []);
+
+        // Store the client ID in the modal so saveOAuthClient knows we're editing
+        document.getElementById('oauth-client-modal').dataset.editingClientId = clientId;
+
+        // Change the modal title
+        document.querySelector('#oauth-client-modal .modal-header h2').textContent = 'Edit OAuth Client';
+
+        // Open the modal
+        document.getElementById('oauth-client-modal').classList.add('active');
+    } catch (error) {
+        alert(`Failed to load OAuth client: ${error.message}`);
+    }
+}
+
+async function saveOAuthClient() {
+    try {
+        const name = document.getElementById('oauth-client-name').value.trim();
+        const redirectUrisText = document.getElementById('oauth-redirect-uris').value.trim();
+
+        if (!name) {
+            alert('Client name is required');
+            return;
+        }
+
+        if (!redirectUrisText) {
+            alert('At least one redirect URI is required');
+            return;
+        }
+
+        const redirect_uris = redirectUrisText.split('\n').map(uri => uri.trim()).filter(uri => uri);
+
+        // Get selected groups
+        const allowed_groups = getSelectedGroups('oauth-client-groups');
+
+        // Check if we're editing an existing client
+        const editingClientId = document.getElementById('oauth-client-modal').dataset.editingClientId;
+
+        if (editingClientId) {
+            // Update existing client
+            const result = await apiCall(`/api/oauth/clients/${editingClientId}`, {
+                method: 'PUT',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ name, redirect_uris, allowed_groups })
+            });
+
+            showAlert('OAuth client updated successfully!', 'success');
+            closeOAuthClientModal();
+            await loadOAuthClients();
+        } else {
+            // Create new client
+            const result = await apiCall('/api/oauth/clients', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ name, redirect_uris, allowed_groups })
+            });
+
+            // Show credentials modal with copy buttons
+            document.getElementById('oauth-client-id-display').value = result.client_id;
+            document.getElementById('oauth-client-secret-display').value = result.client_secret;
+
+            closeOAuthClientModal();
+            document.getElementById('oauth-credentials-modal').classList.add('active');
+
+            await loadOAuthClients();
+        }
+    } catch (error) {
+        alert(`Failed to save OAuth client: ${error.message}`);
+    }
+}
+
+function closeOAuthCredentialsModal() {
+    document.getElementById('oauth-credentials-modal').classList.remove('active');
+    document.getElementById('oauth-client-id-display').value = '';
+    document.getElementById('oauth-client-secret-display').value = '';
+}
+
+async function copyOAuthClientId() {
+    const clientId = document.getElementById('oauth-client-id-display').value;
+    try {
+        await navigator.clipboard.writeText(clientId);
+        showAlert('Client ID copied to clipboard!', 'success');
+    } catch (err) {
+        // Fallback for older browsers
+        document.getElementById('oauth-client-id-display').select();
+        showAlert('Please copy the Client ID manually (Ctrl+C)', 'info');
+    }
+}
+
+async function copyOAuthClientSecret() {
+    const clientSecret = document.getElementById('oauth-client-secret-display').value;
+    try {
+        await navigator.clipboard.writeText(clientSecret);
+        showAlert('Client Secret copied to clipboard!', 'success');
+    } catch (err) {
+        // Fallback for older browsers
+        document.getElementById('oauth-client-secret-display').select();
+        showAlert('Please copy the Client Secret manually (Ctrl+C)', 'info');
+    }
+}
+
+async function deleteOAuthClient(clientId) {
+    if (!confirm('Are you sure you want to delete this OAuth client? This will revoke access for all applications using this client.')) {
+        return;
+    }
+
+    try {
+        await apiCall(`/api/oauth/clients/${clientId}`, {
+            method: 'DELETE'
+        });
+
+        await loadOAuthClients();
+        alert('OAuth client deleted');
+    } catch (error) {
+        alert(`Failed to delete OAuth client: ${error.message}`);
+    }
+}
+
+async function updateLDAPConfigDisplay() {
+    // Update the LDAP client configuration display
+    const port = document.getElementById('ldap_port').value || '389';
+    const baseDN = document.getElementById('ldap_base_dn').value || 'dc=example,dc=com';
+    const bindDN = document.getElementById('ldap_bind_dn').value || '-';
+
+    document.getElementById('ldap-port-display').textContent = port;
+    document.getElementById('ldap-bind-dn-display').textContent = bindDN;
+    document.getElementById('ldap-search-base-display').textContent = baseDN;
+
+    // Get server IP addresses
+    try {
+        const response = await apiCall('/api/system/network-info', {}, false);
+        if (response && response.addresses && response.addresses.length > 0) {
+            document.getElementById('ldap-server-display').textContent = response.addresses.join(', ');
+        }
+    } catch (e) {
+        // Fallback to localhost if we can't get network info
+        document.getElementById('ldap-server-display').textContent = 'localhost';
+    }
+}
+
+function updateAuthSettings() {
+    // Real-time status update when checkboxes change
+    const oidcEnabled = document.getElementById('oidc_enabled').checked;
+    const ldapEnabled = document.getElementById('ldap_enabled').checked;
+    const radiusEnabled = document.getElementById('radius_enabled').checked;
+    const smtpEnabled = document.getElementById('smtp_enabled').checked;
+
+    // Update LDAP config display
+    updateLDAPConfigDisplay();
+
+    updateProtocolStatus('oidc', oidcEnabled);
+    updateProtocolStatus('ldap', ldapEnabled);
+    updateProtocolStatus('radius', radiusEnabled);
+    updateProtocolStatus('smtp', smtpEnabled);
+}
+
+function updateAuthenticationNavVisibility(enabled) {
+    // Find the Authentication nav item
+    const navItems = document.querySelectorAll('.nav-item');
+    navItems.forEach(item => {
+        if (item.textContent.includes('Authentication')) {
+            if (enabled) {
+                item.style.display = 'flex';
+                // Add a subtle highlight animation to draw attention
+                item.style.transition = 'background-color 0.5s';
+                item.style.backgroundColor = 'rgba(76, 175, 80, 0.2)';
+                setTimeout(() => {
+                    item.style.backgroundColor = '';
+                }, 2000);
+            } else {
+                item.style.display = 'none';
+            }
+        }
+    });
+}

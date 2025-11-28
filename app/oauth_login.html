@@ -1,0 +1,182 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Sign In</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: #e0e0e0;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            min-height: 100vh;
+        }
+        .container {
+            background: #ffffff;
+            border-radius: 12px;
+            padding: 40px;
+            width: 400px;
+            max-width: 90%;
+            box-shadow: 0 10px 40px rgba(0, 0, 0, 0.2);
+        }
+        h1 {
+            color: #1f2937;
+            margin-bottom: 10px;
+            font-size: 28px;
+            text-align: center;
+        }
+        p {
+            color: #6b7280;
+            margin-bottom: 30px;
+            text-align: center;
+        }
+        .form-group {
+            margin-bottom: 20px;
+        }
+        label {
+            display: block;
+            margin-bottom: 8px;
+            color: #374151;
+            font-weight: 500;
+        }
+        input {
+            width: 100%;
+            padding: 12px;
+            border: 1px solid #d1d5db;
+            border-radius: 6px;
+            background: #f9fafb;
+            color: #1f2937;
+            font-size: 14px;
+        }
+        input:focus {
+            outline: none;
+            border-color: #667eea;
+            background: #ffffff;
+        }
+        button {
+            width: 100%;
+            padding: 12px;
+            border: none;
+            border-radius: 6px;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            font-size: 16px;
+            font-weight: 500;
+            cursor: pointer;
+            transition: transform 0.2s;
+        }
+        button:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 5px 15px rgba(102, 126, 234, 0.4);
+        }
+        button:active {
+            transform: translateY(0);
+        }
+        .error {
+            background: #fef2f2;
+            color: #dc2626;
+            border: 1px solid #fecaca;
+            padding: 12px;
+            border-radius: 6px;
+            margin-bottom: 20px;
+            display: none;
+        }
+        .hidden {
+            display: none;
+        }
+        .info {
+            background: #eff6ff;
+            color: #1e40af;
+            border: 1px solid #bfdbfe;
+            padding: 12px;
+            border-radius: 6px;
+            margin-bottom: 20px;
+            font-size: 14px;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>🔐 Sign In</h1>
+        <p>Please authenticate to continue</p>
+        <div id="error" class="error"></div>
+        <div id="2fa-info" class="info hidden">
+            Please enter your 2FA code from your authenticator app
+        </div>
+        <form id="loginForm" onsubmit="login(event)">
+            <div class="form-group">
+                <label>Username</label>
+                <input type="text" id="username" required autofocus autocomplete="username">
+            </div>
+            <div class="form-group">
+                <label>Password</label>
+                <input type="password" id="password" required autocomplete="current-password">
+            </div>
+            <div class="form-group hidden" id="2fa-group">
+                <label>2FA Code</label>
+                <input type="text" id="2fa-token" maxlength="6" pattern="[0-9]{6}" autocomplete="one-time-code">
+            </div>
+            <button type="submit">Sign In</button>
+        </form>
+    </div>
+
+    <script>
+        async function login(event) {
+            event.preventDefault();
+
+            const username = document.getElementById('username').value;
+            const password = document.getElementById('password').value;
+            const totpToken = document.getElementById('2fa-token').value.trim();
+            const errorDiv = document.getElementById('error');
+
+            try {
+                const response = await fetch('/api/login', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    credentials: 'include',
+                    body: JSON.stringify({
+                        username: username,
+                        password: password,
+                        totp_token: totpToken || undefined
+                    })
+                });
+
+                if (!response.ok) {
+                    const error = await response.json();
+
+                    // Check if 2FA is required
+                    if (response.status === 403 && (error.detail === '2FA token required' || error.detail.includes('2FA'))) {
+                        document.getElementById('2fa-group').classList.remove('hidden');
+                        document.getElementById('2fa-info').classList.remove('hidden');
+                        document.getElementById('2fa-token').focus();
+                        errorDiv.style.display = 'none';
+                        return;
+                    }
+
+                    errorDiv.textContent = error.detail || 'Login failed';
+                    errorDiv.style.display = 'block';
+                    return;
+                }
+
+                const data = await response.json();
+
+                // Check if there's a return URL from OAuth flow
+                const returnTo = sessionStorage.getItem('returnTo');
+                if (returnTo) {
+                    sessionStorage.removeItem('returnTo');
+                    window.location.href = returnTo;
+                } else {
+                    // No return URL, go to user portal
+                    window.location.href = '/user-portal';
+                }
+            } catch (err) {
+                errorDiv.textContent = 'An error occurred. Please try again.';
+                errorDiv.style.display = 'block';
+            }
+        }
+    </script>
+</body>
+</html>
