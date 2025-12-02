@@ -20,7 +20,7 @@ import hashlib
 import uuid
 import time
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timezone
 import platform
 import bcrypt
 from contextlib import asynccontextmanager
@@ -38,10 +38,43 @@ from cryptography.hazmat.primitives.asymmetric import rsa
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.backends import default_backend
 from urllib.parse import urlencode, parse_qs, urlparse
+import ssl
+import struct
+from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+from cryptography.hazmat.primitives import hashes, hmac
+from cryptography import x509
+from cryptography.x509.oid import NameOID, ExtensionOID
+from cryptography.hazmat.primitives.asymmetric import padding
 from email.message import EmailMessage
 import aiosmtplib
+from datetime import timedelta
 
-VERSION = "1.3.2"
+VERSION = "1.3.4"
+
+# DEBUG mode - enables sensitive TLS secret logging and keylog files
+# WARNING: Never enable in production! Only for development/debugging
+DEBUG_MODE = os.getenv('CADDYMAN_DEBUG', 'false').lower() == 'true'
+
+def validate_return_url(url: str) -> bool:
+    """
+    Validate return_to URL to prevent open redirect attacks.
+    Only allows relative paths or same-origin URLs.
+
+    Security: Prevents attackers from redirecting users to malicious external sites
+    """
+    if not url:
+        return False
+
+    # Allow relative paths (starting with /)
+    if url.startswith('/'):
+        # Ensure it's not a protocol-relative URL (//example.com)
+        if url.startswith('//'):
+            return False
+        return True
+
+    # Reject all absolute URLs (http://, https://, etc.)
+    # For a homelab/internal tool, we only allow relative redirects
+    return False
 
 def resource_path(relative_path):
     """Get absolute path to resource, works for dev and PyInstaller (including auto-py-to-exe)
@@ -839,6 +872,7 @@ def init_database():
                 client_secret_hash TEXT NOT NULL,
                 name TEXT NOT NULL,
                 redirect_uris TEXT NOT NULL,
+                allowed_groups TEXT NOT NULL DEFAULT '[]',
                 allowed_scopes TEXT NOT NULL,
                 grant_types TEXT NOT NULL,
                 require_pkce INTEGER DEFAULT 1,
@@ -846,6 +880,14 @@ def init_database():
                 enabled INTEGER DEFAULT 1
             )
         ''')
+
+        # Migration: ensure older databases get the allowed_groups column
+        try:
+            cursor.execute("ALTER TABLE oauth_clients ADD COLUMN allowed_groups TEXT DEFAULT '[]'")
+            logger.info("Added allowed_groups column to oauth_clients table")
+        except sqlite3.OperationalError:
+            # Column already exists or table missing; ignore
+            pass
 
         # Create OAuth authorization codes table
         cursor.execute('''
@@ -1294,11 +1336,18 @@ def get_all_oauth_clients_from_db():
         rows = cursor.fetchall()
         clients = []
         for row in rows:
+            # sqlite3.Row doesn't implement .get(); access columns safely
+            try:
+                allowed_groups_json = row['allowed_groups']
+            except Exception:
+                allowed_groups_json = '[]'
+
             clients.append({
                 'client_id': row['client_id'],
                 'client_secret_hash': row['client_secret_hash'],
                 'name': row['name'],
                 'redirect_uris': json.loads(row['redirect_uris']),
+                'allowed_groups': json.loads(allowed_groups_json or '[]'),
                 'allowed_scopes': json.loads(row['allowed_scopes']),
                 'grant_types': json.loads(row['grant_types']),
                 'require_pkce': bool(row['require_pkce']),
@@ -1314,11 +1363,17 @@ def get_oauth_client_by_id_from_db(client_id: str):
         cursor.execute('SELECT * FROM oauth_clients WHERE client_id = ?', (client_id,))
         row = cursor.fetchone()
         if row:
+            try:
+                allowed_groups_json = row['allowed_groups']
+            except Exception:
+                allowed_groups_json = '[]'
+
             return {
                 'client_id': row['client_id'],
                 'client_secret_hash': row['client_secret_hash'],
                 'name': row['name'],
                 'redirect_uris': json.loads(row['redirect_uris']),
+                'allowed_groups': json.loads(allowed_groups_json or '[]'),
                 'allowed_scopes': json.loads(row['allowed_scopes']),
                 'grant_types': json.loads(row['grant_types']),
                 'require_pkce': bool(row['require_pkce']),
@@ -1333,14 +1388,15 @@ def save_oauth_client_to_db(client: dict):
         cursor = conn.cursor()
         cursor.execute('''
             INSERT OR REPLACE INTO oauth_clients
-            (client_id, client_secret_hash, name, redirect_uris, allowed_scopes, grant_types,
+            (client_id, client_secret_hash, name, redirect_uris, allowed_groups, allowed_scopes, grant_types,
              require_pkce, created_at, enabled)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ''', (
             client['client_id'],
             client['client_secret_hash'],
             client['name'],
             json.dumps(client['redirect_uris']),
+            json.dumps(client.get('allowed_groups', [])),
             json.dumps(client['allowed_scopes']),
             json.dumps(client['grant_types']),
             1 if client.get('require_pkce', True) else 0,
@@ -2435,16 +2491,85 @@ async def handle_ldap_bind(client, msg_id: int, data: bytes, settings: dict):
         client.send(response)
         return False
 
+def parse_ldap_search_base_dn(data: bytes) -> str:
+    """
+    Parse the base DN from an LDAP SEARCH request
+    Returns empty string if parsing fails
+    """
+    try:
+        # LDAP SEARCH request structure:
+        # SEQUENCE { messageID, SearchRequest }
+        # SearchRequest { baseObject (OCTET STRING), scope, derefAliases, ... }
+
+        # Skip to SearchRequest (after messageID)
+        # Typically: 0x30 (SEQ) [len] 0x02 (INT) 0x01 [msgid] 0x63 (SearchRequest)
+        idx = 0
+        while idx < len(data) - 10:
+            if data[idx] == 0x63:  # SearchRequest APPLICATION tag
+                idx += 1
+                # Skip length encoding
+                length_byte = data[idx]
+                idx += 1
+                if length_byte & 0x80:  # Long form
+                    num_bytes = length_byte & 0x7f
+                    idx += num_bytes
+
+                # Now at baseObject (OCTET STRING)
+                if idx < len(data) and data[idx] == 0x04:
+                    idx += 1
+                    str_len = data[idx]
+                    idx += 1
+                    if str_len & 0x80:  # Long form length
+                        num_bytes = str_len & 0x7f
+                        str_len = int.from_bytes(data[idx:idx+num_bytes], 'big')
+                        idx += num_bytes
+
+                    base_dn = data[idx:idx+str_len].decode('utf-8')
+                    return base_dn
+            idx += 1
+
+        return ""
+    except Exception as e:
+        logger.debug(f"LDAP: Could not parse search base DN: {e}")
+        return ""
+
 async def handle_ldap_search(client, msg_id: int, data: bytes, settings: dict, authenticated: bool):
     """
     Handle LDAP SEARCH request
     Security: Only returns data for authenticated users, no sensitive data, group filtering
+    Supports hierarchical search: can search base DN or specific group OUs
     """
     try:
-        base_dn = settings.get('ldap_base_dn', 'dc=example,dc=com')
+        configured_base_dn = settings.get('ldap_base_dn', 'dc=example,dc=com')
         allowed_groups = settings.get('ldap_allowed_groups', [])
 
+        # Parse the requested base DN from client
+        requested_base_dn = parse_ldap_search_base_dn(data)
+        logger.info(f"LDAP: SEARCH request for base DN: {requested_base_dn or configured_base_dn}")
+
+        # Determine which base DN to use and if we need to filter by specific group
+        search_base_dn = requested_base_dn if requested_base_dn else configured_base_dn
+        filter_group = None
+
+        # Check if searching a specific group OU (e.g., ou=wifi,dc=jvr,dc=home)
+        if requested_base_dn and requested_base_dn.lower() != configured_base_dn.lower():
+            # Extract OU from requested base DN
+            # Format: ou=<groupname>,<base_dn>
+            if ',' in requested_base_dn:
+                ou_part = requested_base_dn.split(',')[0].lower()
+                remaining_dn = ','.join(requested_base_dn.split(',')[1:]).lower()
+
+                # Verify it's a sub-DN of our configured base
+                if remaining_dn == configured_base_dn.lower() and ou_part.startswith('ou='):
+                    filter_group = ou_part[3:]  # Extract group name after 'ou='
+                    logger.info(f"LDAP: Filtering results to group: {filter_group}")
+
         users = get_all_users_from_db()
+        all_groups = get_all_groups_from_db()
+
+        # Create a mapping of group IDs to names for quick lookup
+        group_id_to_name = {g['id']: g['name'] for g in all_groups}
+
         returned_count = 0
 
         # Filter users based on admin status and group membership
@@ -2453,14 +2578,21 @@ async def handle_ldap_search(client, msg_id: int, data: bytes, settings: dict, a
             if user.get('is_admin', False):
                 continue
 
+            user_groups = user.get('groups', [])
+            user_group_names = [group_id_to_name.get(gid, '') for gid in user_groups]
+
+            # If searching specific group OU, only return users in that group
+            if filter_group:
+                if filter_group not in user_group_names:
+                    continue
+
             # Security: Check if user is in allowed groups (if specified)
             if allowed_groups:
-                user_groups = user.get('groups', [])
                 # Check if user has at least one allowed group
                 if not any(group in allowed_groups for group in user_groups):
                     continue
 
-            entry = user_to_ldap_entry(user, base_dn)
+            entry = user_to_ldap_entry(user, search_base_dn)
             entry_response = build_ldap_search_result_entry(msg_id, entry['dn'], entry['attributes'])
             client.send(entry_response)
             returned_count += 1
@@ -2613,6 +2745,959 @@ async def stop_ldap_server():
 # RADIUS Server Implementation
 radius_server_task = None
 
+# EAP-TTLS State Management
+eap_sessions = {}  # session_id -> {state, tls_context, username, etc}
+
+# EAP Constants
+EAP_CODE_REQUEST = 1
+EAP_CODE_RESPONSE = 2
+EAP_CODE_SUCCESS = 3
+EAP_CODE_FAILURE = 4
+
+EAP_TYPE_IDENTITY = 1
+EAP_TYPE_TTLS = 21
+
+# TLS Flags
+TLS_FLAG_LENGTH = 0x80
+TLS_FLAG_MORE = 0x40
+TLS_FLAG_START = 0x20
+
+def ensure_radius_tls_cert():
+    """
+    Ensure RADIUS server has a TLS certificate for EAP-TTLS
+    Returns (cert_path, key_path)
+    """
+    # Use same directory as database file
+    cert_dir = os.path.join(os.path.dirname(os.path.abspath(DB_FILE)), "radius_certs")
+    os.makedirs(cert_dir, exist_ok=True)
+
+    cert_path = os.path.join(cert_dir, "server.crt")
+    key_path = os.path.join(cert_dir, "server.key")
+
+    # Check if cert exists and is valid
+    if os.path.exists(cert_path) and os.path.exists(key_path):
+        try:
+            # Verify cert is still valid
+            with open(cert_path, 'rb') as f:
+                cert = x509.load_pem_x509_certificate(f.read(), default_backend())
+                if cert.not_valid_after_utc > datetime.now(timezone.utc):
+                    return (cert_path, key_path)
+        except:
+            pass
+
+    # Generate new certificate
+    logger.info("Generating new RADIUS TLS certificate...")
+
+    # Generate private key
+    private_key = rsa.generate_private_key(
+        public_exponent=65537,
+        key_size=2048,
+        backend=default_backend()
+    )
+
+    # Generate certificate
+    subject = issuer = x509.Name([
+        x509.NameAttribute(NameOID.COUNTRY_NAME, "US"),
+        x509.NameAttribute(NameOID.STATE_OR_PROVINCE_NAME, "CA"),
+        x509.NameAttribute(NameOID.LOCALITY_NAME, "HomeServer"),
+        x509.NameAttribute(NameOID.ORGANIZATION_NAME, "CaddyMAN RADIUS"),
+        x509.NameAttribute(NameOID.COMMON_NAME, "radius.local"),
+    ])
+
+    cert = x509.CertificateBuilder().subject_name(
+        subject
+    ).issuer_name(
+        issuer
+    ).public_key(
+        private_key.public_key()
+    ).serial_number(
+        x509.random_serial_number()
+    ).not_valid_before(
+        datetime.utcnow()
+    ).not_valid_after(
+        datetime.utcnow() + timedelta(days=3650)  # 10 years
+    ).add_extension(
+        x509.SubjectAlternativeName([
+            x509.DNSName("radius.local"),
+            x509.DNSName("localhost"),
+        ]),
+        critical=False,
+    ).sign(private_key, hashes.SHA256(), default_backend())
+
+    # Write certificate
+    with open(cert_path, 'wb') as f:
+        f.write(cert.public_bytes(serialization.Encoding.PEM))
+
+    # Write private key
+    with open(key_path, 'wb') as f:
+        f.write(private_key.private_bytes(
+            encoding=serialization.Encoding.PEM,
+            format=serialization.PrivateFormat.TraditionalOpenSSL,
+            encryption_algorithm=serialization.NoEncryption()
+        ))
+
+    logger.info(f"RADIUS TLS certificate generated: {cert_path}")
+    return (cert_path, key_path)
+
+def generate_mppe_keys(master_key: bytes, nonce_client: bytes, nonce_server: bytes, tls_version: str = "1.2") -> tuple:
+    """
+    Generate MPPE keys for WPA2/WPA3
+    Returns (send_key, recv_key)
+
+    Behavior (TLS-version-aware):
+    - For TLS >= 1.2: use the TLS 1.2 PRF (HMAC-SHA256) with the label
+      "ttls keying material" and derive 64 bytes, then take the first 32
+      bytes as the PMK portion (compatibility with many modern supplicants).
+    - For TLS < 1.2: use the TLS 1.0/1.1 PRF (MD5+SHA1) with the RFC 5216
+      label "client EAP encryption" (RFC-compliant fallback).
+
+    The seed for derivation is client_random || server_random (nonce_client + nonce_server).
+    """
+    full_seed = nonce_client + nonce_server
+
+    # Prefer TLS 1.2 exporter-style derivation for modern clients
+    try:
+        if tls_version and float(tls_version[:3]) >= 1.2:
+            # Log at debug level: this is detailed protocol behavior useful during debugging
+            logger.debug("[EAP-TTLS] TLS >= 1.2 negotiated; deriving PMK using TLS1.2 PRF + 'ttls keying material'")
+            key_material = tls_prf_sha256(master_key, b"ttls keying material", full_seed, 64)
+            # Use first 32 bytes as PMK-compatible key material
+            send_key = key_material[:32]
+            recv_key = key_material[32:64]
+            return (send_key, recv_key)
+
+        # Fallback RFC behavior (TLS 1.0 / 1.1 PRF)
+        # Demote to debug to avoid exposing derivation details in normal logs
+        logger.debug("[EAP-TTLS] Deriving PMK using TLS1.0 PRF (MD5+SHA1) + 'client EAP encryption'")
+        key_material = tls_prf_md5_sha1(master_key, b"client EAP encryption", full_seed, 64)
+        send_key = key_material[:32]
+        recv_key = key_material[32:64]
+        return (send_key, recv_key)
+
+    except Exception as e:
+        logger.exception(f"[EAP-TTLS] PMK derivation failed: {e}; using deterministic fallback")
+        # Deterministic fallback (original behavior preserved)
+        result = b''
+        a = hashlib.sha1(b"client EAP encryption" + full_seed).digest()
+        while len(result) < 64:
+            result += hashlib.sha1(master_key + a).digest()
+            a = hashlib.sha1(master_key + a).digest()
+        send_key = result[:32]
+        recv_key = result[32:64]
+        return (send_key, recv_key)
+
+def tls_prf_md5_sha1(secret: bytes, label: bytes, seed: bytes, length: int) -> bytes:
+    """
+    TLS 1.0/1.1 PRF using MD5 and SHA1 (RFC 2246 Section 5)
+    Used by EAP-TTLS per RFC 5216 (which references RFC 2246)
+
+    PRF(secret, label, seed) = P_MD5(S1, label + seed) XOR P_SHA-1(S2, label + seed)
+    where S1 and S2 are the two halves of the secret
+    """
+    import hmac
+
+    full_seed = label + seed
+
+    # Split secret into two halves
+    secret_len = len(secret)
+    half_len = (secret_len + 1) // 2  # Round up if odd length
+    s1 = secret[:half_len]  # First half for MD5
+    s2 = secret[secret_len - half_len:]  # Second half for SHA1 (overlap if odd)
+
+    # Detailed PRF computation logs are sensitive; emit at debug level without secrets
+    logger.debug("[PRF] Computing TLS 1.0/1.1 PRF (MD5+SHA1)")
+    logger.debug(f"[PRF]   Label: {label}")
+    logger.debug(f"[PRF]   Seed length: {len(seed)} bytes")
+
+    # P_MD5
+    def p_hash(secret: bytes, seed: bytes, length: int, hash_func):
+        result = b''
+        a = seed  # A(0) = seed
+        while len(result) < length:
+            a = hmac.new(secret, a, hash_func).digest()  # A(i) = HMAC(secret, A(i-1))
+            result += hmac.new(secret, a + seed, hash_func).digest()
+        return result[:length]
+
+    p_md5_result = p_hash(s1, full_seed, length, hashlib.md5)
+    p_sha1_result = p_hash(s2, full_seed, length, hashlib.sha1)
+
+    # XOR the two results
+    final = bytes([a ^ b for a, b in zip(p_md5_result, p_sha1_result)])
+
+    # Avoid logging raw PRF outputs (sensitive keying material); log lengths at debug level
+    logger.debug(f"[PRF] P_MD5 length: {len(p_md5_result)}")
+    logger.debug(f"[PRF] P_SHA1 length: {len(p_sha1_result)}")
+    logger.debug(f"[PRF] Result length: {len(final)}")
+    return final
+
+def tls_prf_sha256(secret: bytes, label: bytes, seed: bytes, length: int) -> bytes:
+    """
+    TLS 1.2 PRF using HMAC-SHA256 (RFC 5246 Section 5)
+    Used for deriving keying material per RFC 5705
+
+    Args:
+        secret: The master secret from TLS handshake
+        label: The label string (e.g., b"client EAP encryption")
+        seed: Additional seed data (empty for RFC 5705 without context)
+        length: Number of bytes to generate
+
+    Returns:
+        Derived keying material of specified length
+    """
+    import hmac
+
+    # TLS PRF: PRF(secret, label, seed) = P_SHA256(secret, label + seed)
+    full_seed = label + seed
+
+    # Detailed PRF computation logs are sensitive; emit minimal info at debug level
+    logger.debug("[PRF] Computing TLS PRF (SHA256)")
+    logger.debug(f"[PRF]   Label: {label}")
+    logger.debug(f"[PRF]   Seed length: {len(seed)} bytes; full_seed length: {len(full_seed)} bytes")
+
+    # P_SHA256 from RFC 5246 Section 5
+    result = b''
+    a = full_seed  # A(0) = full_seed
+    iteration = 0
+
+    while len(result) < length:
+        iteration += 1
+        # A(i) = HMAC_SHA256(secret, A(i-1))
+        a = hmac.new(secret, a, hashlib.sha256).digest()
+        # Append HMAC_SHA256(secret, A(i) + full_seed)
+        chunk = hmac.new(secret, a + full_seed, hashlib.sha256).digest()
+        result += chunk
+
+        if iteration <= 2:
+            logger.debug(f"[PRF] Iteration {iteration} computed (chunk length={len(chunk)})")
+
+    final = result[:length]
+    logger.debug(f"[PRF] Result length: {len(final)}")
+    return final
+
+
+def debug_pmk_variants(master_hex: str, client_hex: str, server_hex: str) -> dict:
+    """
+    Helper for debugging PMK derivation variants.
+    Returns a dict with both TLS1.2-exporter-derived PMK and RFC-derived PMK (hex strings).
+
+    Usage (example):
+        debug_pmk_variants(master_hex, client_hex, server_hex)
+    """
+    try:
+        master = bytes.fromhex(master_hex)
+        client = bytes.fromhex(client_hex)
+        server = bytes.fromhex(server_hex)
+    except Exception:
+        raise ValueError("Invalid hex input for master/client/server")
+
+    seed = client + server
+
+    # TLS1.2 exporter-style (label 'ttls keying material'), take first 32 bytes
+    pmk_tls12 = tls_prf_sha256(master, b"ttls keying material", seed, 64)[:32]
+
+    # RFC 5216 / TLS1.0 PRF (label 'client EAP encryption') — request 32 bytes
+    pmk_rfc = tls_prf_md5_sha1(master, b"client EAP encryption", seed, 32)
+
+    # Sensitive: avoid printing raw PMK material at info level
+    logger.debug(f"[DEBUG-PMK] TLS1.2 PMK (hex): {pmk_tls12.hex()}")
+    logger.debug(f"[DEBUG-PMK] RFC PMK   (hex): {pmk_rfc.hex()}")
+
+    return {
+        'pmk_tls12': pmk_tls12.hex(),
+        'pmk_rfc': pmk_rfc.hex()
+    }
+
+def build_eap_packet(code: int, identifier: int, eap_type: Optional[int] = None, data: bytes = b'') -> bytes:
+    """Build an EAP packet"""
+    if eap_type is not None:
+        # EAP Request/Response with type
+        packet = struct.pack('!BBH', code, identifier, 5 + len(data)) + bytes([eap_type]) + data
+    else:
+        # EAP Success/Failure (no type field)
+        packet = struct.pack('!BBH', code, identifier, 4)
+    return packet
+
+def parse_eap_packet(data: bytes) -> dict:
+    """Parse an EAP packet"""
+    if len(data) < 4:
+        return None
+
+    code = data[0]
+    identifier = data[1]
+    length = struct.unpack('!H', data[2:4])[0]
+
+    if len(data) < length:
+        return None
+
+    result = {
+        'code': code,
+        'identifier': identifier,
+        'length': length
+    }
+
+    if code in [EAP_CODE_REQUEST, EAP_CODE_RESPONSE] and length > 4:
+        result['type'] = data[4]
+        result['data'] = data[5:length]
+
+    return result
+
+class EAPTTLSSession:
+    """Manage EAP-TTLS session state"""
+
+    def __init__(self, session_id: str):
+        self.session_id = session_id
+        self.state = 'INIT'  # INIT -> IDENTITY -> TTLS_START -> TTLS_HANDSHAKE -> TTLS_TUNNEL -> SUCCESS/FAILURE
+        self.identifier = 0
+        self.username = None
+        self.tls_in_buffer = b''
+        self.tls_out_buffer = b''
+        self.fragment_offset = 0
+        self.total_length = 0
+        self.ssl_context = None
+        self.ssl_obj = None  # SSL object
+        self.bio_in = None  # BIO for input
+        self.bio_out = None  # BIO for output
+        self.authenticated = False
+        self.master_key: Optional[bytes] = None
+        self.client_random: Optional[bytes] = None
+        self.server_random: Optional[bytes] = None
+        self.tls_secrets = {}  # Store TLS secrets from keylog callback
+        self.keylog_file = None  # Temporary file for SSL keylog
+
+    def create_ssl_context(self, cert_path: str, key_path: str, enable_keylog: bool = False):
+        """Create SSL context for TLS handshake.
+
+        enable_keylog: when True and Python supports it, create a temporary
+        keylog file and set `context.keylog_filename` so the SSL library will
+        write TLS secrets there. This is disabled by default to avoid
+        accidental secret exposure in production logs/files.
+        """
+        context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        context.load_cert_chain(cert_path, key_path)
+        context.set_ciphers('HIGH:!aNULL:!eNULL:!EXPORT:!DES:!MD5:!PSK:!RC4')
+        # Don't verify client cert
+        context.check_hostname = False
+        context.verify_mode = ssl.CERT_NONE
+
+        # Set keylog file to capture TLS secrets (Python 3.8+) only when enabled
+        if enable_keylog and hasattr(context, 'keylog_filename'):
+            import tempfile
+            # Create a unique temporary file for this session
+            self.keylog_file = tempfile.NamedTemporaryFile(mode='w+', delete=False, suffix='.keylog')
+            keylog_path = self.keylog_file.name
+            self.keylog_file.close()  # Close but don't delete, SSL will write to it
+            context.keylog_filename = keylog_path
+            logger.debug(f"[EAP-TTLS] SSL keylog enabled (debug): {keylog_path}")
+            logger.debug("[EAP-TTLS] context.keylog_filename set for session")
+        else:
+            # Do not create a keylog file unless explicitly requested.
+            self.keylog_file = None
+            if enable_keylog:
+                # Python does not support keylog_filename on this build
+                logger.warning(f"[EAP-TTLS] SSL keylog requested but not available in this Python version")
+
+        return context
+
+def handle_eap_ttls_session(session: EAPTTLSSession, eap_packet: dict, cert_path: str, key_path: str, settings: dict) -> bytes:
+    """
+    Handle EAP-TTLS protocol state machine
+    Returns EAP response packet to send back
+    """
+    eap_type = eap_packet.get('type')
+    eap_data = eap_packet.get('data', b'')
+    identifier = eap_packet['identifier']
+
+    # State: Waiting for Identity
+    if session.state == 'INIT' and eap_type == EAP_TYPE_IDENTITY:
+        # Extract identity
+        session.username = eap_data.decode('utf-8', errors='ignore')
+        logger.info(f"[EAP-TTLS] Identity: {session.username}")
+        session.state = 'IDENTITY'
+        session.identifier = (identifier + 1) % 256
+
+        # Send TTLS Start
+        ttls_flags = TLS_FLAG_START
+        ttls_data = bytes([ttls_flags])
+        return build_eap_packet(EAP_CODE_REQUEST, session.identifier, EAP_TYPE_TTLS, ttls_data)
+
+    # State: TTLS Handshake
+    elif session.state in ['IDENTITY', 'TTLS_START', 'TTLS_HANDSHAKE'] and eap_type == EAP_TYPE_TTLS:
+        if len(eap_data) < 1:
+            return build_eap_packet(EAP_CODE_FAILURE, identifier)
+
+        flags = eap_data[0]
+        offset = 1
+
+        # Check for length field
+        if flags & TLS_FLAG_LENGTH:
+            if len(eap_data) < 5:
+                return build_eap_packet(EAP_CODE_FAILURE, identifier)
+            session.total_length = struct.unpack('!I', eap_data[1:5])[0]
+            offset = 5
+
+        # Extract TLS data
+        tls_data = eap_data[offset:]
+        session.tls_in_buffer += tls_data
+
+        # If more fragments expected, request next fragment
+        if flags & TLS_FLAG_MORE:
+            session.identifier = (identifier + 1) % 256
+            return build_eap_packet(EAP_CODE_REQUEST, session.identifier, EAP_TYPE_TTLS, bytes([0]))
+
+        # Process TLS handshake
+        try:
+            # Create SSL context if not exists
+            if session.ssl_context is None:
+                from ssl import MemoryBIO
+
+                session.state = 'TTLS_HANDSHAKE'
+                # Only enable keylog in DEBUG mode to avoid exposing TLS secrets in production
+                # Security: Keylog files contain master_secret which can decrypt all TLS traffic
+                context = session.create_ssl_context(cert_path, key_path, enable_keylog=DEBUG_MODE)
+                session.ssl_context = context  # Store context in session
+
+                bio_in = MemoryBIO()
+                bio_out = MemoryBIO()
+                session.ssl_obj = context.wrap_bio(bio_in, bio_out, server_side=True)
+                session.bio_in = bio_in
+                session.bio_out = bio_out
+
+                logger.debug(f"[EAP-TTLS] Created new SSL context for {session.username}")
+
+            # Feed TLS data to SSL
+            if session.tls_in_buffer:
+                logger.debug(f"[EAP-TTLS] Writing {len(session.tls_in_buffer)} bytes to bio_in")
+                session.bio_in.write(session.tls_in_buffer)
+                session.tls_in_buffer = b''
+
+            # Try to do handshake - may need multiple rounds
+            handshake_complete = False
+            max_rounds = 10  # Prevent infinite loop
+            for round in range(max_rounds):
+                try:
+                    logger.debug(f"[EAP-TTLS] Calling do_handshake(), round {round + 1}")
+                    session.ssl_obj.do_handshake()
+                    # Handshake complete, move to tunnel state
+                    handshake_complete = True
+                    session.state = 'TTLS_TUNNEL'
+                    logger.info(f"[EAP-TTLS] TLS handshake complete for {session.username}")
+
+                    # Extract server_random from the TLS session if we captured ServerHello
+                    # During handshake, bio_out contained ServerHello with server_random
+                    # We should have captured it earlier, but if not, we'll use zeros
+                    if not session.server_random:
+                        logger.warning(f"[EAP-TTLS] server_random was not captured during handshake")
+
+                    # Extract keying material for MPPE keys (RFC 5216 Section 2.3)
+                    # Use TLS Exporter as defined in RFC 5705
+                    try:
+                        # Read the keylog file to get the master secret
+                        logger.debug(f"[EAP-TTLS] session.keylog_file = {session.keylog_file}")
+                        if session.keylog_file:
+                            logger.debug(f"[EAP-TTLS] Keylog file path: {session.keylog_file.name}")
+                            logger.debug(f"[EAP-TTLS] Keylog file exists: {os.path.exists(session.keylog_file.name)}")
+
+                        if session.keylog_file and os.path.exists(session.keylog_file.name):
+                            with open(session.keylog_file.name, 'r') as f:
+                                keylog_data = f.read()
+
+                            logger.info(f"[EAP-TTLS] Keylog file contents ({len(keylog_data)} bytes):\n{keylog_data}")
+
+                            # Parse CLIENT_RANDOM <client_random> <master_secret>
+                            master_secret = None
+                            client_random = None
+                            for line in keylog_data.strip().split('\n'):
+                                if line.startswith('CLIENT_RANDOM '):
+                                    parts = line.split()
+                                    if len(parts) == 3:
+                                        client_random_hex = parts[1]
+                                        master_secret_hex = parts[2]
+                                        client_random = bytes.fromhex(client_random_hex)
+                                        master_secret = bytes.fromhex(master_secret_hex)
+                                        logger.debug(f"[EAP-TTLS] Extracted master secret (len): {len(master_secret)} bytes")
+                                        logger.debug(f"[EAP-TTLS] Client random (hex start): {client_random.hex()[:32]}... (len={len(client_random)})")
+                                        break
+
+                            if master_secret and client_random:
+                                # Get server random from SSL connection
+                                # We should have extracted it from ServerHello earlier
+                                # RFC 5216 Section 2.3: PRF(master_secret, "client EAP encryption",
+                                #                          client_random + server_random)
+                                if not session.server_random:
+                                    logger.warning(f"[EAP-TTLS] server_random not available, using zeros (PMK will mismatch!)")
+                                    server_random = b'\x00' * 32
+                                else:
+                                    server_random = session.server_random
+                                    logger.debug(f"[EAP-TTLS] Using server_random (hex start): {server_random.hex()[:32]}... (len={len(server_random)})")
+
+                                # Derive keying material using TLS PRF (RFC 5705 Section 4)
+                                # RFC 5705 without context: PRF(master_secret, label, client_random || server_random)
+                                # For EAP-TTLS (RFC 5216), context is empty
+                                # Use RFC 5216 seed ordering: client_random || server_random
+                                seed = client_random + server_random
+                                logger.debug(f"[EAP-TTLS] PRF inputs: label='client EAP encryption', master_secret_len={len(master_secret)}")
+                                logger.debug(f"[EAP-TTLS] PRF inputs: client_random(hex start)={client_random.hex()[:32]}... server_random(hex start)={server_random.hex()[:32]}... seed_len={len(seed)}")
+                                # Notes:
+                                # - Use TLS 1.0 PRF (MD5+SHA1) per RFC 5216
+                                # - PMK = PRF(master_secret, "client EAP encryption", client_random || server_random)
+                                # CRITICAL FIX: Only generate 32 bytes for PMK, not 128!
+                                # Generating more bytes causes A(i) to evolve differently than wpa_supplicant
+                                # wpa_supplicant uses "client EAP encryption" per RFC 5216 (NOT "ttls keying material" from draft!)
+                                # Derive PMK. Historically there are two common behaviours:
+                                # - RFC 5216: use TLS 1.0 PRF (MD5+SHA1) with label b"client EAP encryption" and seed = client||server
+                                # - Some implementations (and test tools) derive keying material using the TLS1.2 PRF (HMAC-SHA256)
+                                #   with the draft label b"ttls keying material" (producing 64 bytes, where first 32 are PMK)
+                                # To maximize compatibility, choose derivation based on negotiated TLS version when available.
+                                try:
+                                    tls_version = None
+                                    if hasattr(session, 'ssl_obj') and session.ssl_obj is not None:
+                                        try:
+                                            tls_version = session.ssl_obj.version()  # e.g., 'TLSv1.2'
+                                        except Exception:
+                                            tls_version = None
+
+                                    # Preferred: if TLS >= 1.2, many clients use the TLS1.2 PRF with 'ttls keying material'
+                                    if tls_version and ('1.2' in tls_version or '1.3' in tls_version):
+                                        # Compute candidate using TLS1.2 PRF + draft label (64 bytes, first 32 used as PMK)
+                                        pmk_candidate = tls_prf_sha256(master_secret, b"ttls keying material", seed, 64)[:32]
+                                        logger.info(f"[EAP-TTLS] TLS negotiated: {tls_version}; deriving PMK using TLS1.2 PRF + 'ttls keying material'")
+                                        logger.debug(f"[EAP-TTLS] PMK candidate (hex start): {pmk_candidate.hex()[:32]}... (len={len(pmk_candidate)})")
+                                        session.master_key = pmk_candidate
+                                    else:
+                                        # Fallback to RFC 5216 behavior (TLS1.0 PRF MD5+SHA1 with 'client EAP encryption')
+                                        pmk_rfc = tls_prf_md5_sha1(master_secret, b"client EAP encryption", seed, 32)
+                                        logger.info(f"[EAP-TTLS] TLS negotiated: {tls_version or 'unknown'}; deriving PMK using RFC method (MD5+SHA1) + 'client EAP encryption'")
+                                        logger.debug(f"[EAP-TTLS] PMK (RFC) (hex start): {pmk_rfc.hex()[:32]}... (len={len(pmk_rfc)})")
+                                        session.master_key = pmk_rfc
+                                except Exception as e:
+                                    logger.warning(f"[EAP-TTLS] PMK derivation failed: {e}")
+                                    session.master_key = None
+                            else:
+                                logger.warning(f"[EAP-TTLS] Could not parse master secret from keylog file")
+                                session.master_key = None
+                        else:
+                            logger.warning(f"[EAP-TTLS] Keylog file not available")
+                            session.master_key = None
+                    except Exception as e:
+                        logger.warning(f"[EAP-TTLS] Could not derive keying material from keylog: {e}")
+                        import traceback
+                        logger.debug(traceback.format_exc())
+                        session.master_key = None
+                    break
+                except ssl.SSLWantReadError:
+                    # Need more data from client
+                    logger.debug(f"[EAP-TTLS] SSL wants more read data (round {round + 1})")
+                    break  # Exit loop, we'll get more data in next packet
+                except ssl.SSLWantWriteError:
+                    # Need to send data to client - check if there's data in bio_out
+                    logger.debug(f"[EAP-TTLS] SSL wants to write data (round {round + 1})")
+                    # Try to read from bio_out and continue loop
+                    try:
+                        pending = session.bio_out.read()
+                        if pending:
+                            logger.debug(f"[EAP-TTLS] Got {len(pending)} bytes from bio_out during handshake")
+                            # Try to extract server_random from ServerHello
+                            if not session.server_random:
+                                try:
+                                    # Parse TLS record: type(1) + version(2) + length(2) + data
+                                    if len(pending) >= 5 and pending[0] == 0x16:  # Handshake
+                                        pos = 5  # Skip record header
+                                        # Parse handshake: type(1) + length(3) + data
+                                        if len(pending) > pos and pending[pos] == 0x02:  # ServerHello
+                                            # ServerHello: type(1) + length(3) + version(2) + random(32)
+                                            pos += 1 + 3 + 2  # Skip type, length, version
+                                            if len(pending) >= pos + 32:
+                                                session.server_random = pending[pos:pos+32]
+                                                if session.server_random:
+                                                    logger.debug(f"[EAP-TTLS] Extracted server_random from handshake (hex start): {session.server_random.hex()[:32]}... (len={len(session.server_random)})")
+                                except Exception as e:
+                                    logger.debug(f"[EAP-TTLS] Could not extract server_random from handshake: {e}")
+                    except:
+                        pass
+                    # Continue loop to try handshake again
+                except ssl.SSLError as e:
+                    logger.error(f"[EAP-TTLS] SSL error during handshake: {e}")
+                    raise  # Re-raise to outer exception handler
+
+            # Get TLS response data (there may be data to send even if handshake not complete)
+            tls_response = b''
+            try:
+                tls_response = session.bio_out.read()
+                # Try to extract server_random from ServerHello if not already captured
+                if tls_response and not session.server_random:
+                    try:
+                        # Parse TLS record: type(1) + version(2) + length(2) + data
+                        if len(tls_response) >= 5 and tls_response[0] == 0x16:  # Handshake
+                            pos = 5  # Skip record header
+                            # Parse handshake: type(1) + length(3) + data
+                            if len(tls_response) > pos and tls_response[pos] == 0x02:  # ServerHello
+                                # ServerHello: type(1) + length(3) + version(2) + random(32)
+                                pos += 1 + 3 + 2  # Skip type, length, version
+                                if len(tls_response) >= pos + 32:
+                                    session.server_random = tls_response[pos:pos+32]
+                                    if session.server_random:
+                                        logger.debug(f"[EAP-TTLS] Extracted server_random (hex start): {session.server_random.hex()[:32]}... (len={len(session.server_random)})")
+                    except Exception as e:
+                        logger.debug(f"[EAP-TTLS] Could not extract server_random: {e}")
+            except:
+                pass
+
+            if tls_response:
+                # Send TLS data back
+                logger.debug(f"[EAP-TTLS] Sending {len(tls_response)} bytes of TLS data")
+                session.tls_out_buffer = tls_response
+
+                # Fragment if needed (max 1024 bytes per fragment)
+                if len(session.tls_out_buffer) > 1024:
+                    fragment = session.tls_out_buffer[:1024]
+                    session.tls_out_buffer = session.tls_out_buffer[1024:]
+                    flags = TLS_FLAG_MORE | TLS_FLAG_LENGTH
+                    ttls_data = bytes([flags]) + struct.pack('!I', len(tls_response)) + fragment
+                else:
+                    fragment = session.tls_out_buffer
+                    session.tls_out_buffer = b''
+                    flags = 0
+                    ttls_data = bytes([flags]) + fragment
+
+                session.identifier = (identifier + 1) % 256
+                return build_eap_packet(EAP_CODE_REQUEST, session.identifier, EAP_TYPE_TTLS, ttls_data)
+
+            # If handshake complete and no data to send, send empty ACK to prompt client for inner auth
+            if handshake_complete:
+                logger.debug(f"[EAP-TTLS] Handshake complete, waiting for inner auth")
+                session.identifier = (identifier + 1) % 256
+                return build_eap_packet(EAP_CODE_REQUEST, session.identifier, EAP_TYPE_TTLS, bytes([0]))
+
+            # Still in handshake but no data ready - send ACK to get more data
+            session.identifier = (identifier + 1) % 256
+            return build_eap_packet(EAP_CODE_REQUEST, session.identifier, EAP_TYPE_TTLS, bytes([0]))
+
+        except Exception as e:
+            import traceback
+            logger.error(f"[EAP-TTLS] TLS handshake error: {e}")
+            logger.error(f"[EAP-TTLS] Traceback: {traceback.format_exc()}")
+            logger.error(f"[EAP-TTLS] Session state: {session.state}, buffer size: {len(session.tls_in_buffer)}")
+            return build_eap_packet(EAP_CODE_FAILURE, identifier)
+
+    # State: Inside TLS tunnel - handle inner PAP authentication
+    elif session.state == 'TTLS_TUNNEL' and eap_type == EAP_TYPE_TTLS:
+        if len(eap_data) < 1:
+            return build_eap_packet(EAP_CODE_FAILURE, identifier)
+
+        flags = eap_data[0]
+        tls_data = eap_data[1:]
+
+        try:
+            # Feed encrypted data to SSL
+            session.bio_in.write(tls_data)
+
+            # Read decrypted inner authentication
+            inner_data = session.ssl_obj.read(4096)
+
+            if inner_data:
+                # Parse inner PAP authentication (AVP format)
+                # AVP: Code(1) + Identifier(1) + Length(2) + Type(1) + Data
+                username, password = parse_pap_avp(inner_data)
+
+                logger.debug(f"[EAP-TTLS] Parsed AVP: username={username}, password={password}")
+
+                if username and password:
+                    logger.info(f"[EAP-TTLS] Inner PAP auth: username={username}, password_len={len(password)}")
+                    logger.debug(f"[EAP-TTLS] Received password: {password[:20]}..." if len(password) > 20 else f"[EAP-TTLS] Received password: {password}")
+
+                    # Authenticate user
+                    user = get_user_by_username_from_db(username)
+
+                    if not user:
+                        logger.warning(f"[EAP-TTLS] User not found in database: {username}")
+                        session.authenticated = False
+                        return build_eap_packet(EAP_CODE_FAILURE, identifier)
+
+                    logger.debug(f"[EAP-TTLS] User found, verifying password...")
+                    if verify_password(password, user['password_hash']):
+                        # Check allowed groups
+                        allowed_groups = settings.get('radius_allowed_groups', [])
+                        if allowed_groups:
+                            user_groups = user.get('groups', [])
+                            if not any(group in allowed_groups for group in user_groups):
+                                logger.warning(f"[EAP-TTLS] User not in allowed groups: {username}")
+                                session.authenticated = False
+                                return build_eap_packet(EAP_CODE_FAILURE, identifier)
+
+                        # Check if admin user (block admins from RADIUS)
+                        if user.get('is_admin', False):
+                            logger.warning(f"[EAP-TTLS] Admin user blocked: {username}")
+                            session.authenticated = False
+                            return build_eap_packet(EAP_CODE_FAILURE, identifier)
+
+                        logger.info(f"[EAP-TTLS] Password verification SUCCESS for {username}")
+                        session.authenticated = True
+                        session.username = username
+
+                        # Send EAP-Success at outer layer (RFC 5281: after inner auth success)
+                        # The protected success result has been sent via TLS
+                        logger.info(f"[EAP-TTLS] Sending EAP-Success for {username}")
+                        return build_eap_packet(EAP_CODE_SUCCESS, identifier)
+                    else:
+                        logger.warning(f"[EAP-TTLS] Password verification FAILED for {username}")
+                        session.authenticated = False
+                        return build_eap_packet(EAP_CODE_FAILURE, identifier)
+                else:
+                    logger.error(f"[EAP-TTLS] Failed to parse PAP credentials from AVP data (len={len(inner_data)})")
+                    logger.debug(f"[EAP-TTLS] AVP data: {inner_data[:100].hex() if len(inner_data) > 100 else inner_data.hex()}")
+                    return build_eap_packet(EAP_CODE_FAILURE, identifier)
+
+            # If we received empty ACK after sending success, send final EAP Success
+            # Avoid logging potentially-sensitive inner_data at info level
+            logger.debug(f"[EAP-TTLS] Checking for ACK: authenticated={session.authenticated}, inner_data_len={len(inner_data) if inner_data else 0}")
+            if session.authenticated and not inner_data:
+                logger.info(f"[EAP-TTLS] Received ACK after success, sending final EAP-Success")
+                return build_eap_packet(EAP_CODE_SUCCESS, identifier)
+
+        except Exception as e:
+            logger.error(f"[EAP-TTLS] Tunnel error: {e}")
+            return build_eap_packet(EAP_CODE_FAILURE, identifier)
+
+    # Unknown state/type
+    return build_eap_packet(EAP_CODE_FAILURE, identifier)
+
+def parse_pap_avp(data: bytes) -> tuple:
+    """
+    Parse PAP credentials from TTLS AVP format
+    Returns (username, password)
+    """
+    username = None
+    password = None
+
+    pos = 0
+    while pos < len(data):
+        if pos + 8 > len(data):
+            break
+
+        # AVP Header: Code(4) + Flags(1) + Length(3)
+        avp_code = struct.unpack('!I', data[pos:pos+4])[0]
+        _ = data[pos+4]  # avp_flags (not used)
+        avp_length = struct.unpack('!I', b'\x00' + data[pos+5:pos+8])[0]
+
+        if pos + avp_length > len(data):
+            break
+
+        avp_data = data[pos+8:pos+avp_length]
+
+        # User-Name AVP (code 1)
+        if avp_code == 1:
+            username = avp_data.rstrip(b'\x00').decode('utf-8', errors='ignore')
+        # User-Password AVP (code 2)
+        elif avp_code == 2:
+            password = avp_data.rstrip(b'\x00').decode('utf-8', errors='ignore')
+
+        # Move to next AVP (pad to 4-byte boundary)
+        pos += avp_length
+        if pos % 4:
+            pos += 4 - (pos % 4)
+
+    return (username, password)
+
+def encrypt_with_ssl(ssl_obj, bio_out, data: bytes) -> bytes:
+    """Encrypt data using SSL connection"""
+    ssl_obj.write(data)
+    return bio_out.read()
+
+async def handle_eap_radius_request(packet: dict, addr, server, settings: dict):
+    """
+    Handle RADIUS request with EAP-Message
+    Implements EAP-TTLS with PAP inner authentication
+    """
+    identifier = packet['identifier']
+    authenticator = packet['authenticator']
+    attributes = packet['attributes']
+    secret = settings.get('radius_secret', '').encode('utf-8')
+
+    logger.info(f"[RADIUS] Received packet: code={packet['code']}, identifier={identifier}")
+
+    # Get TLS certificate
+    cert_path, key_path = ensure_radius_tls_cert()
+
+    # Extract EAP-Message (can be fragmented across multiple attributes)
+    eap_data = b''.join(attributes.get(79, []))
+
+    if not eap_data:
+        logger.warning(f"[RADIUS] Empty EAP-Message from {addr}")
+        response = build_radius_response(3, identifier, authenticator, secret)
+        server.sendto(response, addr)
+        return
+
+    # Parse EAP packet
+    eap_packet = parse_eap_packet(eap_data)
+    if not eap_packet:
+        logger.warning(f"[RADIUS] Invalid EAP packet from {addr}")
+        response = build_radius_response(3, identifier, authenticator, secret)
+        server.sendto(response, addr)
+        return
+
+    # Create session ID from client address
+    session_id = f"{addr[0]}:{addr[1]}"
+
+    # Get or create EAP session
+    if session_id not in eap_sessions:
+        eap_sessions[session_id] = EAPTTLSSession(session_id)
+        logger.info(f"[EAP] New session created: {session_id}")
+
+    session = eap_sessions[session_id]
+
+    # Handle EAP-TTLS state machine
+    eap_response = handle_eap_ttls_session(session, eap_packet, cert_path, key_path, settings)
+
+    # Check if authentication is complete
+    if eap_response[0] == EAP_CODE_SUCCESS:
+        # Authentication successful - send Access-Accept
+        logger.info(f"[EAP-TTLS] Authentication SUCCESS for {session.username}")
+
+        # Log activity
+        await log_activity(session.username, "RADIUS_AUTH_SUCCESS", "EAP-TTLS authentication successful", f"RADIUS:{addr[0]}")
+
+        # Build Access-Accept with EAP-Success and MPPE keys
+        response_attrs = []
+
+        # Add EAP-Message with Success
+        response_attrs.append((79, eap_response))
+
+        # Generate MPPE keys for WPA2/WPA3 from TLS keying material
+        if session.master_key and len(session.master_key) >= 32:
+            # session.master_key IS the PMK (32 bytes)
+            # For EAP-TTLS with PAP, we only derive 32 bytes for the PMK
+            # MS-MPPE-Recv-Key = PMK (used for WPA2 4-way handshake)
+            # MS-MPPE-Send-Key = Also use PMK (some implementations expect both)
+            mppe_recv_key = session.master_key  # This is the PMK
+            mppe_send_key = session.master_key  # Use same key for both
+            logger.info(f"[EAP-TTLS] Using derived PMK from TLS keying material")
+            logger.debug(f"[EAP-TTLS] PMK (MS-MPPE-Recv-Key) (hex start): {mppe_recv_key.hex()[:32]}... (len={len(mppe_recv_key)})")
+            logger.debug(f"[EAP-TTLS] MS-MPPE-Send-Key (hex start): {mppe_send_key.hex()[:32]}... (len={len(mppe_send_key)})")
+        else:
+            # Fallback to random keys if keying material not available
+            import secrets
+            mppe_send_key = secrets.token_bytes(32)
+            mppe_recv_key = secrets.token_bytes(32)
+            logger.warning(f"[EAP-TTLS] Using random MPPE keys (keying material unavailable)")
+
+        # Add MS-MPPE keys as vendor-specific attributes (RFC 2548)
+        # Vendor ID: 311 (Microsoft)
+        # MS-MPPE-Send-Key: vendor attr 16
+        # MS-MPPE-Recv-Key: vendor attr 17
+        try:
+            # Encrypt MPPE keys using RADIUS request authenticator and secret
+            def encrypt_mppe_key(key: bytes, request_auth: bytes, secret: bytes) -> bytes:
+                """Encrypt MPPE key for RADIUS transmission (RFC 2548 Section 2.4.2)"""
+                # Salt: 2 random bytes with high bit set
+                import secrets as sec
+                salt = sec.token_bytes(2)
+                salt = bytes([(salt[0] | 0x80), salt[1]])  # Set high bit of first byte
+
+                # Create plaintext: Length(1) + Key(N) + Padding
+                plaintext = bytes([len(key)]) + key
+                # Pad to 16-byte boundary
+                if len(plaintext) % 16:
+                    plaintext += b'\x00' * (16 - (len(plaintext) % 16))
+
+                # Encrypt using MD5(secret + request_auth + salt)
+                encrypted = b''
+                b_prev = hashlib.md5(secret + request_auth + salt).digest()
+                for i in range(0, len(plaintext), 16):
+                    chunk = plaintext[i:i+16]
+                    xor_chunk = bytes([a ^ b for a, b in zip(chunk, b_prev)])
+                    encrypted += xor_chunk
+                    b_prev = hashlib.md5(secret + xor_chunk).digest()
+
+                return salt + encrypted
+
+            logger.debug(f"[EAP-TTLS] About to encrypt MPPE keys (debug)")
+            logger.debug(f"[EAP-TTLS]   mppe_recv_key (PMK) (hex start): {mppe_recv_key.hex()[:32]}... (len={len(mppe_recv_key)})")
+            logger.debug(f"[EAP-TTLS]   mppe_send_key (hex start): {mppe_send_key.hex()[:32]}... (len={len(mppe_send_key)})")
+            logger.debug(f"[EAP-TTLS]   authenticator (hex start): {authenticator.hex()[:32]}... (len={len(authenticator)})")
+            logger.debug(f"[EAP-TTLS]   secret (len): {len(secret)}")
+
+            mppe_send_encrypted = encrypt_mppe_key(mppe_send_key, authenticator, secret)
+            mppe_recv_encrypted = encrypt_mppe_key(mppe_recv_key, authenticator, secret)
+
+            logger.debug(f"[EAP-TTLS] Encrypted MPPE values (debug)")
+            logger.debug(f"[EAP-TTLS]   mppe_recv_encrypted (hex start): {mppe_recv_encrypted.hex()[:32]}... (len={len(mppe_recv_encrypted)})")
+            logger.debug(f"[EAP-TTLS]   mppe_send_encrypted (hex start): {mppe_send_encrypted.hex()[:32]}... (len={len(mppe_send_encrypted)})")
+
+            # Build vendor-specific attribute (attribute 26)
+            # Format: Type(1) + Length(1) + Vendor-Id(4) + Vendor-Type(1) + Vendor-Length(1) + Data
+            def build_vendor_attr(vendor_id: int, vendor_type: int, vendor_data: bytes) -> bytes:
+                vendor_length = 2 + len(vendor_data)  # Type(1) + Length(1) + Data
+                vendor_payload = struct.pack('!I', vendor_id) + bytes([vendor_type, vendor_length]) + vendor_data
+                return vendor_payload
+
+            # Microsoft Vendor ID = 311
+            mppe_send_vsa = build_vendor_attr(311, 16, mppe_send_encrypted)
+            mppe_recv_vsa = build_vendor_attr(311, 17, mppe_recv_encrypted)
+
+            response_attrs.append((26, mppe_send_vsa))  # Vendor-Specific Attribute
+            response_attrs.append((26, mppe_recv_vsa))  # Vendor-Specific Attribute
+
+            logger.debug(f"[EAP-TTLS] Added MS-MPPE keys to Access-Accept")
+        except Exception as e:
+            logger.error(f"[EAP-TTLS] Failed to add MPPE keys: {e}")
+
+        # VLAN assignment (if enabled)
+        if settings.get('radius_vlan_assignment', False):
+            user = get_user_by_username_from_db(session.username)
+            if user:
+                groups = user.get('groups', [])
+                if groups:
+                    all_groups = get_all_groups_from_db()
+                    for group in all_groups:
+                        if group['id'] == groups[0]:
+                            vlan_id = group.get('radius_vlan')
+                            if vlan_id:
+                                response_attrs.append((64, struct.pack('!I', 13)))  # Tunnel-Type = VLAN
+                                response_attrs.append((65, struct.pack('!I', 6)))   # Tunnel-Medium-Type = IEEE-802
+                                response_attrs.append((81, str(vlan_id).encode()))  # Tunnel-Private-Group-ID
+                                logger.info(f"[RADIUS] Assigned VLAN {vlan_id} to {session.username}")
+                            break
+
+        response = build_radius_response(2, identifier, authenticator, secret, response_attrs)
+        server.sendto(response, addr)
+
+        # Clean up session and temporary files
+        if session.keylog_file and os.path.exists(session.keylog_file.name):
+            try:
+                os.unlink(session.keylog_file.name)
+                logger.debug(f"[EAP-TTLS] Cleaned up keylog file: {session.keylog_file.name}")
+            except Exception as e:
+                logger.warning(f"[EAP-TTLS] Failed to cleanup keylog file: {e}")
+        del eap_sessions[session_id]
+
+    elif eap_response[0] == EAP_CODE_FAILURE:
+        # Authentication failed - send Access-Reject
+        logger.warning(f"[EAP-TTLS] Authentication FAILED for session {session_id}")
+
+        response_attrs = [(79, eap_response)]
+        response = build_radius_response(3, identifier, authenticator, secret, response_attrs)
+        server.sendto(response, addr)
+
+        # Clean up session and temporary files
+        if session_id in eap_sessions:
+            session = eap_sessions[session_id]
+            if session.keylog_file and os.path.exists(session.keylog_file.name):
+                try:
+                    os.unlink(session.keylog_file.name)
+                    logger.debug(f"[EAP-TTLS] Cleaned up keylog file: {session.keylog_file.name}")
+                except Exception as e:
+                    logger.warning(f"[EAP-TTLS] Failed to cleanup keylog file: {e}")
+            del eap_sessions[session_id]
+
+    else:
+        # Continue EAP conversation - send Access-Challenge
+        response_attrs = [(79, eap_response)]
+        logger.info(f"[RADIUS] Sending Access-Challenge with identifier={identifier}, EAP response len={len(eap_response)}")
+        response = build_radius_response(11, identifier, authenticator, secret, response_attrs)  # Access-Challenge
+        logger.debug(f"[RADIUS] About to send packet hex (debug): {response.hex()}")
+        server.sendto(response, addr)
+        logger.info(f"[RADIUS] Packet sent to {addr}")
+
 def md5_hash(data: bytes) -> bytes:
     """MD5 hash for RADIUS"""
     import hashlib
@@ -2714,9 +3799,13 @@ def extract_radius_password(attributes: dict, authenticator: bytes, secret: byte
 
 def build_radius_response(code: int, identifier: int, authenticator: bytes, secret: bytes, attributes: list = []) -> bytes:
     """
-    Build RADIUS response packet
-    code: 2=Access-Accept, 3=Access-Reject
+    Build RADIUS response packet with Message-Authenticator for EAP
+    code: 2=Access-Accept, 3=Access-Reject, 11=Access-Challenge
     """
+    # Check if this is an EAP packet (has EAP-Message attribute 79)
+    has_eap = any(attr_type == 79 for attr_type, _ in attributes)
+    logger.debug(f"[RADIUS] build_radius_response: code={code}, has_eap={has_eap}, attrs={[(t, len(v) if isinstance(v, bytes) else v) for t, v in attributes]}")
+
     # Build attributes section
     attrs_data = b''
     for attr_type, attr_value in attributes:
@@ -2724,27 +3813,91 @@ def build_radius_response(code: int, identifier: int, authenticator: bytes, secr
             attr_value = attr_value.encode('utf-8')
         elif isinstance(attr_value, int):
             attr_value = attr_value.to_bytes(4, 'big')
+        elif not isinstance(attr_value, bytes):
+            logger.error(f"[RADIUS] Invalid attribute value type: {type(attr_value)} for attr {attr_type}")
+            continue
+
+        # Special handling for EAP-Message (79) - fragment if needed
+        if attr_type == 79 and len(attr_value) > 253:
+            # Fragment EAP-Message across multiple attributes (max 253 bytes each)
+            logger.debug(f"[RADIUS] Fragmenting EAP-Message: {len(attr_value)} bytes into multiple attributes")
+            offset = 0
+            while offset < len(attr_value):
+                chunk_size = min(253, len(attr_value) - offset)
+                chunk = attr_value[offset:offset + chunk_size]
+                attr_len = 2 + len(chunk)
+                attrs_data += bytes([attr_type, attr_len]) + chunk
+                offset += chunk_size
+                logger.debug(f"[RADIUS] Added EAP-Message fragment: offset={offset-chunk_size}, size={chunk_size}")
+            continue
 
         attr_len = 2 + len(attr_value)
-        attrs_data += bytes([attr_type, attr_len]) + attr_value
 
-    # Build packet
+        # RADIUS attributes have a max length of 255
+        if attr_len > 255:
+            logger.error(f"[RADIUS] Attribute {attr_type} too long: {attr_len} bytes (not EAP-Message)")
+            continue
+
+        try:
+            attrs_data += bytes([attr_type, attr_len]) + attr_value
+        except Exception as e:
+            logger.error(f"[RADIUS] Error building attribute {attr_type}: {e}, len={attr_len}, value_len={len(attr_value)}")
+            raise
+
+    # Add Message-Authenticator attribute (80) for EAP packets
+    # This is HMAC-MD5 and must be added BEFORE calculating the authenticator
+    if has_eap:
+        logger.debug(f"[RADIUS] Adding Message-Authenticator to EAP response")
+        # Add placeholder Message-Authenticator (16 zero bytes)
+        msg_auth_attr = bytes([80, 18]) + (b'\x00' * 16)
+        attrs_data += msg_auth_attr
+        logger.debug(f"[RADIUS] Total attrs length after Message-Auth: {len(attrs_data)}")
+
+    # Build packet with placeholder authenticator and attrs with ZERO Message-Authenticator
     length = 20 + len(attrs_data)
-    packet = bytes([code, identifier]) + length.to_bytes(2, 'big') + (b'\x00' * 16) + attrs_data
 
-    # Calculate response authenticator: MD5(Code+ID+Length+RequestAuth+Attributes+Secret)
+    # Calculate Message-Authenticator if EAP (HMAC-MD5 over entire packet)
+    # RFC 2869: For response packets, use the Request-Authenticator from the Access-Request
+    if has_eap:
+        # Build packet for HMAC with Request-Authenticator and ZERO Message-Authenticator
+        packet_for_hmac = bytes([code, identifier]) + length.to_bytes(2, 'big') + authenticator + attrs_data
+
+        logger.debug(f"[RADIUS] HMAC input packet (debug): {packet_for_hmac.hex()}")
+        logger.debug(f"[RADIUS] HMAC secret (len): {len(secret)}")
+        logger.debug(f"[RADIUS] Request-Authenticator (hex start): {authenticator.hex()[:32]}... (len={len(authenticator)})")
+
+        # Calculate HMAC-MD5
+        import hmac as hmac_module
+        msg_auth = hmac_module.new(secret, packet_for_hmac, hashlib.md5).digest()
+        logger.debug(f"[RADIUS] Message-Auth calculated (hex start): {msg_auth.hex()[:32]}... (len={len(msg_auth)})")
+
+        # Replace the ZERO Message-Authenticator in attrs_data with calculated value
+        msg_auth_pos = len(attrs_data) - 18  # 18 = 2 (header) + 16 (value)
+        attrs_data = attrs_data[:msg_auth_pos + 2] + msg_auth + attrs_data[msg_auth_pos + 18:]
+        logger.debug(f"[RADIUS] Updated attrs_data with Message-Auth (debug)")
+
+    # Now calculate response authenticator with the CORRECT Message-Authenticator in attrs
+    # MD5(Code+ID+Length+RequestAuth+Attributes+Secret)
+    packet = bytes([code, identifier]) + length.to_bytes(2, 'big') + (b'\x00' * 16) + attrs_data
     response_auth = md5_hash(
         packet[:4] + authenticator + attrs_data + secret
     )
 
-    # Replace placeholder authenticator
+    # Build final packet with response authenticator
     packet = packet[:4] + response_auth + packet[20:]
+
+    if has_eap:
+        # Verify Message-Authenticator in final packet
+        final_msg_auth_pos = 20 + len(attrs_data) - 16
+        final_msg_auth = packet[final_msg_auth_pos:final_msg_auth_pos + 16]
+        logger.debug(f"[RADIUS] Final packet Message-Auth (hex start): {final_msg_auth.hex()[:32]}... (len={len(final_msg_auth)})")
+        logger.debug(f"[RADIUS] Final packet hex (debug): {packet.hex()}")
 
     return packet
 
 async def handle_radius_request(data: bytes, addr, server, settings: dict):
     """
-    Handle RADIUS Access-Request
+    Handle RADIUS Access-Request with EAP-TTLS support
     Security: Rate limiting, no admin access, proper authentication
     """
     try:
@@ -2763,6 +3916,13 @@ async def handle_radius_request(data: bytes, addr, server, settings: dict):
         authenticator = packet['authenticator']
         attributes = packet['attributes']
 
+        # Check for EAP-Message attribute (79)
+        if 79 in attributes:
+            # EAP authentication
+            await handle_eap_radius_request(packet, addr, server, settings)
+            return
+
+        # Legacy PAP authentication (fallback)
         # Extract username and password
         username = extract_radius_username(attributes)
         password = extract_radius_password(attributes, authenticator, secret)
@@ -3583,10 +4743,23 @@ def build_caddy_config():
                         redirect_route["match"] = [{"host": domains}]
 
                     # Exclude ACME challenge paths from redirect - Let's Encrypt needs HTTP access
-                    # This uses a "not" matcher to avoid redirecting /.well-known/acme-challenge/*
+                    # Use a compatibility switch: older Caddy versions don't support
+                    # the `path_prefix` matcher. By default we use the widely-supported
+                    # wildcard `path` matcher. If you explicitly enable
+                    # `caddy_use_path_prefix` in settings, we'll emit `path_prefix`.
                     if "match" not in redirect_route:
                         redirect_route["match"] = [{}]
-                    redirect_route["match"][0]["not"] = [{"path": ["/.well-known/acme-challenge/*"]}]
+                    use_path_prefix = False
+                    try:
+                        # `settings` is defined at top of build_caddy_config()
+                        use_path_prefix = bool(settings.get("caddy_use_path_prefix", False))
+                    except Exception:
+                        use_path_prefix = False
+
+                    if use_path_prefix:
+                        redirect_route["match"][0]["not"] = [{"path_prefix": ["/.well-known/acme-challenge/"]}]
+                    else:
+                        redirect_route["match"][0]["not"] = [{"path": ["/.well-known/acme-challenge/*"]}]
 
                     # Insert at beginning so it matches before other routes
                     servers[http_port]["routes"].insert(0, redirect_route)
@@ -3595,6 +4768,17 @@ def build_caddy_config():
         # Add routes to bypass authentication for auth endpoints
         # These must come BEFORE any auth-protected routes
         for port, server_data in servers.items():
+            # Ensure ACME challenge requests are handled by Caddy's ACME handler
+            # before any reverse_proxy or redirect routes so HTTP-01 can succeed.
+            # dint know if this is correct / working.
+            acme_bypass_route = {
+                "match": [{"path": ["/.well-known/acme-challenge/*"]}],
+                "handle": [{"handler": "acme_server"}],
+                "terminal": True
+            }
+            # Insert at beginning so ACME requests are handled first
+            server_data["routes"].insert(0, acme_bypass_route)
+
             # Bypass for API auth endpoints (manager login, website auth, etc.)
             api_auth_bypass_route = {
                 "match": [{"path": ["/api/auth/*", "/api/website-auth/*"]}],
@@ -3683,8 +4867,22 @@ async def root():
     return HTMLResponse(content=html_content)
 
 @app.get("/login", response_class=HTMLResponse)
-async def login_page(return_to: Optional[str] = None):
+async def login_page(return_to: Optional[str] = None, session_id: Optional[str] = Cookie(None)):
     """OAuth/OIDC login page with optional return URL"""
+    # Security: Validate return_to URL to prevent open redirect attacks
+    if return_to and not validate_return_url(return_to):
+        logger.warning(f"[Security] Invalid return_to URL rejected: {return_to}")
+        return_to = None  # Reset to safe default
+
+    # Check if user is already logged in
+    if session_id and session_id in sessions:
+        # User is already authenticated, redirect them
+        if return_to:
+            return RedirectResponse(url=return_to)
+        else:
+            return RedirectResponse(url="/user-portal")
+
+    # Not logged in, show login page
     oauth_login_path = resource_path("app/oauth_login.html")
     with open(oauth_login_path, "r", encoding="utf-8") as f:
         html_content = f.read()
@@ -3763,6 +4961,7 @@ async def oauth_login(login_data: LoginRequest, request: Request, response: Resp
         "session_id",
         session_id,
         httponly=True,
+        secure=True,  # Security: Prevent cookie from being sent over HTTP
         max_age=3*24*60*60,
         samesite="lax"
     )
@@ -3863,6 +5062,7 @@ async def admin_login(login_data: LoginRequest, request: Request, response: Resp
         "session_id",
         session_id,
         httponly=True,
+        secure=True,  # Security: Prevent cookie from being sent over HTTP
         max_age=3*24*60*60,
         samesite="strict"
     )
@@ -3922,14 +5122,24 @@ async def get_network_info():
         # Get all IP addresses associated with this host
         host_info = socket.getaddrinfo(hostname, None)
 
-        # Extract unique IPv4 addresses
+        # Extract unique IPv4 addresses using proper IP validation
         seen = set()
         for info in host_info:
-            ip = info[4][0]
-            # Only include IPv4 addresses, exclude localhost
-            if '.' in ip and ip not in seen and not ip.startswith('127.'):
-                addresses.append(ip)
-                seen.add(ip)
+            try:
+                import ipaddress
+                ip = info[4][0]
+                addr = ipaddress.ip_address(ip)
+
+                # Only include non-localhost IPv4 addresses
+                if addr.version == 4 and not addr.is_loopback and ip not in seen:
+                    addresses.append(ip)
+                    seen.add(ip)
+
+            except (ValueError, IndexError, TypeError):
+                # ValueError: invalid IP
+                # IndexError: missing info[4] or info[4][0]
+                # TypeError: info[4] isn't subscriptable
+                continue
 
         # If no addresses found, try to get local IP by connecting to external host
         if not addresses:
@@ -4053,7 +5263,7 @@ async def get_users(session_id: Optional[str] = Cookie(None)):
         raise HTTPException(status_code=401, detail="Not authenticated")
     # Get users from database
     users = get_all_users_from_db()
-    return [{"id": u["id"], "username": u["username"], "groups": u["groups"], "totp_enabled": u.get("totp_enabled", False)} for u in users]
+    return [{"id": u["id"], "username": u["username"], "groups": u["groups"], "email": u.get("email", ""), "totp_enabled": u.get("totp_enabled", False)} for u in users]
 
 @app.post("/api/users")
 async def create_user(user_create: UserCreate, request: Request, session_id: Optional[str] = Cookie(None)):
@@ -4094,8 +5304,11 @@ async def create_user(user_create: UserCreate, request: Request, session_id: Opt
             "totp_enabled": False
         }
         save_user_to_db(new_user)
+        # Convert group IDs to group names for notification
+        all_groups = get_all_groups_from_db()
+        group_names = [g['name'] for g in all_groups if g['id'] in new_user["groups"]]
         await send_event_notification("user_created", "User Created",
-            f"New user account created.", username=new_user["username"], groups=", ".join(new_user["groups"]),
+            f"New user account created.", username=new_user["username"], groups=", ".join(group_names),
             created_by=user.get("username", "admin"))
     return {"id": new_user["id"], "username": new_user["username"], "groups": new_user["groups"]}
 
@@ -4149,11 +5362,12 @@ async def update_user(user_id: str, user_update: UserCreate, request: Request, s
             "username": user_update.username,
             "password_hash": hash_password(user_update.password) if user_update.password else existing_user["password_hash"],
             "groups": user_update.groups,
+            "email": user_update.email or "",
             "totp_secret": existing_user.get("totp_secret"),
             "totp_enabled": existing_user.get("totp_enabled", False)
         }
         save_user_to_db(updated_user)
-    return {"id": updated_user["id"], "username": updated_user["username"], "groups": updated_user["groups"]}
+    return {"id": updated_user["id"], "username": updated_user["username"], "groups": updated_user["groups"], "email": updated_user.get("email", "")}
 
 @app.delete("/api/users/{user_id}")
 async def delete_user(user_id: str, request: Request, session_id: Optional[str] = Cookie(None)):
@@ -4314,21 +5528,21 @@ async def generate_invite_link(
 @app.get("/user-portal/", response_class=HTMLResponse)
 async def user_portal_root():
     """Serve the user portal HTML"""
-    portal_path = resource_path("user-portal/index.html")
+    portal_path = resource_path("app/user-portal-index.html")
     with open(portal_path, "r", encoding="utf-8") as f:
         return HTMLResponse(content=f.read())
 
 @app.get("/user-portal/style.css")
 async def user_portal_css():
     """Serve user portal CSS"""
-    css_path = resource_path("user-portal/style.css")
+    css_path = resource_path("app/user-portal-style.css")
     with open(css_path, "r", encoding="utf-8") as f:
         return Response(content=f.read(), media_type="text/css")
 
 @app.get("/user-portal/script.js")
 async def user_portal_js():
     """Serve user portal JavaScript"""
-    js_path = resource_path("user-portal/script.js")
+    js_path = resource_path("app/user-portal-script.js")
     with open(js_path, "r", encoding="utf-8") as f:
         return Response(content=f.read(), media_type="application/javascript")
 
@@ -4830,6 +6044,8 @@ async def oidc_discovery():
     if not settings.get('auth_protocols_enabled') or not settings.get('oidc_enabled'):
         raise HTTPException(status_code=404, detail="OIDC not enabled")
 
+    # (No helper here) NOTE: HTML error helper is defined in the authorize handler where needed.
+
     issuer = settings.get('oidc_issuer', 'http://localhost:12888')
 
     return {
@@ -4891,6 +6107,7 @@ async def jwks_endpoint():
 
 @app.get("/oauth/authorize")
 async def oauth_authorize(
+    request: Request,
     response_type: str,
     client_id: str,
     redirect_uri: str,
@@ -4905,22 +6122,47 @@ async def oauth_authorize(
     if not settings.get('auth_protocols_enabled') or not settings.get('oidc_enabled'):
         raise HTTPException(status_code=404, detail="OIDC not enabled")
 
+    # Helper: return HTML error page when the request prefers HTML, otherwise raise JSON HTTPException
+    def _respond_error(status_code: int, message: str):
+        accept = ""
+        try:
+            # Use the injected request object to inspect headers
+            if request and hasattr(request, 'headers'):
+                accept = request.headers.get('accept', '')
+        except Exception:
+            accept = ''
+
+        # Also consider common browser User-Agent values as a fallback
+        try:
+            ua = ''
+            if request and hasattr(request, 'headers'):
+                ua = request.headers.get('user-agent', '')
+        except Exception:
+            ua = ''
+
+        if 'text/html' in accept or 'application/xhtml+xml' in accept or ('mozilla' in ua.lower()):
+            html = f"""<html lang="en"><head> <meta charset="utf-8"> <meta name="viewport" content="width=device-width, initial-scale=1.0"> <title>Authorization Error</title> <style> body {{ font-family: Arial, Helvetica, sans-serif; margin: 0; padding: 0; background-color: #121212; color: #fff; display: flex; justify-content: center; align-items: center; height: 100vh; text-align: center; }} .container {{ background-color: #1e1e1e; padding: 2rem; border-radius: 8px; box-shadow: 0 4px 10px rgba(0, 0, 0, 0.3); max-width: 90%; width: 400px; }} h2 {{ font-size: 1.5rem; color: #e57373; }} p {{ font-size: 1rem; color: #b0bec5; }} a {{ color: #81c784; text-decoration: none; font-weight: bold; }} a:hover {{ text-decoration: underline; }} </style></head><body> <div class="container"> <h2>Authorization Error</h2> <p>{message}</p> <p><a href="javascript:history.back()">Back</a></p> </div></body></html>"""
+            return HTMLResponse(html, status_code=status_code)
+        # Default: raise HTTPException which yields JSON
+        raise HTTPException(status_code=status_code, detail=message)
+
     # Validate response_type
     if response_type != "code":
-        raise HTTPException(status_code=400, detail="Unsupported response_type")
+        return _respond_error(400, "Unsupported response_type")
 
     # Validate client
     client = get_oauth_client_by_id_from_db(client_id)
     if not client or not client.get('enabled'):
-        raise HTTPException(status_code=400, detail="Invalid client_id")
+        return _respond_error(400, "Invalid client_id")
 
     # Validate redirect_uri
+    logger.debug(f"[OIDC] authorize request: client_id={client_id}, redirect_uri={redirect_uri}, stored_redirects={client.get('redirect_uris')}")
     if redirect_uri not in client['redirect_uris']:
-        raise HTTPException(status_code=400, detail="Invalid redirect_uri")
+        return _respond_error(400, "Invalid redirect_uri")
 
     # Check PKCE requirement
     if client.get('require_pkce') and not code_challenge:
-        raise HTTPException(status_code=400, detail="PKCE required for this client")
+        return _respond_error(400, "PKCE required for this client")
 
     # Check if user is authenticated
     user = get_session_user(session_id)
@@ -4946,7 +6188,7 @@ async def oauth_authorize(
         await send_event_notification("oidc_auth_denied", "OIDC Authorization Denied",
             f"OIDC authorization denied - admin users not allowed.",
             username=user.get('username', 'unknown'), client_id=client_id, reason="Admin user")
-        raise HTTPException(status_code=403, detail="Admin users cannot use OIDC authentication")
+        return _respond_error(403, "Admin users cannot use OIDC authentication")
 
     # Check if user is in allowed groups (if specified)
     allowed_groups = client.get('allowed_groups', [])
@@ -4958,7 +6200,15 @@ async def oauth_authorize(
             await send_event_notification("oidc_auth_denied", "OIDC Authorization Denied",
                 f"OIDC authorization denied - user not in allowed groups.",
                 username=user.get('username', 'unknown'), client_id=client_id, reason="Not in allowed groups")
-            raise HTTPException(status_code=403, detail="User not authorized for this client")
+            # If the incoming request prefers HTML (browser), render a user-friendly error page.
+            # Otherwise, return the standard JSON error response.
+            try:
+                # FastAPI will provide a `request` object automatically if the route signature includes it.
+                # Some test callers may not have `request` in scope; _respond_error handles that.
+                return _respond_error(403, "User not authorized for this client")
+            except HTTPException:
+                # Re-raise JSON HTTPException for API clients
+                raise
 
     # Check if user is required to have 2FA but hasn't set it up
     if user_requires_2fa(user) and not user.get("totp_enabled", False):
@@ -4966,7 +6216,7 @@ async def oauth_authorize(
         await send_event_notification("oidc_auth_denied", "OIDC Authorization Denied",
             f"OIDC authorization denied - 2FA required but not configured.",
             username=user.get('username', 'unknown'), client_id=client_id, reason="2FA required but not configured")
-        raise HTTPException(status_code=403, detail="Your account requires 2FA to be enabled. Please visit the user portal to set up 2FA.")
+        return _respond_error(403, "Your account requires 2FA to be enabled. Please visit the user portal to set up 2FA.")
 
     # Generate authorization code
     auth_code = secrets.token_urlsafe(32)
