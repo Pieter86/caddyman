@@ -48,8 +48,16 @@ from cryptography.hazmat.primitives.asymmetric import padding
 from email.message import EmailMessage
 import aiosmtplib
 from datetime import timedelta
+from cryptography.fernet import Fernet
+from passlib.hash import nthash
+from argon2 import PasswordHasher, Type
+from argon2.exceptions import VerifyMismatchError, VerificationError, InvalidHash
 
-VERSION = "1.3.4"
+VERSION = "1.3.6"
+
+# Argon2id migration mode - set at runtime based on existing hashes or user choice
+# This will be auto-detected on startup
+_use_argon2id = None  # None = not yet determined, True = Argon2id, False = bcrypt
 
 # DEBUG mode - enables sensitive TLS secret logging and keylog files
 # WARNING: Never enable in production! Only for development/debugging
@@ -75,6 +83,27 @@ def validate_return_url(url: str) -> bool:
     # Reject all absolute URLs (http://, https://, etc.)
     # For a homelab/internal tool, we only allow relative redirects
     return False
+
+def is_local_request(request) -> bool:
+    """
+    Check if request is from a local/private IP address.
+    Returns True for localhost, private IPs (10.x, 192.168.x, 172.16-31.x)
+    Returns False for public/external IPs (should use HTTPS with secure cookies)
+    """
+    import ipaddress
+
+    # Get client IP (handle x-forwarded-for)
+    client_ip = request.headers.get("x-forwarded-for", request.client.host if request.client else "127.0.0.1")
+    if "," in client_ip:
+        client_ip = client_ip.split(",")[0].strip()
+
+    try:
+        addr = ipaddress.ip_address(client_ip)
+        # Check if it's a private/local IP
+        return addr.is_loopback or addr.is_private
+    except ValueError:
+        # If we can't parse the IP, assume it's not local (safer default)
+        return False
 
 def resource_path(relative_path):
     """Get absolute path to resource, works for dev and PyInstaller (including auto-py-to-exe)
@@ -138,6 +167,10 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# Log DEBUG_MODE status after logger is configured
+if DEBUG_MODE:
+    logger.info("[STARTUP] DEBUG_MODE enabled - TLS keylog files will be created")
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # Startup
@@ -183,14 +216,15 @@ class AdminAuthMiddleware(BaseHTTPMiddleware):
         if "," in client_ip:
             client_ip = client_ip.split(",")[0].strip()
         
-        # Allow login page, OAuth, user portal, and auth endpoints
-        if (request.url.path in ["/", "/login", "/api/auth/login", "/api/auth/logout", "/api/auth/verify", "/api/login", "/api/user"] or
+        # Allow login page, OAuth, user portal, auth endpoints, and admin page
+        if (request.url.path in ["/", "/admin", "/login", "/api/auth/login", "/api/auth/logout", "/api/auth/verify", "/api/login", "/api/user"] or
             request.url.path.startswith("/static/") or
             request.url.path.startswith("/api/website-auth/") or
             request.url.path.startswith("/auth/") or
             request.url.path.startswith("/oauth/") or
             request.url.path.startswith("/user-portal") or
-            request.url.path.startswith("/api/user-portal/")):
+            request.url.path.startswith("/api/user-portal/") or
+            request.url.path.startswith("/api/user-portal/branding")):
             return await call_next(request)
         
         # All other pages require admin group membership
@@ -227,6 +261,174 @@ class AdminAuthMiddleware(BaseHTTPMiddleware):
         return await call_next(request)
 
 app.add_middleware(AdminAuthMiddleware)
+
+# Custom exception handlers for better user experience
+@app.exception_handler(404)
+async def not_found_handler(request: Request, exc):
+    """Custom 404 handler that shows a nice error page instead of JSON"""
+    # Return HTML for browser requests
+    if "text/html" in request.headers.get("accept", ""):
+        # Get settings to determine user portal link
+        settings = get_settings_from_db()
+        user_portal_link = "/" if settings.get('admin_path_mode', False) else "/user-portal"
+
+        return HTMLResponse(content=f"""
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>404 - Page Not Found</title>
+    <style>
+        body {{
+            margin: 0;
+            padding: 0;
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }}
+        .error-container {{
+            background: white;
+            border-radius: 12px;
+            padding: 40px;
+            max-width: 500px;
+            text-align: center;
+            box-shadow: 0 10px 40px rgba(0,0,0,0.2);
+        }}
+        h1 {{
+            font-size: 72px;
+            margin: 0;
+            color: #667eea;
+        }}
+        h2 {{
+            font-size: 24px;
+            margin: 20px 0;
+            color: #333;
+        }}
+        p {{
+            color: #666;
+            line-height: 1.6;
+        }}
+        .btn {{
+            display: inline-block;
+            margin-top: 20px;
+            padding: 12px 24px;
+            background: #667eea;
+            color: white;
+            text-decoration: none;
+            border-radius: 6px;
+            font-weight: 500;
+            transition: background 0.2s;
+        }}
+        .btn:hover {{
+            background: #5568d3;
+        }}
+        .path {{
+            background: #f5f5f5;
+            padding: 8px 12px;
+            border-radius: 4px;
+            font-family: monospace;
+            margin-top: 20px;
+            word-break: break-all;
+        }}
+    </style>
+</head>
+<body>
+    <div class="error-container">
+        <h1>404</h1>
+        <h2>Page Not Found</h2>
+        <p>The page you're looking for doesn't exist or has been moved.</p>
+        <div class="path">{request.url.path}</div>
+        <a href="javascript:history.back()" class="btn" style="background: #555;">Go Back</a>
+        <a href="{user_portal_link}" class="btn" style="background: #764ba2;">User Portal</a>
+    </div>
+</body>
+</html>
+        """, status_code=404)
+    # Return JSON for API requests
+    return JSONResponse(
+        status_code=404,
+        content={"detail": "Not Found"}
+    )
+
+@app.exception_handler(500)
+async def server_error_handler(request: Request, exc):
+    """Custom 500 handler for internal server errors"""
+    if "text/html" in request.headers.get("accept", ""):
+        return HTMLResponse(content=f"""
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>500 - Server Error</title>
+    <style>
+        body {{
+            margin: 0;
+            padding: 0;
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+            background: linear-gradient(135deg, #f093fb 0%, #f5576c 100%);
+            min-height: 100vh;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }}
+        .error-container {{
+            background: white;
+            border-radius: 12px;
+            padding: 40px;
+            max-width: 500px;
+            text-align: center;
+            box-shadow: 0 10px 40px rgba(0,0,0,0.2);
+        }}
+        h1 {{
+            font-size: 72px;
+            margin: 0;
+            color: #f5576c;
+        }}
+        h2 {{
+            font-size: 24px;
+            margin: 20px 0;
+            color: #333;
+        }}
+        p {{
+            color: #666;
+            line-height: 1.6;
+        }}
+        .btn {{
+            display: inline-block;
+            margin-top: 20px;
+            padding: 12px 24px;
+            background: #f5576c;
+            color: white;
+            text-decoration: none;
+            border-radius: 6px;
+            font-weight: 500;
+            transition: background 0.2s;
+        }}
+        .btn:hover {{
+            background: #e04857;
+        }}
+    </style>
+</head>
+<body>
+    <div class="error-container">
+        <h1>500</h1>
+        <h2>Internal Server Error</h2>
+        <p>Something went wrong on our end. Please try again later.</p>
+        <a href="/" class="btn">Go to Dashboard</a>
+    </div>
+</body>
+</html>
+        """, status_code=500)
+    return JSONResponse(
+        status_code=500,
+        content={"detail": "Internal Server Error"}
+    )
+
 # Get absolute path for reliability - works with PyInstaller
 static_dir = resource_path("app")
 
@@ -323,6 +525,11 @@ default_settings = {
     "php_enabled": False, "php_path": "",
     "manager_port": 8000, "enhanced_security": False,
     "caddy_log_level": "WARN", "caddy_admin_port": 12999,
+
+    # Branding & Domain Settings (v1.3.5)
+    "organization_name": "CaddyMAN",
+    "domain_url": "http://localhost:8000",
+    "admin_path_mode": False,  # If true, admin is at /admin and / shows user portal login
     "notification_events": {
         # Security Events
         "admin_login": {"enabled": True, "severity": "info"},
@@ -447,6 +654,11 @@ class Settings(BaseModel):
     smtp_password: str = ""
     smtp_from_address: str = ""
     smtp_from_name: str = "CaddyIAM"
+
+    # Branding & Domain Settings (v1.3.5)
+    organization_name: str = "CaddyMAN"
+    domain_url: str = "http://localhost:8000"
+    admin_path_mode: bool = False
 
     @field_validator('php_path')
     @classmethod
@@ -573,11 +785,128 @@ class LoginRequest(BaseModel):
     password: str
     totp_token: Optional[str] = None
 
+# ====================================================================
+# Argon2id Password Hashing with DPAPI-Encrypted Pepper
+# ====================================================================
+
+# Path for DPAPI-encrypted pepper file
+PEPPER_FILE = Path("pepper.enc")
+
+def _get_dpapi_pepper() -> bytes:
+    """
+    Get or create DPAPI-encrypted pepper for Argon2id.
+    On Windows, uses DPAPI to encrypt pepper bound to local machine/user.
+    On other platforms, uses basic file encryption (less secure).
+    """
+    if platform.system() == 'Windows':
+        try:
+            import win32crypt
+        except ImportError:
+            logger.warning("pywin32 not installed - falling back to basic pepper encryption")
+            return _get_fallback_pepper()
+
+        if PEPPER_FILE.exists():
+            # Read existing encrypted pepper
+            try:
+                encrypted_pepper = PEPPER_FILE.read_bytes()
+                pepper = win32crypt.CryptUnprotectData(encrypted_pepper, None, None, None, 0)[1]
+                logger.debug("DPAPI pepper loaded successfully")
+                return pepper
+            except Exception as e:
+                logger.error(f"Failed to decrypt pepper with DPAPI: {e}")
+                raise RuntimeError("Failed to decrypt pepper - data may be corrupted or bound to different user/machine")
+        else:
+            # Generate new pepper and encrypt with DPAPI
+            pepper = secrets.token_bytes(32)
+            try:
+                encrypted_pepper = win32crypt.CryptProtectData(pepper, "CaddyMAN Argon2id Pepper", None, None, None, 0)
+                PEPPER_FILE.write_bytes(encrypted_pepper)
+                logger.info("Generated new DPAPI-encrypted pepper")
+                return pepper
+            except Exception as e:
+                logger.error(f"Failed to encrypt pepper with DPAPI: {e}")
+                raise RuntimeError(f"Failed to create DPAPI-encrypted pepper: {e}")
+    else:
+        # Non-Windows fallback (less secure - just uses file permissions)
+        return _get_fallback_pepper()
+
+def _get_fallback_pepper() -> bytes:
+    """Fallback pepper storage for non-Windows platforms (less secure)"""
+    if PEPPER_FILE.exists():
+        return PEPPER_FILE.read_bytes()
+    else:
+        pepper = secrets.token_bytes(32)
+        PEPPER_FILE.write_bytes(pepper)
+        # Set restrictive permissions on Unix-like systems
+        if hasattr(os, 'chmod'):
+            os.chmod(PEPPER_FILE, 0o600)
+        logger.warning("Using fallback pepper storage (not DPAPI-protected)")
+        return pepper
+
+# Initialize Argon2id hasher with strong security parameters
+# time_cost=2 (iterations), memory_cost=524288 (512 MiB), parallelism=4
+_argon2_hasher = PasswordHasher(
+    time_cost=2,
+    memory_cost=524288,  # 512 MiB (512 * 1024)
+    parallelism=4,
+    hash_len=32,
+    salt_len=16,
+    type=Type.ID  # Argon2id
+)
+
+def _add_pepper(password: str) -> str:
+    """Add DPAPI-encrypted pepper to password before hashing"""
+    if not _use_argon2id:
+        return password
+    pepper = _get_dpapi_pepper()
+    # Use HMAC to combine password and pepper securely
+    h = hmac.HMAC(pepper, hashes.SHA256(), backend=default_backend())
+    h.update(password.encode('utf-8'))
+    peppered = h.finalize()
+    # Return base64 encoded to use as password input for Argon2
+    return base64.b64encode(peppered).decode('ascii')
+
 def hash_password(password: str) -> str:
-    return bcrypt.hashpw(password.encode('utf-8'), bcrypt.gensalt()).decode('utf-8')
+    """
+    Hash password using Argon2id or bcrypt based on current mode.
+    Mode is auto-detected on startup based on existing users.
+    """
+    if _use_argon2id:
+        # Use Argon2id with DPAPI-encrypted pepper
+        peppered_password = _add_pepper(password)
+        hashed = _argon2_hasher.hash(peppered_password)
+        logger.debug("Password hashed with Argon2id")
+        return hashed
+    else:
+        # Use bcrypt (default/backward compatible)
+        hashed = bcrypt.hashpw(password.encode('utf-8'), bcrypt.gensalt()).decode('utf-8')
+        logger.debug("Password hashed with bcrypt")
+        return hashed
 
 def verify_password(password: str, hashed: str) -> bool:
-    return bcrypt.checkpw(password.encode('utf-8'), hashed.encode('utf-8'))
+    """
+    Verify password against hash.
+    Automatically detects hash type (Argon2id or bcrypt) and uses appropriate verification.
+    """
+    try:
+        if hashed.startswith('$argon2'):
+            # Argon2id hash - use peppered password
+            peppered_password = _add_pepper(password)
+            try:
+                _argon2_hasher.verify(hashed, peppered_password)
+                logger.debug("Password verified with Argon2id")
+                return True
+            except (VerifyMismatchError, VerificationError, InvalidHash):
+                logger.debug("Argon2id verification failed")
+                return False
+        else:
+            # bcrypt hash
+            result = bcrypt.checkpw(password.encode('utf-8'), hashed.encode('utf-8'))
+            logger.debug(f"Password verified with bcrypt: {result}")
+            return result
+    except Exception as e:
+        logger.error(f"Password verification error: {e}")
+        return False
 
 def user_requires_2fa(user: dict) -> bool:
     """Check if user is required to have 2FA based on their group memberships"""
@@ -1710,9 +2039,15 @@ if not groups:
     save_group_to_db(admin_group)
     logger.info("Created default admin group")
 
-# Create default admin user in database if no users exist
+# Auto-detect password hashing algorithm and prompt for migration if needed
 users = get_all_users_from_db()
+
 if not users:
+    # Fresh installation - use Argon2id by default
+    _use_argon2id = True
+    logger.info("Fresh installation detected - using Argon2id password hashing")
+
+    # Create default admin user
     default_admin = {
         "id": str(uuid.uuid4()),
         "username": "admin",
@@ -1720,10 +2055,110 @@ if not users:
         "groups": ["admin_group"],
         "totp_secret": None,
         "totp_enabled": False,
-        "force_password_change": True  # Force password change on first login
+        "force_password_change": True
     }
     save_user_to_db(default_admin)
-    logger.info("Created default admin user: admin/changeme (password change required on first login)")
+    logger.info("Created default admin user with Argon2id: admin/changeme (password change required)")
+else:
+    # Existing installation - detect hash type from first user
+    first_user = users[0]
+    first_hash = first_user.get('password_hash', '')
+
+    if first_hash.startswith('$argon2'):
+        # Already using Argon2id
+        _use_argon2id = True
+        logger.info("Detected Argon2id password hashes - continuing with Argon2id")
+    else:
+        # Currently using bcrypt - prompt for migration
+        _use_argon2id = False
+        logger.info("Detected bcrypt password hashes - currently using bcrypt")
+
+        # Prompt user for migration
+        print("\n" + "=" * 80)
+        print("ARGON2ID MIGRATION AVAILABLE")
+        print("=" * 80)
+        print("\nYour CaddyMAN installation is currently using bcrypt password hashing.")
+        print("Argon2id is a more modern and secure algorithm with:")
+        print("  - Memory-hard hashing (resistant to GPU/ASIC attacks)")
+        print("  - DPAPI-encrypted pepper (Windows)")
+        print("  - Better protection against brute force attacks")
+        print("\nWARNING: Migrating to Argon2id will:")
+        print("  ✓ Keep all settings, websites, proxies, groups, logs")
+        print("  ✗ DELETE ALL USERS (including admin)")
+        print("  ✓ Create new default admin: admin/changeme")
+        print("  ✗ All users must be recreated with new passwords")
+        print("\nDo you want to migrate to Argon2id now?")
+        print("  [Y] Yes, migrate to Argon2id (deletes all users)")
+        print("  [N] No, keep using bcrypt (ask again on next restart)")
+        print("\nDefaulting to 'No' in 20 seconds...")
+        print("=" * 80)
+
+        # Wait for user input with 20-second timeout
+        import select
+        import sys
+
+        user_choice = None
+        if platform.system() == 'Windows':
+            # Windows: use msvcrt for timeout input
+            import msvcrt
+            import time
+            start_time = time.time()
+            user_input = ""
+            while (time.time() - start_time) < 20:
+                if msvcrt.kbhit():
+                    char = msvcrt.getch().decode('utf-8', errors='ignore').lower()
+                    if char in ['y', 'n']:
+                        user_choice = char
+                        print(f"\nSelected: {user_choice.upper()}")
+                        break
+                time.sleep(0.1)
+        else:
+            # Unix/Linux: use select
+            print("Enter your choice (Y/N): ", end='', flush=True)
+            i, o, e = select.select([sys.stdin], [], [], 20)
+            if i:
+                user_input = sys.stdin.readline().strip().lower()
+                if user_input in ['y', 'yes']:
+                    user_choice = 'y'
+                elif user_input in ['n', 'no']:
+                    user_choice = 'n'
+
+        if user_choice == 'y':
+            # User chose to migrate - delete all users and switch to Argon2id
+            logger.warning("User chose to migrate to Argon2id - deleting all users")
+            print("\nMigrating to Argon2id...")
+
+            with closing(get_db_connection()) as conn:
+                cursor = conn.cursor()
+                cursor.execute('DELETE FROM users')
+                conn.commit()
+
+            _use_argon2id = True
+            logger.info("All users deleted - switched to Argon2id")
+
+            # Create new default admin with Argon2id
+            default_admin = {
+                "id": str(uuid.uuid4()),
+                "username": "admin",
+                "password_hash": hash_password("changeme"),
+                "groups": ["admin_group"],
+                "totp_secret": None,
+                "totp_enabled": False,
+                "force_password_change": True
+            }
+            save_user_to_db(default_admin)
+            logger.info("Created new admin user with Argon2id: admin/changeme")
+            print("✓ Migration complete! Default admin recreated: admin/changeme")
+            print("=" * 80 + "\n")
+        else:
+            # User chose not to migrate or timeout
+            if user_choice == 'n':
+                logger.info("User chose to keep bcrypt - will ask again on next restart")
+                print("\nKeeping bcrypt - you can migrate on next restart")
+            else:
+                logger.info("Migration prompt timed out - defaulting to bcrypt")
+                print("\n\nTimeout - defaulting to bcrypt. You can migrate on next restart.")
+            print("=" * 80 + "\n")
 
 # Initialize settings in database if they don't exist
 db_settings = get_settings_from_db()
@@ -2756,6 +3191,8 @@ EAP_CODE_FAILURE = 4
 
 EAP_TYPE_IDENTITY = 1
 EAP_TYPE_TTLS = 21
+EAP_TYPE_PEAP = 25
+# Note: PAP is not an EAP type, it's handled via RADIUS directly without EAP encapsulation
 
 # TLS Flags
 TLS_FLAG_LENGTH = 0x80
@@ -3007,6 +3444,74 @@ def debug_pmk_variants(master_hex: str, client_hex: str, server_hex: str) -> dic
         'pmk_rfc': pmk_rfc.hex()
     }
 
+# MSCHAPv2 Helper Functions for PEAP
+def mschapv2_challenge_hash(peer_challenge: bytes, authenticator_challenge: bytes, username: str) -> bytes:
+    """Generate MSCHAPv2 challenge hash (RFC 2759 Section 8.2)"""
+    sha1 = hashlib.sha1()
+    sha1.update(peer_challenge)
+    sha1.update(authenticator_challenge)
+    sha1.update(username.encode('utf-8'))
+    return sha1.digest()[:8]
+
+def mschapv2_nt_password_hash(password: str) -> bytes:
+    """Generate NT password hash (MD4 of UTF-16LE password)"""
+    import hashlib
+    # MD4 is not in standard hashlib, need to use a workaround
+    try:
+        # Try to use passlib if available
+        from passlib.hash import nthash
+        return bytes.fromhex(nthash.hash(password))
+    except ImportError:
+        # Fall back to manual MD4 implementation using hashlib
+        try:
+            # Some Python builds have MD4 available
+            md4 = hashlib.new('md4')
+            md4.update(password.encode('utf-16le'))
+            return md4.digest()
+        except ValueError:
+            # MD4 not available - this is a problem for PEAP/MSCHAPv2
+            logger.error("[PEAP] MD4 hash not available - cannot perform MSCHAPv2 authentication")
+            raise HTTPException(status_code=500, detail="MSCHAPv2 authentication not supported (MD4 unavailable)")
+
+def mschapv2_challenge_response(challenge: bytes, password_hash: bytes) -> bytes:
+    """Generate MSCHAPv2 challenge response using DES (RFC 2759 Section 8.3)"""
+    from Crypto.Cipher import DES
+
+    # Expand 16-byte password hash to 21 bytes by padding with zeros
+    z_password_hash = password_hash + b'\x00' * 5
+
+    # Split into three 7-byte keys
+    response = b''
+    for i in range(3):
+        # Extract 7 bytes
+        key_7 = z_password_hash[i*7:(i+1)*7]
+        # Expand to 8-byte DES key
+        des_key = des_expand_key(key_7)
+        # Encrypt challenge
+        cipher = DES.new(des_key, DES.MODE_ECB)
+        response += cipher.encrypt(challenge)
+
+    return response
+
+def des_expand_key(key_7: bytes) -> bytes:
+    """Expand 7-byte key to 8-byte DES key with parity bits"""
+    key_8 = bytearray(8)
+    key_8[0] = key_7[0] & 0xFE
+    key_8[1] = ((key_7[0] << 7) | (key_7[1] >> 1)) & 0xFE
+    key_8[2] = ((key_7[1] << 6) | (key_7[2] >> 2)) & 0xFE
+    key_8[3] = ((key_7[2] << 5) | (key_7[3] >> 3)) & 0xFE
+    key_8[4] = ((key_7[3] << 4) | (key_7[4] >> 4)) & 0xFE
+    key_8[5] = ((key_7[4] << 3) | (key_7[5] >> 5)) & 0xFE
+    key_8[6] = ((key_7[5] << 2) | (key_7[6] >> 6)) & 0xFE
+    key_8[7] = (key_7[6] << 1) & 0xFE
+    return bytes(key_8)
+
+def mschapv2_generate_nt_response(authenticator_challenge: bytes, peer_challenge: bytes, username: str, password: str) -> bytes:
+    """Generate MSCHAPv2 NT-Response (RFC 2759 Section 8.1)"""
+    challenge = mschapv2_challenge_hash(peer_challenge, authenticator_challenge, username)
+    password_hash = mschapv2_nt_password_hash(password)
+    return mschapv2_challenge_response(challenge, password_hash)
+
 def build_eap_packet(code: int, identifier: int, eap_type: Optional[int] = None, data: bytes = b'') -> bytes:
     """Build an EAP packet"""
     if eap_type is not None:
@@ -3041,12 +3546,135 @@ def parse_eap_packet(data: bytes) -> dict:
 
     return result
 
-class EAPTTLSSession:
-    """Manage EAP-TTLS session state"""
+# ====================================================================
+# WiFi Password Encryption and MSCHAPv2 Helper Functions
+# ====================================================================
 
-    def __init__(self, session_id: str):
+def get_wifi_encryption_key() -> bytes:
+    """
+    Get or generate the encryption key for WiFi passwords.
+    Uses a key derived from a secret stored in settings.
+    """
+    settings = get_settings_from_db()
+    encryption_secret = settings.get('wifi_password_encryption_secret')
+
+    if not encryption_secret:
+        # Generate a new secret
+        encryption_secret = base64.urlsafe_b64encode(secrets.token_bytes(32)).decode()
+        update_setting_in_db('wifi_password_encryption_secret', encryption_secret)
+
+    # Derive a Fernet key from the secret
+    key = hashlib.sha256(encryption_secret.encode()).digest()
+    return base64.urlsafe_b64encode(key)
+
+def encrypt_wifi_password(plaintext_password: str) -> str:
+    """
+    Encrypt a WiFi password and return the encrypted NT hash.
+    Stores the encrypted NT hash, not the plaintext.
+    """
+    # Calculate NT hash
+    nt_hash_value = nthash.hash(plaintext_password)
+
+    # Encrypt the NT hash
+    fernet_key = get_wifi_encryption_key()
+    f = Fernet(fernet_key)
+    encrypted = f.encrypt(nt_hash_value.encode())
+
+    return encrypted.decode()
+
+def decrypt_wifi_password_hash(encrypted_hash: str) -> str:
+    """
+    Decrypt a WiFi password hash (returns the NT hash, not plaintext).
+    """
+    fernet_key = get_wifi_encryption_key()
+    f = Fernet(fernet_key)
+    decrypted = f.decrypt(encrypted_hash.encode())
+
+    return decrypted.decode()
+
+def verify_mschapv2_response(nt_hash: str, auth_challenge: bytes, peer_challenge: bytes,
+                             username: str, nt_response: bytes) -> tuple:
+    """
+    Verify MSCHAPv2 response and generate authenticator response.
+
+    Args:
+        nt_hash: NT hash of the password (32 hex chars)
+        auth_challenge: 16-byte authenticator challenge
+        peer_challenge: 16-byte peer challenge
+        username: Username
+        nt_response: 24-byte NT response from client
+
+    Returns:
+        (is_valid: bool, authenticator_response: str)
+    """
+    try:
+        # Convert NT hash to bytes
+        nt_hash_bytes = bytes.fromhex(nt_hash)
+
+        # Generate the challenge
+        # ChallengeHash = SHA1(PeerChallenge + AuthenticatorChallenge + Username)
+        challenge_hash = hashlib.sha1(peer_challenge + auth_challenge + username.encode()).digest()[:8]
+
+        # Calculate expected NT response
+        # NTResponse = ChallengeResponse(Challenge, PasswordHash)
+        # This uses DES encryption with the NT hash
+        import Crypto.Cipher.DES as DES_module
+
+        def des_encrypt_one_block(key7: bytes, data: bytes) -> bytes:
+            """DES encrypt one block with 7-byte key"""
+            # Expand 7-byte key to 8-byte DES key with parity
+            key8 = bytes([
+                key7[0] & 0xFE,
+                ((key7[0] << 7) | (key7[1] >> 1)) & 0xFE,
+                ((key7[1] << 6) | (key7[2] >> 2)) & 0xFE,
+                ((key7[2] << 5) | (key7[3] >> 3)) & 0xFE,
+                ((key7[3] << 4) | (key7[4] >> 4)) & 0xFE,
+                ((key7[4] << 3) | (key7[5] >> 5)) & 0xFE,
+                ((key7[5] << 2) | (key7[6] >> 6)) & 0xFE,
+                (key7[6] << 1) & 0xFE
+            ])
+            cipher = DES_module.new(key8, DES_module.MODE_ECB)
+            return cipher.encrypt(data)
+
+        # Split NT hash into 3 keys and encrypt challenge
+        expected_response = b''
+        for i in range(0, 21, 7):
+            key = nt_hash_bytes[i:i+7]
+            if len(key) < 7:
+                key += b'\x00' * (7 - len(key))
+            expected_response += des_encrypt_one_block(key, challenge_hash)
+
+        # Check if response matches
+        is_valid = (expected_response == nt_response)
+
+        # Generate authenticator response
+        # AuthenticatorResponse = GenerateAuthenticatorResponse(PasswordHash, NTResponse,
+        #                                                       PeerChallenge, AuthenticatorChallenge, Username)
+        magic1 = b'\x4D\x61\x67\x69\x63\x20\x73\x65\x72\x76\x65\x72\x20\x74\x6F\x20\x63\x6C\x69\x65\x6E\x74\x20\x73\x69\x67\x6E\x69\x6E\x67\x20\x63\x6F\x6E\x73\x74\x61\x6E\x74'
+        magic2 = b'\x50\x61\x64\x20\x74\x6F\x20\x6D\x61\x6B\x65\x20\x69\x74\x20\x64\x6F\x20\x6D\x6F\x72\x65\x20\x74\x68\x61\x6E\x20\x6F\x6E\x65\x20\x69\x74\x65\x72\x61\x74\x69\x6F\x6E'
+
+        # HashNtPasswordHash = MD4(NT hash)
+        password_hash_hash = hashlib.new('md4', nt_hash_bytes, usedforsecurity=False).digest()
+
+        # Generate authenticator response
+        digest = hashlib.sha1(password_hash_hash + nt_response + magic1).digest()
+        challenge_digest = hashlib.sha1(digest + auth_challenge + magic2).digest()
+
+        auth_response = "S=" + challenge_digest.hex().upper()
+
+        return (is_valid, auth_response)
+
+    except Exception as e:
+        logger.error(f"[MSCHAPv2] Verification error: {e}")
+        return (False, "")
+
+class EAPTTLSSession:
+    """Manage EAP-TTLS and EAP-PEAP session state"""
+
+    def __init__(self, session_id: str, eap_method: str = 'TTLS'):
         self.session_id = session_id
-        self.state = 'INIT'  # INIT -> IDENTITY -> TTLS_START -> TTLS_HANDSHAKE -> TTLS_TUNNEL -> SUCCESS/FAILURE
+        self.eap_method = eap_method  # 'TTLS' or 'PEAP'
+        self.state = 'INIT'  # INIT -> IDENTITY -> TLS_START -> TLS_HANDSHAKE -> TLS_TUNNEL -> SUCCESS/FAILURE
         self.identifier = 0
         self.username = None
         self.tls_in_buffer = b''
@@ -3062,15 +3690,42 @@ class EAPTTLSSession:
         self.client_random: Optional[bytes] = None
         self.server_random: Optional[bytes] = None
         self.tls_secrets = {}  # Store TLS secrets from keylog callback
-        self.keylog_file = None  # Temporary file for SSL keylog
+        self.keylog_file = None  # Temporary file for SSL keylog (fallback only)
+        self.keylog_buffer = None  # In-memory buffer for keylog data (preferred)
+
+        # PEAP/MSCHAPv2 specific fields
+        self.mschapv2_challenge = None  # Authenticator challenge for MSCHAPv2
+        self.mschapv2_ident = 0  # MSCHAPv2 identifier
+
+    def keylog_callback(self, conn, line):
+        """Callback to capture TLS keylog data.
+
+        This is called by OpenSSL/Python SSL for each key material line.
+        We store the secrets in the session for later use.
+        """
+        try:
+            line_str = line.decode('utf-8').strip() if isinstance(line, bytes) else str(line).strip()
+            logger.debug(f"[EAP-TTLS] Keylog callback: {line_str[:50]}...")
+
+            # Parse CLIENT_RANDOM lines
+            if line_str.startswith('CLIENT_RANDOM '):
+                parts = line_str.split()
+                if len(parts) == 3:
+                    self.tls_secrets['client_random_hex'] = parts[1]
+                    self.tls_secrets['master_secret_hex'] = parts[2]
+                    logger.debug(f"[EAP-TTLS] Captured master secret from keylog callback")
+        except Exception as e:
+            logger.debug(f"[EAP-TTLS] Keylog callback error: {e}")
 
     def create_ssl_context(self, cert_path: str, key_path: str, enable_keylog: bool = False):
         """Create SSL context for TLS handshake.
 
-        enable_keylog: when True and Python supports it, create a temporary
-        keylog file and set `context.keylog_filename` so the SSL library will
-        write TLS secrets there. This is disabled by default to avoid
-        accidental secret exposure in production logs/files.
+        enable_keylog: when True and Python supports it, creates a temporary keylog file
+        that will be read into memory and deleted after use. This is required for PMK
+        derivation since BIO-wrapped SSL objects don't expose export_keying_material().
+
+        Note: Python's ssl.SSLContext.keylog_filename only accepts file paths (strings),
+        not callbacks, so we must use a temporary file that gets read and deleted.
         """
         context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
         context.load_cert_chain(cert_path, key_path)
@@ -3079,49 +3734,56 @@ class EAPTTLSSession:
         context.check_hostname = False
         context.verify_mode = ssl.CERT_NONE
 
-        # Set keylog file to capture TLS secrets (Python 3.8+) only when enabled
-        if enable_keylog and hasattr(context, 'keylog_filename'):
-            import tempfile
-            # Create a unique temporary file for this session
-            self.keylog_file = tempfile.NamedTemporaryFile(mode='w+', delete=False, suffix='.keylog')
-            keylog_path = self.keylog_file.name
-            self.keylog_file.close()  # Close but don't delete, SSL will write to it
-            context.keylog_filename = keylog_path
-            logger.debug(f"[EAP-TTLS] SSL keylog enabled (debug): {keylog_path}")
-            logger.debug("[EAP-TTLS] context.keylog_filename set for session")
+        # Set up keylog file for keying material extraction (required for EAP-TTLS)
+        # The file will be read into memory immediately after handshake and deleted
+        if enable_keylog:
+            if hasattr(ssl.SSLContext, 'keylog_filename'):
+                import tempfile
+                # Create a temporary file that will be read and deleted after use
+                self.keylog_file = tempfile.NamedTemporaryFile(mode='w+', delete=False, suffix='.keylog')
+                keylog_path = self.keylog_file.name
+                self.keylog_file.close()  # Close handle so SSL library can write to it
+                context.keylog_filename = keylog_path
+                self.keylog_buffer = None  # Will store file contents after reading
+                logger.debug(f"[EAP-TTLS] Keylog file created (will be read to memory): {keylog_path}")
+            else:
+                self.keylog_file = None
+                self.keylog_buffer = None
+                logger.error(f"[EAP-TTLS] CRITICAL: Python version does not support keylog_filename - RADIUS authentication will fail!")
         else:
-            # Do not create a keylog file unless explicitly requested.
             self.keylog_file = None
-            if enable_keylog:
-                # Python does not support keylog_filename on this build
-                logger.warning(f"[EAP-TTLS] SSL keylog requested but not available in this Python version")
+            self.keylog_buffer = None
 
         return context
 
 def handle_eap_ttls_session(session: EAPTTLSSession, eap_packet: dict, cert_path: str, key_path: str, settings: dict) -> bytes:
     """
-    Handle EAP-TTLS protocol state machine
+    Handle EAP-TTLS and EAP-PEAP protocol state machine
     Returns EAP response packet to send back
     """
     eap_type = eap_packet.get('type')
     eap_data = eap_packet.get('data', b'')
     identifier = eap_packet['identifier']
 
+    # Determine which EAP type to use based on session method
+    session_eap_type = EAP_TYPE_PEAP if session.eap_method == 'PEAP' else EAP_TYPE_TTLS
+    method_label = session.eap_method  # 'PEAP' or 'TTLS'
+
     # State: Waiting for Identity
     if session.state == 'INIT' and eap_type == EAP_TYPE_IDENTITY:
         # Extract identity
         session.username = eap_data.decode('utf-8', errors='ignore')
-        logger.info(f"[EAP-TTLS] Identity: {session.username}")
+        logger.info(f"[{method_label}] Identity: {session.username}")
         session.state = 'IDENTITY'
         session.identifier = (identifier + 1) % 256
 
-        # Send TTLS Start
-        ttls_flags = TLS_FLAG_START
-        ttls_data = bytes([ttls_flags])
-        return build_eap_packet(EAP_CODE_REQUEST, session.identifier, EAP_TYPE_TTLS, ttls_data)
+        # Send TLS Start (PEAP or TTLS)
+        tls_flags = TLS_FLAG_START
+        tls_data = bytes([tls_flags])
+        return build_eap_packet(EAP_CODE_REQUEST, session.identifier, session_eap_type, tls_data)
 
-    # State: TTLS Handshake
-    elif session.state in ['IDENTITY', 'TTLS_START', 'TTLS_HANDSHAKE'] and eap_type == EAP_TYPE_TTLS:
+    # State: TLS Handshake (PEAP and TTLS)
+    elif session.state in ['IDENTITY', 'TTLS_START', 'TTLS_HANDSHAKE', 'TLS_START', 'TLS_HANDSHAKE'] and eap_type == session_eap_type:
         if len(eap_data) < 1:
             return build_eap_packet(EAP_CODE_FAILURE, identifier)
 
@@ -3142,7 +3804,7 @@ def handle_eap_ttls_session(session: EAPTTLSSession, eap_packet: dict, cert_path
         # If more fragments expected, request next fragment
         if flags & TLS_FLAG_MORE:
             session.identifier = (identifier + 1) % 256
-            return build_eap_packet(EAP_CODE_REQUEST, session.identifier, EAP_TYPE_TTLS, bytes([0]))
+            return build_eap_packet(EAP_CODE_REQUEST, session.identifier, session_eap_type, bytes([0]))
 
         # Process TLS handshake
         try:
@@ -3151,9 +3813,10 @@ def handle_eap_ttls_session(session: EAPTTLSSession, eap_packet: dict, cert_path
                 from ssl import MemoryBIO
 
                 session.state = 'TTLS_HANDSHAKE'
-                # Only enable keylog in DEBUG mode to avoid exposing TLS secrets in production
-                # Security: Keylog files contain master_secret which can decrypt all TLS traffic
-                context = session.create_ssl_context(cert_path, key_path, enable_keylog=DEBUG_MODE)
+                # Always enable keylog for keying material extraction (required for proper PMK derivation)
+                # The keylog file is cleaned up after use and is necessary because BIO-wrapped
+                # SSL objects don't expose export_keying_material() method
+                context = session.create_ssl_context(cert_path, key_path, enable_keylog=True)
                 session.ssl_context = context  # Store context in session
 
                 bio_in = MemoryBIO()
@@ -3191,32 +3854,124 @@ def handle_eap_ttls_session(session: EAPTTLSSession, eap_packet: dict, cert_path
                     # Extract keying material for MPPE keys (RFC 5216 Section 2.3)
                     # Use TLS Exporter as defined in RFC 5705
                     try:
-                        # Read the keylog file to get the master secret
-                        logger.debug(f"[EAP-TTLS] session.keylog_file = {session.keylog_file}")
-                        if session.keylog_file:
-                            logger.debug(f"[EAP-TTLS] Keylog file path: {session.keylog_file.name}")
-                            logger.debug(f"[EAP-TTLS] Keylog file exists: {os.path.exists(session.keylog_file.name)}")
+                        # Log TLS version
+                        tls_version = None
+                        try:
+                            if hasattr(session, 'ssl_obj') and session.ssl_obj is not None:
+                                tls_version = session.ssl_obj.version()
+                                logger.info(f"[EAP-TTLS] TLS version negotiated: {tls_version}")
+                        except Exception:
+                            pass
 
-                        if session.keylog_file and os.path.exists(session.keylog_file.name):
-                            with open(session.keylog_file.name, 'r') as f:
-                                keylog_data = f.read()
+                        # Try to derive PMK using SSL's exporter API (preferred method)
+                        session.master_key = None
+                        ssl_obj = getattr(session, 'ssl_obj', None)
 
-                            logger.info(f"[EAP-TTLS] Keylog file contents ({len(keylog_data)} bytes):\n{keylog_data}")
+                        # Try to access the underlying SSL object (for BIO-wrapped objects)
+                        # In Python 3.11+, export_keying_material is available
+                        ssl_real = None
+                        if ssl_obj is not None:
+                            # Debug: log what type of object we have
+                            logger.debug(f"[EAP-TTLS] SSL object type: {type(ssl_obj)}")
+                            logger.debug(f"[EAP-TTLS] SSL object dir: {[m for m in dir(ssl_obj) if not m.startswith('_')]}")
 
-                            # Parse CLIENT_RANDOM <client_random> <master_secret>
+                            # Try direct access first
+                            if hasattr(ssl_obj, 'export_keying_material'):
+                                ssl_real = ssl_obj
+                                logger.debug("[EAP-TTLS] Using ssl_obj.export_keying_material directly")
+                            # Try accessing _sslobj (internal attribute)
+                            elif hasattr(ssl_obj, '_sslobj') and ssl_obj._sslobj is not None:
+                                logger.debug(f"[EAP-TTLS] Found _sslobj attribute, type: {type(ssl_obj._sslobj)}")
+                                if hasattr(ssl_obj._sslobj, 'export_keying_material'):
+                                    ssl_real = ssl_obj._sslobj
+                                    logger.debug("[EAP-TTLS] Using _sslobj for export_keying_material")
+                                else:
+                                    logger.debug("[EAP-TTLS] _sslobj does not have export_keying_material")
+                            else:
+                                logger.debug("[EAP-TTLS] No _sslobj attribute found or it is None")
+
+                        # ALTERNATIVE: Try to get session info for master_secret and client_random
+                        # SSLObject created with wrap_bio() doesn't have export_keying_material()
+                        # but we might be able to access session() which returns session data
+                        if ssl_real is None and ssl_obj is not None:
+                            try:
+                                # Check if we can access session information
+                                if hasattr(ssl_obj, 'session') and callable(ssl_obj.session):
+                                    session_info = ssl_obj.session()
+                                    logger.debug(f"[EAP-TTLS] Got session info: {type(session_info)}")
+                                    logger.debug(f"[EAP-TTLS] Session info attributes: {dir(session_info)}")
+                                elif hasattr(ssl_obj, 'get_channel_binding'):
+                                    binding = ssl_obj.get_channel_binding('tls-unique')
+                                    logger.debug(f"[EAP-TTLS] Got channel binding: {binding.hex() if binding else 'None'}")
+                            except Exception as ex:
+                                logger.debug(f"[EAP-TTLS] Could not access session info: {ex}")
+
+                        # Prefer SSL export_keying_material() if available (most robust)
+                        if ssl_real is not None:
+                            # Try the TLS1.2-style 'ttls keying material' first (64 bytes -> take first 32)
+                            try:
+                                cand = ssl_real.export_keying_material(b"ttls keying material", 64, None)
+                                if cand and len(cand) >= 32:
+                                    session.master_key = cand[:32]
+                                    logger.info(f"[EAP-TTLS] Derived PMK using SSL exporter 'ttls keying material' (len={len(session.master_key)})")
+                            except Exception as ex:
+                                logger.debug(f"[EAP-TTLS] SSL exporter 'ttls keying material' failed: {ex}")
+
+                            # If not derived yet, try RFC label 'client EAP encryption' (32 bytes)
+                            if session.master_key is None:
+                                try:
+                                    cand2 = ssl_real.export_keying_material(b"client EAP encryption", 32, None)
+                                    if cand2 and len(cand2) == 32:
+                                        session.master_key = cand2
+                                        logger.info(f"[EAP-TTLS] Derived PMK using SSL exporter 'client EAP encryption' (len={len(session.master_key)})")
+                                except Exception as ex:
+                                    logger.debug(f"[EAP-TTLS] SSL exporter 'client EAP encryption' failed: {ex}")
+
+                        # If exporter not available or failed, fall back to keylog parsing + PRF
+                        if session.master_key is None:
+                            logger.debug(f"[EAP-TTLS] SSL exporter not available, falling back to keylog parsing")
+
+                            # Try to get keylog data from memory first (preferred), then from file
+                            keylog_data = None
+
+                            # Method 1: Check if we already have data in memory buffer
+                            if hasattr(session, 'keylog_buffer') and session.keylog_buffer:
+                                keylog_data = session.keylog_buffer
+                                logger.info(f"[EAP-TTLS] Using keylog data from in-memory buffer ({len(keylog_data)} bytes)")
+
+                            # Method 2: Read from file and store in memory, then delete file immediately
+                            if not keylog_data and session.keylog_file and os.path.exists(session.keylog_file.name):
+                                try:
+                                    with open(session.keylog_file.name, 'r') as f:
+                                        keylog_data = f.read()
+                                    # Store in memory buffer so we don't need the file anymore
+                                    session.keylog_buffer = keylog_data
+                                    # Delete the file immediately after reading
+                                    try:
+                                        os.unlink(session.keylog_file.name)
+                                        logger.debug(f"[EAP-TTLS] Read keylog to memory ({len(keylog_data)} bytes) and deleted file")
+                                        session.keylog_file = None  # Mark as cleaned up
+                                    except Exception as del_err:
+                                        logger.debug(f"[EAP-TTLS] Could not delete keylog file yet: {del_err}")
+                                except Exception as e:
+                                    logger.warning(f"[EAP-TTLS] Could not read keylog file: {e}")
+
+                            # Parse keylog data if we have any
                             master_secret = None
                             client_random = None
-                            for line in keylog_data.strip().split('\n'):
-                                if line.startswith('CLIENT_RANDOM '):
-                                    parts = line.split()
-                                    if len(parts) == 3:
-                                        client_random_hex = parts[1]
-                                        master_secret_hex = parts[2]
-                                        client_random = bytes.fromhex(client_random_hex)
-                                        master_secret = bytes.fromhex(master_secret_hex)
-                                        logger.debug(f"[EAP-TTLS] Extracted master secret (len): {len(master_secret)} bytes")
-                                        logger.debug(f"[EAP-TTLS] Client random (hex start): {client_random.hex()[:32]}... (len={len(client_random)})")
-                                        break
+                            if keylog_data:
+                                # Parse CLIENT_RANDOM <client_random> <master_secret>
+                                for line in keylog_data.strip().split('\n'):
+                                    if line.startswith('CLIENT_RANDOM '):
+                                        parts = line.split()
+                                        if len(parts) == 3:
+                                            client_random_hex = parts[1]
+                                            master_secret_hex = parts[2]
+                                            client_random = bytes.fromhex(client_random_hex)
+                                            master_secret = bytes.fromhex(master_secret_hex)
+                                            logger.debug(f"[EAP-TTLS] Extracted master secret (len): {len(master_secret)} bytes")
+                                            logger.debug(f"[EAP-TTLS] Client random (hex start): {client_random.hex()[:32]}... (len={len(client_random)})")
+                                            break
 
                             if master_secret and client_random:
                                 # Get server random from SSL connection
@@ -3249,35 +4004,24 @@ def handle_eap_ttls_session(session: EAPTTLSSession, eap_packet: dict, cert_path
                                 #   with the draft label b"ttls keying material" (producing 64 bytes, where first 32 are PMK)
                                 # To maximize compatibility, choose derivation based on negotiated TLS version when available.
                                 try:
-                                    tls_version = None
-                                    if hasattr(session, 'ssl_obj') and session.ssl_obj is not None:
-                                        try:
-                                            tls_version = session.ssl_obj.version()  # e.g., 'TLSv1.2'
-                                        except Exception:
-                                            tls_version = None
-
-                                    # Preferred: if TLS >= 1.2, many clients use the TLS1.2 PRF with 'ttls keying material'
+                                    # Choose PRF based on negotiated TLS version if possible
                                     if tls_version and ('1.2' in tls_version or '1.3' in tls_version):
-                                        # Compute candidate using TLS1.2 PRF + draft label (64 bytes, first 32 used as PMK)
-                                        pmk_candidate = tls_prf_sha256(master_secret, b"ttls keying material", seed, 64)[:32]
-                                        logger.info(f"[EAP-TTLS] TLS negotiated: {tls_version}; deriving PMK using TLS1.2 PRF + 'ttls keying material'")
-                                        logger.debug(f"[EAP-TTLS] PMK candidate (hex start): {pmk_candidate.hex()[:32]}... (len={len(pmk_candidate)})")
-                                        session.master_key = pmk_candidate
+                                        # try TLS1.2 PRF with 'ttls keying material' (64 bytes, first 32 bytes = PMK)
+                                        session.master_key = tls_prf_sha256(master_secret, b"ttls keying material", seed, 64)[:32]
+                                        logger.info("[EAP-TTLS] Fallback: derived PMK via TLS1.2 PRF (keylog input)")
                                     else:
-                                        # Fallback to RFC 5216 behavior (TLS1.0 PRF MD5+SHA1 with 'client EAP encryption')
-                                        pmk_rfc = tls_prf_md5_sha1(master_secret, b"client EAP encryption", seed, 32)
-                                        logger.info(f"[EAP-TTLS] TLS negotiated: {tls_version or 'unknown'}; deriving PMK using RFC method (MD5+SHA1) + 'client EAP encryption'")
-                                        logger.debug(f"[EAP-TTLS] PMK (RFC) (hex start): {pmk_rfc.hex()[:32]}... (len={len(pmk_rfc)})")
-                                        session.master_key = pmk_rfc
+                                        # RFC 5216: TLS1.0 PRF (MD5+SHA1) with 'client EAP encryption'
+                                        session.master_key = tls_prf_md5_sha1(master_secret, b"client EAP encryption", seed, 32)
+                                        logger.info("[EAP-TTLS] Fallback: derived PMK via RFC PRF (keylog input)")
                                 except Exception as e:
                                     logger.warning(f"[EAP-TTLS] PMK derivation failed: {e}")
                                     session.master_key = None
                             else:
                                 logger.warning(f"[EAP-TTLS] Could not parse master secret from keylog file")
                                 session.master_key = None
-                        else:
-                            logger.warning(f"[EAP-TTLS] Keylog file not available")
-                            session.master_key = None
+
+                        if session.master_key is None:
+                            logger.warning("[EAP-TTLS] No SSL exporter and no keylog available to derive keying material")
                     except Exception as e:
                         logger.warning(f"[EAP-TTLS] Could not derive keying material from keylog: {e}")
                         import traceback
@@ -3360,17 +4104,17 @@ def handle_eap_ttls_session(session: EAPTTLSSession, eap_packet: dict, cert_path
                     ttls_data = bytes([flags]) + fragment
 
                 session.identifier = (identifier + 1) % 256
-                return build_eap_packet(EAP_CODE_REQUEST, session.identifier, EAP_TYPE_TTLS, ttls_data)
+                return build_eap_packet(EAP_CODE_REQUEST, session.identifier, session_eap_type, ttls_data)
 
             # If handshake complete and no data to send, send empty ACK to prompt client for inner auth
             if handshake_complete:
                 logger.debug(f"[EAP-TTLS] Handshake complete, waiting for inner auth")
                 session.identifier = (identifier + 1) % 256
-                return build_eap_packet(EAP_CODE_REQUEST, session.identifier, EAP_TYPE_TTLS, bytes([0]))
+                return build_eap_packet(EAP_CODE_REQUEST, session.identifier, session_eap_type, bytes([0]))
 
             # Still in handshake but no data ready - send ACK to get more data
             session.identifier = (identifier + 1) % 256
-            return build_eap_packet(EAP_CODE_REQUEST, session.identifier, EAP_TYPE_TTLS, bytes([0]))
+            return build_eap_packet(EAP_CODE_REQUEST, session.identifier, session_eap_type, bytes([0]))
 
         except Exception as e:
             import traceback
@@ -3379,27 +4123,75 @@ def handle_eap_ttls_session(session: EAPTTLSSession, eap_packet: dict, cert_path
             logger.error(f"[EAP-TTLS] Session state: {session.state}, buffer size: {len(session.tls_in_buffer)}")
             return build_eap_packet(EAP_CODE_FAILURE, identifier)
 
-    # State: Inside TLS tunnel - handle inner PAP authentication
-    elif session.state == 'TTLS_TUNNEL' and eap_type == EAP_TYPE_TTLS:
+    # State: Inside TLS tunnel - handle inner authentication (PAP for TTLS, MSCHAPv2 for PEAP)
+    elif session.state == 'TTLS_TUNNEL' and eap_type == session_eap_type:
         if len(eap_data) < 1:
             return build_eap_packet(EAP_CODE_FAILURE, identifier)
 
         flags = eap_data[0]
         tls_data = eap_data[1:]
 
+        # If client sent empty ACK after TLS handshake, prompt for inner auth
+        if not tls_data or len(tls_data) == 0:
+            logger.debug(f"[{session.eap_method}] Received empty ACK, prompting for inner authentication")
+
+            # For PEAP, send encrypted inner EAP-Request-Identity
+            if session.eap_method == 'PEAP':
+                # Build inner EAP-Request-Identity
+                inner_identifier = 0  # Start inner EAP at identifier 0
+                inner_eap = build_eap_packet(EAP_CODE_REQUEST, inner_identifier, EAP_TYPE_IDENTITY, b'')
+
+                # For PEAPv0, strip the EAP header and only send Type + Data
+                # inner_eap format: Code(1) + ID(1) + Length(2) + Type(1) + Data
+                peapv0_data = inner_eap[4:]  # Skip code, id, length - keep Type + Data
+                logger.debug(f"[PEAP] Initial PEAPv0 inner data (Type+Data): {peapv0_data.hex()}")
+
+                # Encrypt it through TLS tunnel
+                session.ssl_obj.write(peapv0_data)
+                encrypted_data = session.bio_out.read()
+
+                # Send as PEAP packet with encrypted inner EAP
+                session.identifier = (identifier + 1) % 256
+                peap_data = bytes([0]) + encrypted_data  # flags=0 + TLS data
+                logger.debug(f"[PEAP] Sending encrypted inner EAP-Request-Identity (len={len(encrypted_data)})")
+                return build_eap_packet(EAP_CODE_REQUEST, session.identifier, session_eap_type, peap_data)
+            else:
+                # For TTLS, just send empty request to prompt for AVP data
+                session.identifier = (identifier + 1) % 256
+                return build_eap_packet(EAP_CODE_REQUEST, session.identifier, session_eap_type, bytes([0]))
+
         try:
             # Feed encrypted data to SSL
             session.bio_in.write(tls_data)
 
             # Read decrypted inner authentication
-            inner_data = session.ssl_obj.read(4096)
+            # For PEAP, we need to read all available data from the TLS stream
+            inner_data = b''
+            while True:
+                try:
+                    chunk = session.ssl_obj.read(4096)
+                    if chunk:
+                        inner_data += chunk
+                    else:
+                        break
+                except ssl.SSLWantReadError:
+                    # No more data available
+                    break
+
+            logger.debug(f"[{session.eap_method}] Read {len(inner_data)} bytes from TLS tunnel")
 
             if inner_data:
-                # Parse inner PAP authentication (AVP format)
-                # AVP: Code(1) + Identifier(1) + Length(2) + Type(1) + Data
-                username, password = parse_pap_avp(inner_data)
+                # Handle different inner protocols based on EAP method
+                if session.eap_method == 'PEAP':
+                    # PEAP uses inner EAP with MSCHAPv2
+                    return handle_peap_inner_auth(session, inner_data, identifier, settings)
+                else:
+                    # TTLS uses AVP format with PAP
+                    # Parse inner PAP authentication (AVP format)
+                    # AVP: Code(1) + Identifier(1) + Length(2) + Type(1) + Data
+                    username, password = parse_pap_avp(inner_data)
 
-                logger.debug(f"[EAP-TTLS] Parsed AVP: username={username}, password={password}")
+                    logger.debug(f"[EAP-TTLS] Parsed AVP: username={username}, password={password}")
 
                 if username and password:
                     logger.info(f"[EAP-TTLS] Inner PAP auth: username={username}, password_len={len(password)}")
@@ -3460,6 +4252,208 @@ def handle_eap_ttls_session(session: EAPTTLSSession, eap_packet: dict, cert_path
 
     # Unknown state/type
     return build_eap_packet(EAP_CODE_FAILURE, identifier)
+
+def handle_peap_inner_auth(session: EAPTTLSSession, inner_data: bytes, outer_identifier: int, settings: dict) -> bytes:
+    """
+    Handle PEAP inner EAP-MSCHAPv2 authentication
+    Returns EAP response packet
+    """
+    # Debug log the received inner data
+    logger.debug(f"[PEAP] Received inner data (len={len(inner_data)}): {inner_data.hex()}")
+
+    # PEAP version 0 (PEAPv0) strips the EAP header and only sends Type + Data
+    # We need to reconstruct the full EAP packet
+    # Format received: Type (1 byte) + Data (variable)
+    # Format needed: Code (1) + Identifier (1) + Length (2) + Type (1) + Data
+    if len(inner_data) >= 1:
+        inner_type = inner_data[0]
+        inner_data_payload = inner_data[1:]
+
+        # Reconstruct full EAP packet (assume it's a Response with identifier 0)
+        # We'll extract the real identifier from the outer packet context
+        eap_length = 5 + len(inner_data_payload)  # header (5 bytes) + data
+        reconstructed_eap = struct.pack('!BBH', EAP_CODE_RESPONSE, 0, eap_length) + inner_data
+
+        logger.debug(f"[PEAP] Reconstructed EAP packet from PEAPv0 format: {reconstructed_eap.hex()}")
+
+        # Parse the reconstructed packet
+        inner_eap = parse_eap_packet(reconstructed_eap)
+    else:
+        inner_eap = None
+
+    if not inner_eap:
+        logger.error(f"[PEAP] Invalid inner EAP packet (len={len(inner_data)}) - full data: {inner_data.hex()}")
+        return build_eap_packet(EAP_CODE_FAILURE, outer_identifier)
+
+    inner_type = inner_eap.get('type')
+    inner_data_payload = inner_eap.get('data', b'')
+    inner_identifier = inner_eap['identifier']
+
+    # Handle EAP-Identity (inner)
+    if inner_type == EAP_TYPE_IDENTITY:
+        session.username = inner_data_payload.decode('utf-8', errors='ignore')
+        logger.info(f"[PEAP] Inner identity: {session.username}")
+
+        # Generate MSCHAPv2 Challenge
+        session.mschapv2_challenge = secrets.token_bytes(16)
+        session.mschapv2_ident = (inner_identifier + 1) % 256
+
+        # Build MSCHAPv2 Challenge packet
+        # MSCHAPv2 OpCode: 1=Challenge
+        mschap_challenge = struct.pack('!BB', 1, session.mschapv2_ident)  # OpCode, MS-CHAPv2-ID
+        mschap_challenge += struct.pack('!H', 10 + len(session.mschapv2_challenge))  # MS-Length
+        mschap_challenge += bytes([len(session.mschapv2_challenge)])  # Value-Size
+        mschap_challenge += session.mschapv2_challenge  # Challenge
+        mschap_challenge += b'CaddyMAN'  # Name (server name)
+
+        # Wrap in inner EAP packet (EAP Type 26 = EAP-MSCHAPv2)
+        inner_eap_response = build_eap_packet(EAP_CODE_REQUEST, session.mschapv2_ident, 26, mschap_challenge)
+
+        # For PEAPv0, strip the EAP header (code, id, length) and only send Type + Data
+        # inner_eap_response format: Code(1) + ID(1) + Length(2) + Type(1) + Data
+        peapv0_data = inner_eap_response[4:]  # Skip first 4 bytes (code, id, length)
+        logger.debug(f"[PEAP] Sending PEAPv0 inner data (Type+Data): {peapv0_data[:20].hex()}...")
+
+        # Encrypt and send through TLS tunnel
+        session.ssl_obj.write(peapv0_data)
+        tls_response = session.bio_out.read(4096)
+
+        # Build outer EAP-PEAP packet
+        flags = 0
+        peap_data = bytes([flags]) + tls_response
+        return build_eap_packet(EAP_CODE_REQUEST, outer_identifier, EAP_TYPE_PEAP, peap_data)
+
+    # Handle EAP-MSCHAPv2 Response
+    elif inner_type == 26:  # EAP-MSCHAPv2
+        if len(inner_data_payload) < 5:
+            logger.error("[PEAP] MSCHAPv2 packet too short")
+            return build_eap_packet(EAP_CODE_FAILURE, outer_identifier)
+
+        opcode = inner_data_payload[0]
+        mschap_id = inner_data_payload[1]
+        ms_length = struct.unpack('!H', inner_data_payload[2:4])[0]
+
+        # OpCode 2 = Response
+        if opcode == 2:
+            logger.debug(f"[PEAP] Received MSCHAPv2 Response")
+
+            # Parse MSCHAPv2 Response
+            # Response format: OpCode(1) + MS-CHAPv2-ID(1) + MS-Length(2) + Value-Size(1) + Response(49) + Name(variable)
+            if len(inner_data_payload) < 54:  # Minimum: 5 header + 49 response
+                logger.error("[PEAP] MSCHAPv2 response too short")
+                return build_eap_packet(EAP_CODE_FAILURE, outer_identifier)
+
+            value_size = inner_data_payload[4]
+            if value_size != 49:
+                logger.error(f"[PEAP] Invalid MSCHAPv2 response size: {value_size}")
+                return build_eap_packet(EAP_CODE_FAILURE, outer_identifier)
+
+            # Extract response components
+            peer_challenge = inner_data_payload[5:21]  # 16 bytes
+            reserved = inner_data_payload[21:29]  # 8 bytes (should be zero)
+            nt_response = inner_data_payload[29:53]  # 24 bytes
+            flags_byte = inner_data_payload[53]
+
+            # Extract username from Name field
+            username_bytes = inner_data_payload[54:ms_length]
+            username = username_bytes.decode('utf-8', errors='ignore')
+
+            logger.info(f"[PEAP] MSCHAPv2 auth for user: {username}")
+
+            # Authenticate user
+            user = get_user_by_username_from_db(username)
+            if not user:
+                logger.warning(f"[PEAP] User not found: {username}")
+                return build_eap_packet(EAP_CODE_FAILURE, outer_identifier)
+
+            # Check security policies
+            allowed_groups = settings.get('radius_allowed_groups', [])
+            if allowed_groups:
+                user_groups = user.get('groups', [])
+                if not any(group in allowed_groups for group in user_groups):
+                    logger.warning(f"[PEAP] User not in allowed groups: {username}")
+                    return build_eap_packet(EAP_CODE_FAILURE, outer_identifier)
+
+            if user.get('is_admin', False):
+                logger.warning(f"[PEAP] Admin user blocked: {username}")
+                return build_eap_packet(EAP_CODE_FAILURE, outer_identifier)
+
+            # Verify MSCHAPv2 response using WiFi password NT hash
+            wifi_password_hash = user.get('wifi_password_hash')
+            if not wifi_password_hash:
+                logger.warning(f"[PEAP] User {username} has no WiFi password configured")
+                return build_eap_packet(EAP_CODE_FAILURE, outer_identifier)
+
+            try:
+                # Decrypt the NT hash
+                nt_hash = decrypt_wifi_password_hash(wifi_password_hash)
+
+                # Verify the MSCHAPv2 response
+                is_valid, auth_response_string = verify_mschapv2_response(
+                    nt_hash,
+                    session.mschapv2_challenge,
+                    peer_challenge,
+                    username,
+                    nt_response
+                )
+
+                if not is_valid:
+                    logger.warning(f"[PEAP] MSCHAPv2 verification FAILED for {username}")
+                    return build_eap_packet(EAP_CODE_FAILURE, outer_identifier)
+
+                logger.info(f"[PEAP] MSCHAPv2 verification SUCCESS for {username}")
+                session.authenticated = True
+                session.username = username
+
+            except Exception as e:
+                logger.error(f"[PEAP] MSCHAPv2 verification error: {e}")
+                return build_eap_packet(EAP_CODE_FAILURE, outer_identifier)
+
+            # Send MSCHAPv2 Success message with proper authenticator response
+            auth_string = auth_response_string.encode('ascii')
+            mschap_success = struct.pack('!BB', 3, mschap_id)  # OpCode 3 = Success, MS-CHAPv2-ID
+            mschap_success += struct.pack('!H', 4 + len(auth_string))  # MS-Length
+            mschap_success += auth_string
+
+            # Wrap in EAP-Request-MSCHAPv2 (Type 26)
+            # Use the same MSCHAPv2 identifier we used for challenge
+            inner_mschap_eap = build_eap_packet(EAP_CODE_REQUEST, session.mschapv2_ident, 26, mschap_success)
+
+            # For PEAPv0, strip the EAP header (code, id, length) and only send Type + Type-Data
+            peapv0_mschap = inner_mschap_eap[4:]  # Skip first 4 bytes (code, id, length)
+            logger.debug(f"[PEAP] Full EAP packet: {inner_mschap_eap.hex()}")
+            logger.debug(f"[PEAP] Sending PEAPv0 MSCHAPv2 success (Type+Data, len={len(peapv0_mschap)}): {peapv0_mschap.hex()}")
+
+            # Encrypt and send through TLS tunnel
+            session.ssl_obj.write(peapv0_mschap)
+            tls_response = session.bio_out.read(4096)
+
+            # Send outer EAP-PEAP Request with encrypted MSCHAPv2 success
+            if tls_response:
+                flags = 0
+                peap_data = bytes([flags]) + tls_response
+                session.identifier = (outer_identifier + 1) % 256
+                # Mark that we're waiting for MSCHAPv2 success acknowledgment
+                session.awaiting_mschapv2_ack = True
+                return build_eap_packet(EAP_CODE_REQUEST, session.identifier, EAP_TYPE_PEAP, peap_data)
+            else:
+                logger.error("[PEAP] No TLS response after MSCHAPv2 success")
+                return build_eap_packet(EAP_CODE_FAILURE, outer_identifier)
+
+    # Handle EAP-NAK (type 3) - client rejecting further authentication
+    # If session is already authenticated (MSCHAPv2 succeeded), NAK means client is done
+    if inner_type == 3:  # EAP-NAK
+        if session.authenticated:
+            logger.info(f"[PEAP] Received NAK after authentication - client wants to finish")
+            # Client is indicating it's done with inner auth, send outer EAP-Success
+            logger.info(f"[PEAP] Authentication SUCCESS for {session.username}")
+            return build_eap_packet(EAP_CODE_SUCCESS, outer_identifier)
+        else:
+            logger.error("[PEAP] Received NAK before authentication complete")
+            return build_eap_packet(EAP_CODE_FAILURE, outer_identifier)
+
+    logger.error(f"[PEAP] Unhandled inner EAP type: {inner_type}")
+    return build_eap_packet(EAP_CODE_FAILURE, outer_identifier)
 
 def parse_pap_avp(data: bytes) -> tuple:
     """
@@ -3540,21 +4534,29 @@ async def handle_eap_radius_request(packet: dict, addr, server, settings: dict):
 
     # Get or create EAP session
     if session_id not in eap_sessions:
-        eap_sessions[session_id] = EAPTTLSSession(session_id)
-        logger.info(f"[EAP] New session created: {session_id}")
+        # Use configured EAP method from settings (default to TTLS for backward compatibility)
+        configured_method = settings.get('radius_eap_method', 'TTLS')
+        if configured_method == 'PEAP':
+            eap_method = 'PEAP'
+        else:
+            eap_method = 'TTLS'
+
+        eap_sessions[session_id] = EAPTTLSSession(session_id, eap_method)
+        logger.info(f"[EAP] New {eap_method} session created: {session_id}")
 
     session = eap_sessions[session_id]
 
-    # Handle EAP-TTLS state machine
+    # Handle EAP-TTLS or EAP-PEAP state machine
     eap_response = handle_eap_ttls_session(session, eap_packet, cert_path, key_path, settings)
 
     # Check if authentication is complete
     if eap_response[0] == EAP_CODE_SUCCESS:
         # Authentication successful - send Access-Accept
-        logger.info(f"[EAP-TTLS] Authentication SUCCESS for {session.username}")
+        method_label = session.eap_method
+        logger.info(f"[{method_label}] Authentication SUCCESS for {session.username}")
 
         # Log activity
-        await log_activity(session.username, "RADIUS_AUTH_SUCCESS", "EAP-TTLS authentication successful", f"RADIUS:{addr[0]}")
+        await log_activity(session.username, "RADIUS_AUTH_SUCCESS", f"{method_label} authentication successful", f"RADIUS:{addr[0]}")
 
         # Build Access-Accept with EAP-Success and MPPE keys
         response_attrs = []
@@ -3570,15 +4572,15 @@ async def handle_eap_radius_request(packet: dict, addr, server, settings: dict):
             # MS-MPPE-Send-Key = Also use PMK (some implementations expect both)
             mppe_recv_key = session.master_key  # This is the PMK
             mppe_send_key = session.master_key  # Use same key for both
-            logger.info(f"[EAP-TTLS] Using derived PMK from TLS keying material")
-            logger.debug(f"[EAP-TTLS] PMK (MS-MPPE-Recv-Key) (hex start): {mppe_recv_key.hex()[:32]}... (len={len(mppe_recv_key)})")
-            logger.debug(f"[EAP-TTLS] MS-MPPE-Send-Key (hex start): {mppe_send_key.hex()[:32]}... (len={len(mppe_send_key)})")
+            logger.info(f"[{method_label}] Using derived PMK from TLS keying material")
+            logger.debug(f"[{method_label}] PMK (MS-MPPE-Recv-Key) (hex start): {mppe_recv_key.hex()[:32]}... (len={len(mppe_recv_key)})")
+            logger.debug(f"[{method_label}] MS-MPPE-Send-Key (hex start): {mppe_send_key.hex()[:32]}... (len={len(mppe_send_key)})")
         else:
             # Fallback to random keys if keying material not available
             import secrets
             mppe_send_key = secrets.token_bytes(32)
             mppe_recv_key = secrets.token_bytes(32)
-            logger.warning(f"[EAP-TTLS] Using random MPPE keys (keying material unavailable)")
+            logger.warning(f"[{method_label}] Using random MPPE keys (keying material unavailable)")
 
         # Add MS-MPPE keys as vendor-specific attributes (RFC 2548)
         # Vendor ID: 311 (Microsoft)
@@ -3661,32 +4663,35 @@ async def handle_eap_radius_request(packet: dict, addr, server, settings: dict):
         response = build_radius_response(2, identifier, authenticator, secret, response_attrs)
         server.sendto(response, addr)
 
-        # Clean up session and temporary files
-        if session.keylog_file and os.path.exists(session.keylog_file.name):
-            try:
-                os.unlink(session.keylog_file.name)
-                logger.debug(f"[EAP-TTLS] Cleaned up keylog file: {session.keylog_file.name}")
-            except Exception as e:
-                logger.warning(f"[EAP-TTLS] Failed to cleanup keylog file: {e}")
+        # Clean up session and temporary files (if not already deleted)
+        if session.keylog_file:
+            if hasattr(session.keylog_file, 'name') and os.path.exists(session.keylog_file.name):
+                try:
+                    os.unlink(session.keylog_file.name)
+                    logger.debug(f"[EAP-TTLS] Cleaned up keylog file: {session.keylog_file.name}")
+                except Exception as e:
+                    logger.debug(f"[EAP-TTLS] Keylog file already cleaned up or inaccessible: {e}")
         del eap_sessions[session_id]
 
     elif eap_response[0] == EAP_CODE_FAILURE:
         # Authentication failed - send Access-Reject
-        logger.warning(f"[EAP-TTLS] Authentication FAILED for session {session_id}")
+        method_label = session.eap_method if hasattr(session, 'eap_method') else 'EAP'
+        logger.warning(f"[{method_label}] Authentication FAILED for session {session_id}")
 
         response_attrs = [(79, eap_response)]
         response = build_radius_response(3, identifier, authenticator, secret, response_attrs)
         server.sendto(response, addr)
 
-        # Clean up session and temporary files
+        # Clean up session and temporary files (if not already deleted)
         if session_id in eap_sessions:
             session = eap_sessions[session_id]
-            if session.keylog_file and os.path.exists(session.keylog_file.name):
-                try:
-                    os.unlink(session.keylog_file.name)
-                    logger.debug(f"[EAP-TTLS] Cleaned up keylog file: {session.keylog_file.name}")
-                except Exception as e:
-                    logger.warning(f"[EAP-TTLS] Failed to cleanup keylog file: {e}")
+            if session.keylog_file:
+                if hasattr(session.keylog_file, 'name') and os.path.exists(session.keylog_file.name):
+                    try:
+                        os.unlink(session.keylog_file.name)
+                        logger.debug(f"[EAP-TTLS] Cleaned up keylog file: {session.keylog_file.name}")
+                    except Exception as e:
+                        logger.debug(f"[EAP-TTLS] Keylog file already cleaned up or inaccessible: {e}")
             del eap_sessions[session_id]
 
     else:
@@ -4122,6 +5127,12 @@ async def send_email(to: str, subject: str, body: str):
         logger.warning("SMTP not enabled, email not sent")
         return False
 
+    smtp_server = settings.get('smtp_server', '')
+    smtp_port = settings.get('smtp_port', 587)
+    smtp_username = settings.get('smtp_username', '')
+    smtp_password = settings.get('smtp_password', '')
+    use_tls_setting = settings.get('smtp_use_tls', True)
+
     try:
         message = EmailMessage()
         message["From"] = f"{settings.get('smtp_from_name', 'CaddyIAM')} <{settings.get('smtp_from_address', 'noreply@example.com')}>"
@@ -4129,19 +5140,38 @@ async def send_email(to: str, subject: str, body: str):
         message["Subject"] = subject
         message.set_content(body)
 
-        await aiosmtplib.send(
-            message,
-            hostname=settings.get('smtp_server', ''),
-            port=settings.get('smtp_port', 587),
-            use_tls=settings.get('smtp_use_tls', True),
-            username=settings.get('smtp_username', ''),
-            password=settings.get('smtp_password', '')
-        )
+        logger.info(f"Attempting to send email via {smtp_server}:{smtp_port} (TLS: {use_tls_setting}, User: {smtp_username[:3]}***)")
 
-        logger.info(f"Email sent to {to}: {subject}")
+        # Use SMTP client directly for better control
+        if smtp_port == 465:
+            # Implicit TLS/SSL
+            logger.debug(f"Using implicit TLS (port 465)")
+            smtp = aiosmtplib.SMTP(hostname=smtp_server, port=smtp_port, use_tls=True, timeout=30)
+        else:
+            # STARTTLS (port 587) or plain (port 25)
+            logger.debug(f"Using STARTTLS (port {smtp_port})")
+            smtp = aiosmtplib.SMTP(hostname=smtp_server, port=smtp_port, timeout=30)
+
+        await smtp.connect()
+
+        # STARTTLS if needed and not already using TLS
+        if smtp_port != 465 and use_tls_setting:
+            await smtp.starttls()
+
+        # Login with credentials
+        if smtp_username and smtp_password:
+            logger.debug(f"Authenticating as {smtp_username}")
+            await smtp.login(smtp_username, smtp_password)
+
+        # Send the message
+        await smtp.send_message(message)
+        await smtp.quit()
+
+        logger.info(f"Email sent successfully to {to}: {subject}")
         return True
     except Exception as e:
-        logger.error(f"Failed to send email: {e}")
+        logger.error(f"Failed to send email to {to}: {type(e).__name__}: {e}")
+        logger.error(f"SMTP config: server={smtp_server}, port={smtp_port}, TLS={use_tls_setting}, user={smtp_username[:3] if smtp_username else '(none)'}***")
         return False
 
 async def send_user_invite(user_id: str):
@@ -4196,12 +5226,13 @@ async def send_password_reset(user_id: str):
 
     # Build reset email
     settings = get_settings_from_db()
+    org_name = settings.get('organization_name', 'CaddyMAN')
     reset_url = f"{settings.get('oidc_issuer', 'http://localhost:12888')}/reset-password?token={reset_token}"
 
-    subject = "Password Reset Request"
+    subject = f"{org_name} Password Reset Request"
     body = f"""Hello {user.get('first_name', user.get('username'))},
 
-A password reset was requested for your account.
+A password reset was requested for your {org_name} account.
 
 Reset your password: {reset_url}
 
@@ -4210,17 +5241,20 @@ This link expires in 1 hour.
 If you didn't request this, please ignore this email.
 
 Best regards,
-CaddyIAM Team
+{org_name} Team
 """
 
     return await send_email(user['email'], subject, body)
 
 async def send_invite_email(email: str, username: str, invite_url: str, expiry_hours: int):
     """Send invite link email to new user"""
-    subject = "You've been invited to CaddyMAN"
+    settings = get_settings_from_db()
+    org_name = settings.get('organization_name', 'CaddyMAN')
+
+    subject = f"You've been invited to {org_name}"
     body = f"""Hello,
 
-You've been invited to create an account on CaddyMAN.
+You've been invited to create an account on {org_name}.
 
 Username: {username}
 
@@ -4229,16 +5263,19 @@ Set up your account: {invite_url}
 This link expires in {expiry_hours} hour{'s' if expiry_hours != 1 else ''}.
 
 Best regards,
-CaddyMAN Team
+{org_name} Team
 """
     return await send_email(email, subject, body)
 
 async def send_password_reset_email(email: str, username: str, reset_url: str, expiry_hours: int):
     """Send password reset email to user"""
-    subject = "CaddyMAN Password Reset Request"
+    settings = get_settings_from_db()
+    org_name = settings.get('organization_name', 'CaddyMAN')
+
+    subject = f"{org_name} Password Reset Request"
     body = f"""Hello {username},
 
-You have requested to reset your password for your CaddyMAN account.
+You have requested to reset your password for your {org_name} account.
 
 Click the link below to reset your password:
 {reset_url}
@@ -4248,7 +5285,7 @@ This link expires in {expiry_hours} hour{'s' if expiry_hours != 1 else ''}.
 If you did not request this password reset, please ignore this email and your password will remain unchanged.
 
 Best regards,
-CaddyMAN Team
+{org_name} Team
 """
     return await send_email(email, subject, body)
 
@@ -4860,6 +5897,32 @@ async def periodic_update_check():
 # API Endpoints
 @app.get("/", response_class=HTMLResponse)
 async def root():
+    """Root endpoint - behavior depends on admin_path_mode setting"""
+    settings = get_settings_from_db()
+
+    # If admin_path_mode is enabled, redirect to user portal login
+    if settings.get('admin_path_mode', False):
+        return RedirectResponse(url="/user-portal")
+
+    # Default behavior: serve admin interface
+    index_path = resource_path("app/index.html")
+    with open(index_path, "r", encoding="utf-8") as f:
+        html_content = f.read()
+        html_content = html_content.replace('""" + VERSION + """', VERSION)
+    return HTMLResponse(content=html_content)
+
+@app.get("/admin", response_class=HTMLResponse)
+async def admin_page():
+    """Admin interface endpoint - serves admin UI when admin_path_mode is enabled"""
+    settings = get_settings_from_db()
+
+    # Only serve admin interface if admin_path_mode is enabled
+    # Otherwise, this route is not used (admin is at root)
+    if not settings.get('admin_path_mode', False):
+        # If admin_path_mode is disabled, / serves the admin interface
+        raise HTTPException(status_code=404, detail="Not found")
+
+    # Serve admin interface
     index_path = resource_path("app/index.html")
     with open(index_path, "r", encoding="utf-8") as f:
         html_content = f.read()
@@ -4957,11 +6020,12 @@ async def oauth_login(login_data: LoginRequest, request: Request, response: Resp
 
     session_id, csrf_token = create_session(user["id"])
     # Set secure cookie with SameSite=Lax (allows cookie on redirects)
+    # Only set secure=True for non-local access (external/public IPs should use HTTPS)
     response.set_cookie(
         "session_id",
         session_id,
         httponly=True,
-        secure=True,  # Security: Prevent cookie from being sent over HTTP
+        secure=not is_local_request(request),  # True for external access, False for local
         max_age=3*24*60*60,
         samesite="lax"
     )
@@ -5058,11 +6122,12 @@ async def admin_login(login_data: LoginRequest, request: Request, response: Resp
 
     session_id, csrf_token = create_session(user["id"])
     # Set secure cookie with SameSite protection
+    # Only set secure=True for non-local access (external/public IPs should use HTTPS)
     response.set_cookie(
         "session_id",
         session_id,
         httponly=True,
-        secure=True,  # Security: Prevent cookie from being sent over HTTP
+        secure=not is_local_request(request),  # True for external access, False for local
         max_age=3*24*60*60,
         samesite="strict"
     )
@@ -5504,9 +6569,11 @@ async def generate_invite_link(
     }
     save_invite_token_to_db(invite_record)
 
-    # Build invite URL
-    manager_port = settings.get('manager_port', 8000)
-    invite_url = f"http://localhost:{manager_port}/user-portal?token={token}"
+    # Build invite URL using domain_url setting
+    domain_url = settings.get('domain_url', f"http://localhost:{settings.get('manager_port', 8000)}")
+    # Remove trailing slash if present
+    domain_url = domain_url.rstrip('/')
+    invite_url = f"{domain_url}/user-portal?token={token}"
 
     # Send email
     try:
@@ -5526,8 +6593,9 @@ async def generate_invite_link(
 
 @app.get("/user-portal", response_class=HTMLResponse)
 @app.get("/user-portal/", response_class=HTMLResponse)
+@app.get("/login", response_class=HTMLResponse)
 async def user_portal_root():
-    """Serve the user portal HTML"""
+    """Serve the user portal HTML (also accessible via /login for convenience)"""
     portal_path = resource_path("app/user-portal-index.html")
     with open(portal_path, "r", encoding="utf-8") as f:
         return HTMLResponse(content=f.read())
@@ -5574,6 +6642,14 @@ async def get_user_info(session_id: Optional[str] = Cookie(None)):
         "email": full_user.get("email", ""),
         "groups": group_names,
         "totp_enabled": full_user.get("totp_enabled", False)
+    }
+
+@app.get("/api/user-portal/branding")
+async def get_user_portal_branding():
+    """Get public branding information for user portal (no authentication required)"""
+    settings = get_settings_from_db()
+    return {
+        "organization_name": settings.get("organization_name", "CaddyMAN")
     }
 
 @app.get("/api/user-portal/invite/{token}")
@@ -5714,6 +6790,113 @@ async def update_email(email_data: UpdateEmailRequest, request: Request, session
     logger.info(f"User {user.get('username')} updated their email to {email_data.email}")
 
     return {"status": "success", "message": "Email updated successfully"}
+
+# ====================================================================
+# WiFi Password Management API Endpoints
+# ====================================================================
+
+@app.get("/api/user-portal/wifi-password-status")
+async def get_wifi_password_status(session_id: Optional[str] = Cookie(None)):
+    """Check if user has WiFi password configured and if they're eligible"""
+    user = get_session_user(session_id)
+    if not user:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+
+    # Check if PEAP is enabled
+    settings = get_settings_from_db()
+    radius_eap_method = settings.get('radius_eap_method', 'TTLS')
+    peap_enabled = (radius_eap_method == 'PEAP')
+
+    # Check if user is in allowed RADIUS groups
+    # If no groups specified, all users are eligible (matches RADIUS auth logic)
+    allowed_groups = settings.get('radius_allowed_groups', [])
+    user_groups = user.get('groups', [])
+    is_in_radius_group = any(group in allowed_groups for group in user_groups) if allowed_groups else True
+
+    # Check if user has WiFi password configured
+    has_wifi_password = bool(user.get('wifi_password_hash'))
+
+    return {
+        "has_wifi_password": has_wifi_password,
+        "is_eligible": peap_enabled and is_in_radius_group,
+        "peap_enabled": peap_enabled,
+        "in_radius_group": is_in_radius_group
+    }
+
+class SetWifiPasswordRequest(BaseModel):
+    wifi_password: str = Field(..., min_length=8)
+    account_password: str
+
+@app.post("/api/user-portal/set-wifi-password")
+async def set_wifi_password(wifi_data: SetWifiPasswordRequest, request: Request, session_id: Optional[str] = Cookie(None)):
+    """Set or update WiFi password for RADIUS authentication"""
+    user = get_session_user(session_id)
+    if not user:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+
+    client_ip = request.headers.get("x-forwarded-for", request.client.host if request.client else "unknown")
+    if "," in client_ip:
+        client_ip = client_ip.split(",")[0].strip()
+
+    # Check eligibility
+    settings = get_settings_from_db()
+    radius_eap_method = settings.get('radius_eap_method', 'TTLS')
+    if radius_eap_method != 'PEAP':
+        raise HTTPException(status_code=403, detail="WiFi password feature is only available when PEAP is enabled")
+
+    allowed_groups = settings.get('radius_allowed_groups', [])
+    user_groups = user.get('groups', [])
+    if allowed_groups and not any(group in allowed_groups for group in user_groups):
+        raise HTTPException(status_code=403, detail="You are not in a RADIUS-allowed group")
+
+    # Verify account password
+    if not verify_password(wifi_data.account_password, user.get('password_hash', '')):
+        await log_activity(user.get('username'), "WIFI_PASSWORD_SET_FAILED", "Incorrect account password", client_ip)
+        raise HTTPException(status_code=401, detail="Account password is incorrect")
+
+    # Validate WiFi password
+    if len(wifi_data.wifi_password) < 8:
+        raise HTTPException(status_code=400, detail="WiFi password must be at least 8 characters")
+
+    # Check that WiFi password is different from account password
+    if verify_password(wifi_data.wifi_password, user.get('password_hash', '')):
+        raise HTTPException(status_code=400, detail="WiFi password must be different from your account password")
+
+    # Encrypt and store WiFi password
+    try:
+        encrypted_hash = encrypt_wifi_password(wifi_data.wifi_password)
+        user['wifi_password_hash'] = encrypted_hash
+        save_user_to_db(user)
+
+        # Log activity
+        await log_activity(user.get('username'), "WIFI_PASSWORD_SET", "WiFi password configured", client_ip)
+        logger.info(f"User {user.get('username')} set their WiFi password")
+
+        return {"status": "success", "message": "WiFi password set successfully"}
+    except Exception as e:
+        logger.error(f"Error setting WiFi password: {e}")
+        raise HTTPException(status_code=500, detail="Failed to set WiFi password")
+
+@app.delete("/api/user-portal/delete-wifi-password")
+async def delete_wifi_password(request: Request, session_id: Optional[str] = Cookie(None)):
+    """Delete WiFi password"""
+    user = get_session_user(session_id)
+    if not user:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+
+    client_ip = request.headers.get("x-forwarded-for", request.client.host if request.client else "unknown")
+    if "," in client_ip:
+        client_ip = client_ip.split(",")[0].strip()
+
+    # Remove WiFi password
+    user['wifi_password_hash'] = None
+    save_user_to_db(user)
+
+    # Log activity
+    await log_activity(user.get('username'), "WIFI_PASSWORD_DELETED", "WiFi password removed", client_ip)
+    logger.info(f"User {user.get('username')} deleted their WiFi password")
+
+    return {"status": "success", "message": "WiFi password deleted successfully"}
 
 @app.post("/api/user-portal/enable-2fa")
 async def enable_2fa_for_user(request: Request, session_id: Optional[str] = Cookie(None)):
@@ -5867,9 +7050,11 @@ async def request_password_reset(reset_request: RequestPasswordResetRequest, req
         }
         save_password_reset_token_to_db(reset_token)
 
-        # Build reset URL
-        manager_port = settings.get('manager_port', 8000)
-        reset_url = f"http://localhost:{manager_port}/user-portal?reset_token={token}"
+        # Build reset URL using domain_url setting
+        domain_url = settings.get('domain_url', f"http://localhost:{settings.get('manager_port', 8000)}")
+        # Remove trailing slash if present
+        domain_url = domain_url.rstrip('/')
+        reset_url = f"{domain_url}/user-portal?reset_token={token}"
 
         # Send email
         try:
@@ -6805,6 +7990,72 @@ async def update_settings(settings: Settings, request: Request, session_id: Opti
         await reload_caddy()
 
     return {"status": "updated"}
+
+@app.post("/api/smtp/test-email")
+async def send_smtp_test_email(request: Request, session_id: Optional[str] = Cookie(None)):
+    """Send a test email to all admin users to verify SMTP configuration"""
+    user = get_session_user(session_id)
+    if not user:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+    require_csrf(request, session_id)
+
+    # Get SMTP settings
+    settings = get_settings_from_db()
+    if not settings.get("smtp_enabled", False):
+        raise HTTPException(status_code=400, detail="SMTP is not enabled. Please enable and configure SMTP first.")
+
+    # Get all admin users with email addresses
+    all_users = get_all_users_from_db()
+    admin_emails = []
+    for u in all_users:
+        if "admin_group" in u.get("groups", []) and u.get("email"):
+            admin_emails.append((u["username"], u["email"]))
+
+    if not admin_emails:
+        raise HTTPException(status_code=400, detail="No admin users with email addresses found. Please add email addresses to admin accounts.")
+
+    # Send test email to each admin
+    success_count = 0
+    failed_emails = []
+
+    for username, email in admin_emails:
+        result = await send_email(
+            to=email,
+            subject="CaddyMAN SMTP Test Email",
+            body=f"""Hello {username},
+
+This is a test email from CaddyMAN to verify your SMTP configuration is working correctly.
+
+If you received this email, your SMTP settings are configured properly!
+
+Server Details:
+- SMTP Server: {settings.get('smtp_server', 'N/A')}
+- Port: {settings.get('smtp_port', 'N/A')}
+- TLS: {'Enabled' if settings.get('smtp_use_tls', False) else 'Disabled'}
+- From: {settings.get('smtp_from_name', 'CaddyIAM')} <{settings.get('smtp_from_address', 'N/A')}>
+
+---
+CaddyMAN v{VERSION}
+"""
+        )
+
+        if result:
+            success_count += 1
+            logger.info(f"Test email sent successfully to {username} ({email})")
+        else:
+            failed_emails.append(f"{username} ({email})")
+
+    if success_count == 0:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to send test emails. Check SMTP configuration. Failed recipients: {', '.join(failed_emails)}"
+        )
+
+    result_message = f"Test email sent successfully to {success_count} admin(s)"
+    if failed_emails:
+        result_message += f". Failed: {', '.join(failed_emails)}"
+
+    return {"status": "success", "message": result_message, "sent": success_count, "failed": len(failed_emails)}
 
 @app.get("/api/proxies")
 async def get_proxies(session_id: Optional[str] = Cookie(None)):

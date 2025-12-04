@@ -231,6 +231,28 @@
                         </div>
                     </div>
                     <div class="card">
+                        <h3>Branding & Domain</h3>
+                        <div class="form-group">
+                            <label>Organization Name</label>
+                            <input type="text" id="organization-name" placeholder="CaddyMAN" value="CaddyMAN">
+                            <small style="color: var(--text-secondary); font-size: 12px;">Used in email templates and user-facing messages</small>
+                        </div>
+                        <div class="form-group">
+                            <label>Domain URL</label>
+                            <input type="text" id="domain-url" placeholder="http://localhost:8000" value="http://localhost:8000">
+                            <small style="color: var(--text-secondary); font-size: 12px;">Public URL for invite/reset links (e.g., https://users.mydomain.nz)</small>
+                        </div>
+                        <div class="form-group">
+                            <div class="checkbox-wrapper">
+                                <input type="checkbox" id="admin-path-mode">
+                                <label>Admin Path Mode</label>
+                            </div>
+                            <small style="color: var(--text-secondary); font-size: 12px; display: block; margin-top: 5px;">
+                                When enabled: Admin interface at /admin, User portal login at / (root). When disabled: Current behavior (Admin at /, User portal at /user-portal)
+                            </small>
+                        </div>
+                    </div>
+                    <div class="card">
                         <h3>Health Check</h3>
                         <div class="form-group">
                             <div class="checkbox-wrapper">
@@ -506,7 +528,7 @@
             <!-- Authentication & IAM -->
             <div class="card" style="margin-bottom: 20px;">
                 <h2 style="margin-top: 0; color: var(--accent);">Authentication & Single Sign-On (v1.3.0+)</h2>
-                <p>CaddyIAM provides comprehensive Identity & Access Management (IAM) features with unified Single Sign-On (SSO).</p>
+                <p>CaddyMAN provides comprehensive Identity & Access Management (IAM) features with unified Single Sign-On (SSO).</p>
 
                 <h3 style="color: var(--accent); margin-top: 20px;">Single Sign-On (SSO)</h3>
                 <p><strong>One Login, Access Everything:</strong> When you log into CaddyMAN, you're automatically authenticated for:</p>
@@ -541,8 +563,15 @@
                 <ul style="line-height: 1.8;">
                     <li><strong>Authentication Port:</strong> Default 1812</li>
                     <li><strong>Accounting Port:</strong> Default 1813</li>
-                    <li><strong>Shared Secret:</strong> Configure on both RADIUS server and WiFi access point</li>
-                    <li><strong>EAP Methods:</strong> Choose PAP, PEAP, or TTLS authentication (v1.3.1+)</li>
+                    <li><strong>Shared Secret:</strong> 512-bit random secret (use Generate button) - configure on both RADIUS server and WiFi access point</li>
+                    <li><strong>EAP Methods:</strong>
+                        <ul>
+                            <li><strong>EAP-TTLS:</strong> Most secure with PAP inner authentication (recommended)</li>
+                            <li><strong>PEAP:</strong> Compatible with Windows and enterprise devices using MSCHAPv2</li>
+                            <li><strong>PAP:</strong> Simple but insecure (passwords sent over network, no TLS)</li>
+                        </ul>
+                    </li>
+                    <li><strong>Router Support:</strong> Works with ASUS routers and most WPA2/WPA3-Enterprise capable access points</li>
                     <li><strong>VLAN Assignment:</strong> Dynamically assign VLANs based on user groups</li>
                     <li><strong>Group Filtering:</strong> Control WiFi access by user groups (v1.3.1+)</li>
                     <li><strong>Security:</strong> Rate limiting, admin users blocked from RADIUS access</li>
@@ -772,13 +801,14 @@ rate_limit {
             <!-- Version Information -->
             <div class="card" style="margin-bottom: 20px;">
                 <h2 style="margin-top: 0; color: var(--accent);">Version Information</h2>
-                <p><strong>Current Version:</strong> v1.3.2</p>
+                <p><strong>Current Version:</strong> v1.3.4</p>
 
                 <h3 style="color: var(--accent); margin-top: 20px;">Recent Updates</h3>
                 <ul style="line-height: 1.8;">
-                    <li><strong>v1.3.2:</strong> 🔐 OAuth/OIDC Improvements - Fixed admin-only access enforcement for admin panel; Created separate OAuth login page at /login with clean design; Added /api/user endpoint for user portal; Fixed user portal CSS/JS loading; Implemented proper OIDC logout flow with redirect support; Fixed ID token generation with username as subject claim; Enhanced OAuth token endpoint with form data and HTTP Basic Auth support; Improved session management for OAuth clients</li>
+                    <li><strong>v1.3.4:</strong> 🔒 Security & Features Update - Fixed email field loading in user edit form; Implemented hierarchical LDAP search (support for searching base DN or specific group OUs like ou=wifi,dc=example,dc=com); Fixed OAuth/OIDC client group display; Marked unimplemented EAP methods (PEAP, PAP) as "not done" in UI; Added DEBUG_MODE flag (env: CADDYMAN_DEBUG) to control TLS keylog files; Set secure=True on session cookies; Added return_to URL validation to prevent open redirect attacks; Improved IPv4 validation using ipaddress module</li>
+                    <li><strong>v1.3.3:</strong> 🔐 OAuth/OIDC Improvements - Fixed admin-only access enforcement for admin panel; Created separate OAuth login page at /login with clean design; Added /api/user endpoint for user portal; Fixed user portal CSS/JS loading; Implemented proper OIDC logout flow with redirect support; Fixed ID token generation with username as subject claim; Enhanced OAuth token endpoint with form data and HTTP Basic Auth support; Improved session management for OAuth clients</li>
                     <li><strong>v1.3.1:</strong> 🎉 User Self-Service Portal at /user-portal (change password, update email, manage 2FA); Password Reset via email with 2FA verification; Invite Link System for user onboarding (admin-generated, email-delivered, time-limited); Force 2FA at Group Level (require 2FA for admin panel, LDAP, OIDC access); Email field added to user profiles; Password minimum changed to 4 characters (always enforced); Modern Clipboard API; Comprehensive security enhancements</li>
-                    <li><strong>v1.3.0 - CaddyIAM:</strong> 🎉 MAJOR RELEASE - Added Identity & Access Management (IAM) features: OIDC/OAuth2 Provider for modern apps (Audiobookshelf, etc.), LDAP Server for legacy apps (Emby, etc.), RADIUS Server for WiFi WPA2-Enterprise, SMTP/Email system with invite & password reset, Enhanced user model with email/name fields, Full authentication management UI</li>
+                    <li><strong>v1.3.0 - CaddyMAN:</strong> 🎉 MAJOR RELEASE - Added Identity & Access Management (IAM) features: OIDC/OAuth2 Provider for modern apps (Audiobookshelf, etc.), LDAP Server for legacy apps (Emby, etc.), RADIUS Server for WiFi WPA2-Enterprise, SMTP/Email system with invite & password reset, Enhanced user model with email/name fields, Full authentication management UI</li>
                     <li><strong>v1.2.24:</strong> Fixed Advanced proxy mode validation (domains no longer required when using full Caddy JSON); Added dynamic help page that adapts to platform (Windows/Linux/macOS) and execution mode (script/executable); Improved update system with dashboard UI showing platform-appropriate update buttons; GitHub integration for updates; Platform-aware PHP-CGI paths</li>
                     <li><strong>v1.2.23:</strong> CRITICAL FIX - notification_events settings now persist correctly; Added Custom Headers (JSON) UI for reverse proxies; Enhanced notification system with 26 granular event types; Recent Notifications dashboard widget; Linux compatibility improvements; Removed unused http_port/https_port settings</li>
                     <li><strong>v1.2.22:</strong> CRITICAL FIX - Settings persistence for WebSocket support, Custom Host Headers, Remove Origin/Referer, Custom Headers, Load Balancing; Fixed CSRF token on mobile browsers (tab suspension)</li>
@@ -988,7 +1018,13 @@ rate_limit {
                                 </div>
                                 <div>
                                     <label>Shared Secret:</label>
-                                    <input type="password" id="radius_secret" placeholder="Enter RADIUS shared secret">
+                                    <div style="display: flex; gap: 10px; align-items: center;">
+                                        <input type="password" id="radius_secret" placeholder="Enter RADIUS shared secret" style="flex: 1;">
+                                        <button type="button" class="btn btn-secondary" onclick="generateRadiusSecret()" title="Generate secure 512-bit secret">🎲 Generate</button>
+                                    </div>
+                                    <small style="color: var(--text-secondary); font-size: 12px; display: block; margin-top: 5px;">
+                                        Use the same secret on your WiFi access point. Click Generate for a secure 512-bit random secret.
+                                    </small>
                                 </div>
                                 <div>
                                     <label>
@@ -999,12 +1035,14 @@ rate_limit {
                                 <div>
                                     <label>EAP Method:</label>
                                     <select id="radius_eap_method">
-                                        <option value="PAP">PAP (Password Authentication Protocol)</option>
-                                        <option value="PEAP">PEAP (Protected EAP)</option>
-                                        <option value="TTLS">TTLS (Tunneled TLS)</option>
+                                        <option value="TTLS" selected>EAP-TTLS (Tunneled TLS with PAP)</option>
+                                        <option value="PEAP">PEAP (MSCHAPv2)</option>
+                                        <option value="PAP">PAP (insecure, no EAP)</option>
                                     </select>
                                     <small style="color: var(--text-secondary); font-size: 12px; display: block; margin-top: 5px;">
-                                        Select the authentication method. PAP sends passwords in encrypted form, PEAP and TTLS provide additional TLS encryption.
+                                        <strong>EAP-TTLS:</strong> Most secure, supported by most modern devices.<br>
+                                        <strong>PEAP:</strong> Compatible with Windows and many enterprise devices.<br>
+                                        <strong>PAP:</strong> Simple but insecure (passwords sent over network).
                                     </small>
                                 </div>
                                 <div style="grid-column: 1 / -1;">
@@ -1055,7 +1093,15 @@ rate_limit {
                                 </div>
                                 <div>
                                     <label>From Name:</label>
-                                    <input type="text" id="smtp_from_name" value="CaddyIAM">
+                                    <input type="text" id="smtp_from_name" value="CaddyMAN">
+                                </div>
+                                <div>
+                                    <button type="button" id="test-email-btn" class="btn btn-secondary" onclick="sendTestEmail(event)" style="width: 100%;">
+                                        📧 Send Test Email
+                                    </button>
+                                    <small style="color: var(--text-secondary); font-size: 12px; display: block; margin-top: 5px;">
+                                        Sends a test email to all admin users to verify SMTP configuration
+                                    </small>
                                 </div>
                             </div>
                         </div>

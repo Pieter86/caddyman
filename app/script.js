@@ -83,9 +83,9 @@ async function apiCall(url, options = {}, showErrors = true) {
             ...options,
             credentials: 'include'
         });
-        if (response.status === 401) {
+        if (response.status === 401 || response.status === 403) {
             showLogin();
-            throw new Error('Not authenticated');
+            throw new Error('Session expired or not authenticated');
         }
         if (!response.ok) {
             let errorMsg = 'Request failed';
@@ -677,6 +677,11 @@ async function loadSettings() {
     document.getElementById('auth-protocols-enabled').checked = data.auth_protocols_enabled || false;
     document.getElementById('caddy-log-level').value = data.caddy_log_level || 'WARN';
 
+    // Load branding & domain settings
+    document.getElementById('organization-name').value = data.organization_name || 'CaddyMAN';
+    document.getElementById('domain-url').value = data.domain_url || 'http://localhost:8000';
+    document.getElementById('admin-path-mode').checked = data.admin_path_mode || false;
+
     // Show/hide Authentication nav item based on setting
     updateAuthenticationNavVisibility(data.auth_protocols_enabled || false);
 
@@ -744,7 +749,10 @@ async function saveSettings() {
         caddy_admin_port: parseInt(document.getElementById('caddy-admin-port').value),
         enhanced_security: document.getElementById('enhanced-security').checked,
         auth_protocols_enabled: document.getElementById('auth-protocols-enabled').checked,
-        caddy_log_level: document.getElementById('caddy-log-level').value
+        caddy_log_level: document.getElementById('caddy-log-level').value,
+        organization_name: document.getElementById('organization-name').value,
+        domain_url: document.getElementById('domain-url').value,
+        admin_path_mode: document.getElementById('admin-path-mode').checked
     };
     await apiCall('/api/settings', {
         method: 'POST',
@@ -1020,12 +1028,20 @@ async function editUser(id) {
     const users = await apiCall('/api/users');
     const user = users.find(u => u.id === id);
 
+    if (!user) {
+        showAlert('User not found', 'error');
+        return;
+    }
+
     editingUserId = id;
     document.getElementById('user-modal-title').textContent = 'Edit User';
     document.getElementById('user-username').value = user.username;
     document.getElementById('user-password').value = '';
     document.getElementById('user-password').placeholder = 'Leave empty to keep current';
-    document.getElementById('user-email').value = user.email || '';
+    // Explicitly set email value (ensure it clears if no email exists)
+    const emailInput = document.getElementById('user-email');
+    emailInput.value = user.email || '';
+    console.log(`Editing user ${user.username}, email: ${user.email || '(empty)'}`);
     renderGroupSelector('user-groups', user.groups);
     await update2FASection(user);
     document.getElementById('user-modal').classList.add('active');
@@ -1932,8 +1948,56 @@ async function saveAuthenticationSettings() {
     }
 }
 
+async function sendTestEmail(event) {
+    const button = event.target;
+    const originalText = button.textContent;
+
+    try {
+        // Check if any admin has an email address
+        const users = await apiCall('/api/users');
+        const adminWithEmail = users.find(u => u.groups.includes('admin_group') && u.email);
+
+        if (!adminWithEmail) {
+            alert('No admin users have email addresses configured. Please add an email address to at least one admin user before testing.');
+            return;
+        }
+
+        // Confirm action
+        if (!confirm('Send a test email to all admin users?')) {
+            return;
+        }
+
+        // Show loading state
+        button.disabled = true;
+        button.textContent = 'Sending...';
+
+        await apiCall('/api/smtp/test-email', {
+            method: 'POST'
+        });
+
+        button.textContent = originalText;
+        button.disabled = false;
+
+        alert('Test email sent successfully! Check admin inboxes.');
+    } catch (error) {
+        button.textContent = originalText;
+        button.disabled = false;
+        alert(`Failed to send test email: ${error.message}`);
+    }
+}
+
 async function loadOAuthClients() {
     try {
+        // Load groups first if not already loaded
+        if (allGroups.length === 0) {
+            try {
+                const groups = await apiCall('/api/groups');
+                allGroups = groups;
+            } catch (error) {
+                console.error('Failed to load groups:', error);
+            }
+        }
+
         const clients = await apiCall('/api/oauth/clients');
         const container = document.getElementById('oauth-clients-list');
 
@@ -2172,6 +2236,33 @@ async function updateLDAPConfigDisplay() {
         // Fallback to localhost if we can't get network info
         document.getElementById('ldap-server-display').textContent = 'localhost';
     }
+}
+
+function generateRadiusSecret() {
+    // Generate a cryptographically secure 512-bit (64 bytes) random secret
+    const array = new Uint8Array(64);
+    crypto.getRandomValues(array);
+
+    // Convert to base64 for easier copy/paste
+    const secret = btoa(String.fromCharCode.apply(null, array));
+
+    // Set the value in the input field and change type to text temporarily to show it
+    const secretInput = document.getElementById('radius_secret');
+    secretInput.value = secret;
+    secretInput.type = 'text';
+    secretInput.select();
+
+    // Copy to clipboard
+    navigator.clipboard.writeText(secret).then(() => {
+        showAlert('✅ RADIUS secret generated and copied to clipboard!', 'success');
+    }).catch(() => {
+        showAlert('✅ RADIUS secret generated! (Copy failed - please copy manually)', 'success');
+    });
+
+    // Change back to password type after 3 seconds
+    setTimeout(() => {
+        secretInput.type = 'password';
+    }, 3000);
 }
 
 function updateAuthSettings() {

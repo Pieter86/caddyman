@@ -1,0 +1,256 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title id="page-title">User Portal</title>
+    <link rel="stylesheet" href="/user-portal/style.css">
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <h1 id="org-name">Loading...</h1>
+            <p class="subtitle">User Portal</p>
+        </div>
+
+        <!-- Setup Page (for invite links) -->
+        <div id="setup-page" class="page hidden">
+            <div class="card">
+                <h2>Complete Your Account Setup</h2>
+                <p class="info-text">Welcome! Please set a password for your account.</p>
+
+                <div id="setup-user-info" class="user-info">
+                    <div class="info-item">
+                        <span class="label">Username:</span>
+                        <span id="setup-username" class="value"></span>
+                    </div>
+                    <div class="info-item">
+                        <span class="label">Email:</span>
+                        <span id="setup-email" class="value"></span>
+                    </div>
+                </div>
+
+                <form id="setup-form">
+                    <div class="form-group">
+                        <label for="setup-password">New Password</label>
+                        <input type="password" id="setup-password" required minlength="4" placeholder="Enter your password">
+                        <small class="hint">Minimum 4 characters</small>
+                    </div>
+                    <div class="form-group">
+                        <label for="setup-password-confirm">Confirm Password</label>
+                        <input type="password" id="setup-password-confirm" required minlength="4" placeholder="Confirm your password">
+                    </div>
+                    <button type="submit" class="btn btn-primary">Set Password & Activate Account</button>
+                </form>
+            </div>
+        </div>
+
+        <!-- Profile Page (for logged-in users) -->
+        <div id="profile-page" class="page hidden">
+            <div class="card">
+                <div class="profile-header">
+                    <h2>My Profile</h2>
+                    <button id="logout-btn" class="btn btn-secondary">Logout</button>
+                </div>
+
+                <div class="user-info">
+                    <div class="info-item">
+                        <span class="label">Username:</span>
+                        <span id="profile-username" class="value"></span>
+                    </div>
+                    <div class="info-item">
+                        <span class="label">Email:</span>
+                        <span id="profile-email" class="value"></span>
+                    </div>
+                    <div class="info-item">
+                        <span class="label">Groups:</span>
+                        <span id="profile-groups" class="value"></span>
+                    </div>
+                </div>
+
+                <div class="section">
+                    <h3>Change Password</h3>
+                    <form id="change-password-form">
+                        <div class="form-group">
+                            <label for="current-password">Current Password</label>
+                            <input type="password" id="current-password" required>
+                        </div>
+                        <div class="form-group">
+                            <label for="new-password">New Password</label>
+                            <input type="password" id="new-password" required minlength="4">
+                            <small class="hint">Minimum 4 characters</small>
+                        </div>
+                        <div class="form-group">
+                            <label for="new-password-confirm">Confirm New Password</label>
+                            <input type="password" id="new-password-confirm" required minlength="4">
+                        </div>
+                        <button type="submit" class="btn btn-primary">Update Password</button>
+                    </form>
+                </div>
+
+                <div class="section">
+                    <h3>Update Email</h3>
+                    <form id="update-email-form">
+                        <div class="form-group">
+                            <label for="new-email">Email Address</label>
+                            <input type="email" id="new-email" required>
+                        </div>
+                        <button type="submit" class="btn btn-primary">Update Email</button>
+                    </form>
+                </div>
+
+                <div class="section" id="wifi-password-section" style="display: none;">
+                    <h3>WiFi Password (RADIUS/PEAP)</h3>
+                    <div class="status-box">
+                        <p class="info-text">
+                            Set a separate password for WiFi authentication. This password is used when connecting to WiFi networks that use RADIUS/PEAP authentication.
+                        </p>
+                        <div id="wifi-status-text"></div>
+                    </div>
+
+                    <!-- Set/Change WiFi Password -->
+                    <div id="wifi-password-form-section">
+                        <form id="wifi-password-form">
+                            <div class="form-group">
+                                <label for="account-password-wifi">Your Account Password</label>
+                                <input type="password" id="account-password-wifi" required placeholder="Enter your account password">
+                                <small class="hint">Required to verify your identity</small>
+                            </div>
+                            <div class="form-group">
+                                <label for="wifi-password">WiFi Password</label>
+                                <input type="password" id="wifi-password" required minlength="8" placeholder="Enter WiFi password (min 8 characters)">
+                                <small class="hint">Minimum 8 characters, must be different from your account password</small>
+                            </div>
+                            <div class="form-group">
+                                <label for="wifi-password-confirm">Confirm WiFi Password</label>
+                                <input type="password" id="wifi-password-confirm" required minlength="8" placeholder="Confirm WiFi password">
+                            </div>
+                            <div class="button-group">
+                                <button type="submit" class="btn btn-primary" id="set-wifi-password-btn">Set WiFi Password</button>
+                                <button type="button" class="btn btn-danger" id="delete-wifi-password-btn" style="display: none;">Delete WiFi Password</button>
+                            </div>
+                        </form>
+                    </div>
+                </div>
+
+                <div class="section" id="2fa-section">
+                    <h3>Two-Factor Authentication (2FA)</h3>
+                    <div id="2fa-status" class="status-box">
+                        <strong>Status:</strong> <span id="2fa-enabled-text">Checking...</span>
+                    </div>
+
+                    <!-- Enable 2FA -->
+                    <div id="2fa-enable-section" class="hidden">
+                        <p>Secure your account with two-factor authentication using an authenticator app.</p>
+                        <button type="button" id="enable-2fa-btn" class="btn btn-primary">Enable 2FA</button>
+                    </div>
+
+                    <!-- QR Code for setup -->
+                    <div id="2fa-qr-section" class="hidden">
+                        <p>Scan this QR code with Google Authenticator or any TOTP app:</p>
+                        <div class="qr-container">
+                            <img id="2fa-qr-code" src="" alt="QR Code">
+                        </div>
+                        <div class="form-group">
+                            <label for="2fa-verify-token">Enter 6-digit code from your app:</label>
+                            <input type="text" id="2fa-verify-token" maxlength="6" pattern="[0-9]{6}" placeholder="000000">
+                        </div>
+                        <div class="button-group">
+                            <button type="button" id="verify-2fa-btn" class="btn btn-primary">Verify & Enable</button>
+                            <button type="button" id="cancel-2fa-btn" class="btn btn-secondary">Cancel</button>
+                        </div>
+                    </div>
+
+                    <!-- Disable 2FA -->
+                    <div id="2fa-disable-section" class="hidden">
+                        <p class="warning-text">Disabling 2FA will make your account less secure.</p>
+                        <button type="button" id="disable-2fa-btn" class="btn btn-danger">Disable 2FA</button>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Login Page -->
+        <div id="login-page" class="page hidden">
+            <div class="card">
+                <h2>Login to Your Account</h2>
+                <form id="login-form">
+                    <div class="form-group">
+                        <label for="login-username">Username</label>
+                        <input type="text" id="login-username" required>
+                    </div>
+                    <div class="form-group">
+                        <label for="login-password">Password</label>
+                        <input type="password" id="login-password" required>
+                    </div>
+                    <div class="form-group" id="login-2fa-group" style="display: none;">
+                        <label for="login-2fa-token">2FA Code</label>
+                        <input type="text" id="login-2fa-token" maxlength="6" pattern="[0-9]{6}" placeholder="000000">
+                    </div>
+                    <button type="submit" class="btn btn-primary">Login</button>
+                </form>
+                <p style="text-align: center; margin-top: 16px;">
+                    <a href="#" id="forgot-password-link" style="color: var(--primary); text-decoration: none;">Forgot your password?</a>
+                </p>
+            </div>
+        </div>
+
+        <!-- Forgot Password Page -->
+        <div id="forgot-password-page" class="page hidden">
+            <div class="card">
+                <h2>Reset Your Password</h2>
+                <p class="info-text">Enter your email address and we'll send you a link to reset your password.</p>
+                <form id="forgot-password-form">
+                    <div class="form-group">
+                        <label for="reset-email">Email Address</label>
+                        <input type="email" id="reset-email" required placeholder="your.email@example.com">
+                    </div>
+                    <div class="button-group">
+                        <button type="submit" class="btn btn-primary">Send Reset Link</button>
+                        <button type="button" class="btn btn-secondary" onclick="showPage('login-page')">Back to Login</button>
+                    </div>
+                </form>
+            </div>
+        </div>
+
+        <!-- Reset Password Page -->
+        <div id="reset-password-page" class="page hidden">
+            <div class="card">
+                <h2>Set New Password</h2>
+                <div id="reset-user-info" class="user-info">
+                    <div class="info-item">
+                        <span class="label">Username:</span>
+                        <span id="reset-username" class="value"></span>
+                    </div>
+                    <div class="info-item">
+                        <span class="label">Email:</span>
+                        <span id="reset-email-display" class="value"></span>
+                    </div>
+                </div>
+                <form id="reset-password-form">
+                    <div class="form-group">
+                        <label for="reset-new-password">New Password</label>
+                        <input type="password" id="reset-new-password" required minlength="4" placeholder="Enter your new password">
+                        <small class="hint">Minimum 4 characters</small>
+                    </div>
+                    <div class="form-group">
+                        <label for="reset-new-password-confirm">Confirm New Password</label>
+                        <input type="password" id="reset-new-password-confirm" required minlength="4" placeholder="Confirm your new password">
+                    </div>
+                    <div class="form-group" id="reset-2fa-group" style="display: none;">
+                        <label for="reset-2fa-token">2FA Code</label>
+                        <input type="text" id="reset-2fa-token" maxlength="6" pattern="[0-9]{6}" placeholder="000000">
+                        <small class="hint">This account has 2FA enabled. Please enter your authenticator code.</small>
+                    </div>
+                    <button type="submit" class="btn btn-primary">Reset Password</button>
+                </form>
+            </div>
+        </div>
+
+        <!-- Alert Messages -->
+        <div id="alert-container"></div>
+    </div>
+
+    <script src="/user-portal/script.js"></script>
+</body>
+</html>
