@@ -159,9 +159,6 @@ A: It's homelab-ready. I use it daily. Your mileage may vary.
 **Q: Why not use [existing solution]?**
 A: Because I wanted everything in one place, and I enjoy building stuff.
 
-**Q: Can I use this commercially?**
-A: It's designed for homelab/personal use. For commercial use, please review the license and consider contributing back.
-
 **Q: Where's the documentation?**
 A: The web UI has a built-in help section. The code is reasonably well-commented. That's all you get for now.
 
