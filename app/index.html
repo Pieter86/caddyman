@@ -4,7 +4,7 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>CaddyMAN</title>
-    <link rel="stylesheet" href="/static/style.css?v=1.2.23">
+    <link rel="stylesheet" href="/static/style.css?v=1.3.6">
 
 </head>
 <body class="dark">
@@ -544,8 +544,20 @@
                 <ul style="line-height: 1.8;">
                     <li><strong>Supported Apps:</strong> Audiobookshelf, Jellyfin, Home Assistant, and any OIDC-compatible app</li>
                     <li><strong>Group-Based Access:</strong> Restrict each OAuth client to specific user groups (v1.3.1+)</li>
+                    <li><strong>Custom Claims (v1.3.6):</strong> Configure application-specific permissions per group via JSON (e.g., AudiobookShelf permissions, Jellyfin profiles, Grafana roles) - only visible when OIDC is enabled</li>
                     <li><strong>Security:</strong> PKCE required, JWT with replay prevention, admin users blocked</li>
                     <li><strong>Configuration:</strong> Get Client ID & Secret when creating client (save secret immediately!)</li>
+                </ul>
+
+                <h3 style="color: var(--accent); margin-top: 20px;">OIDC Custom Claims (v1.3.6)</h3>
+                <p>Configure application-specific permissions and settings that are automatically included in OIDC UserInfo responses:</p>
+                <ul style="line-height: 1.8;">
+                    <li><strong>Per-Group Configuration:</strong> Edit any group and paste JSON with custom claims (only when OIDC is enabled)</li>
+                    <li><strong>Automatic Merging:</strong> Claims from all user's groups are merged into the UserInfo response alongside standard claims (email, name, groups)</li>
+                    <li><strong>AudiobookShelf Support:</strong> Configure permissions like canDownload, canUpload, allowedLibraries, etc.</li>
+                    <li><strong>Multi-App Support:</strong> Include claims for multiple apps in one group (Jellyfin, Grafana, etc.)</li>
+                    <li><strong>Example:</strong> {"abspermissions": {"canDownload": true, "canUpload": false}, "grafana_role": "Editor"}</li>
+                    <li><strong>Validation:</strong> JSON syntax is validated before saving to prevent errors</li>
                 </ul>
 
                 <h3 style="color: var(--accent); margin-top: 20px;">LDAP Server</h3>
@@ -801,10 +813,12 @@ rate_limit {
             <!-- Version Information -->
             <div class="card" style="margin-bottom: 20px;">
                 <h2 style="margin-top: 0; color: var(--accent);">Version Information</h2>
-                <p><strong>Current Version:</strong> v1.3.4</p>
+                <p><strong>Current Version:</strong> v1.3.6</p>
 
                 <h3 style="color: var(--accent); margin-top: 20px;">Recent Updates</h3>
                 <ul style="line-height: 1.8;">
+                    <li><strong>v1.3.6:</strong> 🔐 Argon2id Password Hashing & OIDC Custom Claims - Gradual migration from bcrypt to Argon2id with interactive prompt; Fresh installations automatically use Argon2id by default; 512 MB memory-hard hashing resistant to GPU/ASIC attacks; DPAPI-encrypted pepper on Windows for additional security; 20-second timeout migration prompt (defaults to bcrypt if no input); OIDC Custom Claims support - configure application-specific permissions per group (AudiobookShelf, Jellyfin, Grafana, etc.); Fixed authentication settings persistence (OIDC issuer, SMTP, allowed groups); Fixed group edit duplicate name validation; Updated JavaScript/CSS cache busting to v1.3.6</li>
+                    <li><strong>v1.3.5:</strong> 📶 WiFi Password & PEAP Support - Separate WiFi password for RADIUS/PEAP authentication in user portal; PEAP-MSCHAPv2 support for Windows/Android/iOS WiFi clients; Encrypted NT hash storage using Fernet (AES-128); WiFi password must differ from account password (8 char minimum); Full MSCHAPv2 challenge-response per RFC 2759; User portal shows WiFi section only for RADIUS-eligible users; Enhanced RADIUS logging for PEAP/TTLS authentication events</li>
                     <li><strong>v1.3.4:</strong> 🔒 Security & Features Update - Fixed email field loading in user edit form; Implemented hierarchical LDAP search (support for searching base DN or specific group OUs like ou=wifi,dc=example,dc=com); Fixed OAuth/OIDC client group display; Marked unimplemented EAP methods (PEAP, PAP) as "not done" in UI; Added DEBUG_MODE flag (env: CADDYMAN_DEBUG) to control TLS keylog files; Set secure=True on session cookies; Added return_to URL validation to prevent open redirect attacks; Improved IPv4 validation using ipaddress module</li>
                     <li><strong>v1.3.3:</strong> 🔐 OAuth/OIDC Improvements - Fixed admin-only access enforcement for admin panel; Created separate OAuth login page at /login with clean design; Added /api/user endpoint for user portal; Fixed user portal CSS/JS loading; Implemented proper OIDC logout flow with redirect support; Fixed ID token generation with username as subject claim; Enhanced OAuth token endpoint with form data and HTTP Basic Auth support; Improved session management for OAuth clients</li>
                     <li><strong>v1.3.1:</strong> 🎉 User Self-Service Portal at /user-portal (change password, update email, manage 2FA); Password Reset via email with 2FA verification; Invite Link System for user onboarding (admin-generated, email-delivered, time-limited); Force 2FA at Group Level (require 2FA for admin panel, LDAP, OIDC access); Email field added to user profiles; Password minimum changed to 4 characters (always enforced); Modern Clipboard API; Comprehensive security enhancements</li>
@@ -1451,12 +1465,19 @@ rate_limit {
                 <textarea id="group-description" placeholder="Optional description"></textarea>
             </div>
             <div class="form-group">
-                <label style="display: flex; align-items: center; cursor: pointer;">
-                    <input type="checkbox" id="group-force-2fa" style="margin-right: 8px;">
-                    <span>Force 2FA for all users in this group</span>
-                </label>
+                <div class="checkbox-wrapper">
+                    <input type="checkbox" id="group-force-2fa">
+                    <label for="group-force-2fa">Force 2FA for all users in this group</label>
+                </div>
                 <small style="color: var(--text-secondary); font-size: 12px; display: block; margin-top: 5px;">
                     Users in this group must enable 2FA before they can access admin panel, LDAP, or OIDC. They can still access the user portal to set up 2FA.
+                </small>
+            </div>
+            <div class="form-group" id="group-oidc-claims-section" style="display: none;">
+                <label>OIDC Custom Claims (JSON)</label>
+                <textarea id="group-oidc-claims" rows="12" placeholder='{"abspermissions": {"canDownload": true, "canUpload": false}}'></textarea>
+                <small style="color: var(--text-secondary); font-size: 12px;">
+                    Custom OIDC claims to include when users in this group authenticate via OAuth/OIDC. Paste JSON object with application-specific permissions (e.g., AudiobookShelf, Jellyfin).
                 </small>
             </div>
             <button class="btn btn-primary" onclick="saveGroup()">Save</button>
@@ -1518,6 +1539,6 @@ https://app.example.com/auth/callback"></textarea>
         </div>
     </div>
 
-     <script src="/static/script.js?v=1.2.23">    </script>
+     <script src="/static/script.js?v=1.3.6">    </script>
 </body>
 </html>

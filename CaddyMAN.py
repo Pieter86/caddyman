@@ -590,6 +590,7 @@ default_settings = {
     "ldap_base_dn": "dc=example,dc=com",
     "ldap_bind_dn": "cn=admin,dc=example,dc=com",
     "ldap_username_attribute": "both",  # "cn", "uid", or "both"
+    "ldap_allowed_groups": [],
 
     # RADIUS Server Settings
     "radius_enabled": False,
@@ -597,6 +598,8 @@ default_settings = {
     "radius_acct_port": 1813,
     "radius_secret": "",  # Shared secret
     "radius_vlan_assignment": False,
+    "radius_eap_method": "PAP",
+    "radius_allowed_groups": [],
 
     # Email/SMTP Settings
     "smtp_enabled": False,
@@ -696,6 +699,7 @@ class Group(BaseModel):
     system: bool = False  # System groups cannot be deleted
     radius_vlan: Optional[int] = None  # VLAN assignment for RADIUS
     force_2fa: bool = False  # Require 2FA for users in this group
+    oidc_claims: Optional[str] = None  # JSON string with custom OIDC claims for this group
 
 class OAuthClient(BaseModel):
     client_id: str
@@ -1194,6 +1198,13 @@ def init_database():
         except sqlite3.OperationalError:
             pass
 
+        # Migration v1.3.6: Add OIDC claims to groups
+        try:
+            cursor.execute("ALTER TABLE groups ADD COLUMN oidc_claims TEXT")
+            logger.info("Added oidc_claims column to groups table")
+        except sqlite3.OperationalError:
+            pass
+
         # Create OAuth clients table
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS oauth_clients (
@@ -1516,11 +1527,15 @@ def get_all_groups_from_db():
         rows = cursor.fetchall()
         groups = []
         for row in rows:
+            row_dict = dict(row)
             groups.append({
-                'id': row['id'],
-                'name': row['name'],
-                'description': row['description'],
-                'system': bool(row['system'])
+                'id': row_dict['id'],
+                'name': row_dict['name'],
+                'description': row_dict['description'],
+                'system': bool(row_dict['system']),
+                'radius_vlan': row_dict.get('radius_vlan'),
+                'force_2fa': bool(row_dict.get('force_2fa', 0)),
+                'oidc_claims': row_dict.get('oidc_claims')
             })
         return groups
 
@@ -1531,11 +1546,15 @@ def get_group_by_id_from_db(group_id: str):
         cursor.execute('SELECT * FROM groups WHERE id = ?', (group_id,))
         row = cursor.fetchone()
         if row:
+            row_dict = dict(row)
             return {
-                'id': row['id'],
-                'name': row['name'],
-                'description': row['description'],
-                'system': bool(row['system'])
+                'id': row_dict['id'],
+                'name': row_dict['name'],
+                'description': row_dict['description'],
+                'system': bool(row_dict['system']),
+                'radius_vlan': row_dict.get('radius_vlan'),
+                'force_2fa': bool(row_dict.get('force_2fa', 0)),
+                'oidc_claims': row_dict.get('oidc_claims')
             }
         return None
 
@@ -1544,9 +1563,17 @@ def save_group_to_db(group: dict):
     with closing(get_db_connection()) as conn:
         cursor = conn.cursor()
         cursor.execute('''
-            INSERT OR REPLACE INTO groups (id, name, description, system, updated_at)
-            VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
-        ''', (group['id'], group['name'], group.get('description', ''), int(group.get('system', False))))
+            INSERT OR REPLACE INTO groups (id, name, description, system, radius_vlan, force_2fa, oidc_claims, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+        ''', (
+            group['id'],
+            group['name'],
+            group.get('description', ''),
+            int(group.get('system', False)),
+            group.get('radius_vlan'),
+            int(group.get('force_2fa', False)),
+            group.get('oidc_claims')
+        ))
         conn.commit()
 
 def delete_group_from_db(group_id: str):
@@ -2774,6 +2801,9 @@ async def handle_ldap_bind(client, msg_id: int, data: bytes, settings: dict):
             client.send(response)
             return True
 
+        # DEBUG: Log the BIND DN to see what Emby is sending
+        logger.info(f"LDAP: BIND request with DN: {bind_dn}")
+
         # Extract username from DN (cn=username or uid=username,...)
         username = None
         if bind_dn:
@@ -2980,6 +3010,41 @@ async def handle_ldap_search(client, msg_id: int, data: bytes, settings: dict, a
 
         # Parse the requested base DN from client
         requested_base_dn = parse_ldap_search_base_dn(data)
+
+        # Parse the LDAP search filter (e.g., (uid=test))
+        search_filter_username = None
+        try:
+            # Look for 'uid' or 'cn' attribute in the filter
+            # Search for these strings in the binary data
+            data_str = data.decode('latin-1')  # Use latin-1 to preserve byte values
+
+            # Look for "uid" followed by a string value
+            if 'uid' in data_str:
+                idx = data_str.index('uid')
+                # Skip past 'uid' and look for the next OCTET STRING (0x04)
+                idx += 3
+                while idx < len(data) - 10:
+                    if data[idx] == 0x04:  # OCTET STRING tag
+                        str_len = data[idx + 1]
+                        if str_len < 128 and idx + 2 + str_len <= len(data):
+                            search_filter_username = data[idx + 2:idx + 2 + str_len].decode('utf-8', errors='ignore')
+                            logger.info(f"LDAP: SEARCH filter for uid={search_filter_username}")
+                            break
+                    idx += 1
+            elif 'cn' in data_str:
+                idx = data_str.index('cn')
+                idx += 2
+                while idx < len(data) - 10:
+                    if data[idx] == 0x04:  # OCTET STRING tag
+                        str_len = data[idx + 1]
+                        if str_len < 128 and idx + 2 + str_len <= len(data):
+                            search_filter_username = data[idx + 2:idx + 2 + str_len].decode('utf-8', errors='ignore')
+                            logger.info(f"LDAP: SEARCH filter for cn={search_filter_username}")
+                            break
+                    idx += 1
+        except Exception as e:
+            logger.debug(f"LDAP: Could not parse search filter: {e}")
+
         logger.info(f"LDAP: SEARCH request for base DN: {requested_base_dn or configured_base_dn}")
 
         # Determine which base DN to use and if we need to filter by specific group
@@ -3012,6 +3077,11 @@ async def handle_ldap_search(client, msg_id: int, data: bytes, settings: dict, a
             # Security: Skip admin users
             if user.get('is_admin', False):
                 continue
+
+            # Apply LDAP search filter if present (e.g., uid=test)
+            if search_filter_username:
+                if user.get('username', '').lower() != search_filter_username.lower():
+                    continue
 
             user_groups = user.get('groups', [])
             user_group_names = [group_id_to_name.get(gid, '') for gid in user_groups]
@@ -7205,6 +7275,40 @@ async def create_group(group: Group, request: Request, session_id: Optional[str]
     await reload_caddy()
     return group
 
+@app.put("/api/groups/{group_id}")
+async def update_group(group_id: str, group: Group, request: Request, session_id: Optional[str] = Cookie(None)):
+    user = get_session_user(session_id)
+    if not user:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+    require_csrf(request, session_id)
+
+    # Check if group exists
+    existing_group = get_group_by_id_from_db(group_id)
+    if not existing_group:
+        raise HTTPException(status_code=404, detail="Group not found")
+
+    # Check for duplicate group name (excluding the current group)
+    all_groups = get_all_groups_from_db()
+    if any(g.get("id") != group_id and g.get("name", "").lower() == group.name.lower() for g in all_groups):
+        raise HTTPException(status_code=400, detail=f"Group '{group.name}' already exists")
+
+    # Prevent changing system flag
+    if existing_group.get("system", False):
+        group.system = True
+
+    # Validate OIDC claims if provided
+    if group.oidc_claims:
+        try:
+            json.loads(group.oidc_claims)
+        except json.JSONDecodeError:
+            raise HTTPException(status_code=400, detail="Invalid JSON in oidc_claims")
+
+    # Update group
+    group.id = group_id
+    save_group_to_db(group.model_dump())
+    await reload_caddy()
+    return group
+
 @app.delete("/api/groups/{group_id}")
 async def delete_group(group_id: str, request: Request, session_id: Optional[str] = Cookie(None)):
     user = get_session_user(session_id)
@@ -7618,6 +7722,36 @@ async def oauth_token(
     else:
         raise HTTPException(status_code=400, detail="Unsupported grant_type")
 
+def merge_group_oidc_claims(user: dict) -> dict:
+    """
+    Merge OIDC claims from all groups the user belongs to.
+    Returns a dictionary of merged custom claims.
+    """
+    merged_claims = {}
+    user_groups = user.get('groups', [])
+
+    if not user_groups:
+        return merged_claims
+
+    # Get all groups from database
+    all_groups = get_all_groups_from_db()
+
+    # Filter to only groups the user belongs to
+    for group in all_groups:
+        if group['id'] in user_groups:
+            oidc_claims_json = group.get('oidc_claims')
+            if oidc_claims_json:
+                try:
+                    # Parse JSON claims from group
+                    group_claims = json.loads(oidc_claims_json)
+                    # Merge into result (later groups override earlier ones)
+                    merged_claims.update(group_claims)
+                except json.JSONDecodeError as e:
+                    logger.error(f"Invalid JSON in group {group['id']} oidc_claims: {e}")
+                    continue
+
+    return merged_claims
+
 @app.get("/oauth/userinfo")
 async def oauth_userinfo(authorization: Optional[str] = Header(None)):
     """OAuth2 UserInfo endpoint"""
@@ -7653,7 +7787,7 @@ async def oauth_userinfo(authorization: Optional[str] = Header(None)):
     }
 
     if 'profile' in scopes:
-        userinfo['username'] = user.get('username', '')
+        userinfo['preferred_username'] = user.get('username', '')
         userinfo['name'] = f"{user.get('first_name', '')} {user.get('last_name', '')}".strip()
         userinfo['given_name'] = user.get('first_name', '')
         userinfo['family_name'] = user.get('last_name', '')
@@ -7664,6 +7798,10 @@ async def oauth_userinfo(authorization: Optional[str] = Header(None)):
 
     if 'groups' in scopes:
         userinfo['groups'] = user.get('groups', [])
+
+    # Merge custom OIDC claims from user's groups
+    custom_claims = merge_group_oidc_claims(user)
+    userinfo.update(custom_claims)
 
     return userinfo
 

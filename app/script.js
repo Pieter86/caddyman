@@ -803,12 +803,26 @@ async function loadGroups() {
     `).join('');
 }
 
-function openGroupModal() {
+async function openGroupModal() {
     editingGroupId = null;
     document.getElementById('group-modal-title').textContent = 'Add Group';
     document.getElementById('group-name').value = '';
     document.getElementById('group-description').value = '';
     document.getElementById('group-force-2fa').checked = false;
+    document.getElementById('group-oidc-claims').value = '';
+
+    // Show/hide OIDC claims field based on settings
+    try {
+        const settings = await apiCall('/api/settings', {}, false);
+        const oidcEnabled = settings?.oidc_enabled || false;
+        const claimsSection = document.getElementById('group-oidc-claims-section');
+        if (claimsSection) {
+            claimsSection.style.display = oidcEnabled ? 'block' : 'none';
+        }
+    } catch (err) {
+        console.error('Failed to load settings:', err);
+    }
+
     document.getElementById('group-modal').classList.add('active');
 }
 
@@ -818,15 +832,32 @@ function closeGroupModal() {
 
 async function saveGroup() {
     try {
+        const oidcClaims = document.getElementById('group-oidc-claims').value.trim();
+
+        // Validate JSON if provided
+        if (oidcClaims) {
+            try {
+                JSON.parse(oidcClaims);
+            } catch (e) {
+                showAlert('Invalid JSON in OIDC Claims field', 'error');
+                return;
+            }
+        }
+
         const group = {
             id: editingGroupId || 'group_' + Date.now(),
             name: document.getElementById('group-name').value,
             description: document.getElementById('group-description').value,
-            force_2fa: document.getElementById('group-force-2fa').checked
+            force_2fa: document.getElementById('group-force-2fa').checked,
+            oidc_claims: oidcClaims || null
         };
 
-        await apiCall('/api/groups', {
-            method: 'POST',
+        // Use PUT for editing, POST for creating
+        const method = editingGroupId ? 'PUT' : 'POST';
+        const url = editingGroupId ? `/api/groups/${editingGroupId}` : '/api/groups';
+
+        await apiCall(url, {
+            method: method,
             headers: {'Content-Type': 'application/json'},
             body: JSON.stringify(group)
         });
@@ -846,8 +877,22 @@ async function editGroup(id) {
     editingGroupId = id;
     document.getElementById('group-modal-title').textContent = 'Edit Group';
     document.getElementById('group-name').value = group.name;
-    document.getElementById('group-description').value = group.description;
+    document.getElementById('group-description').value = group.description || '';
     document.getElementById('group-force-2fa').checked = group.force_2fa || false;
+    document.getElementById('group-oidc-claims').value = group.oidc_claims || '';
+
+    // Show/hide OIDC claims field based on settings
+    try {
+        const settings = await apiCall('/api/settings', {}, false);
+        const oidcEnabled = settings?.oidc_enabled || false;
+        const claimsSection = document.getElementById('group-oidc-claims-section');
+        if (claimsSection) {
+            claimsSection.style.display = oidcEnabled ? 'block' : 'none';
+        }
+    } catch (err) {
+        console.error('Failed to load settings:', err);
+    }
+
     document.getElementById('group-modal').classList.add('active');
 }
 
