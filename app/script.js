@@ -345,6 +345,7 @@ async function loadDashboard() {
         await loadSecurityWarnings();
         await loadActivity();
         await loadNotifications();
+        await loadPendingInvites();
         await updateAuthServicesStatus();
         await checkForUpdates();
     } catch {}
@@ -494,6 +495,42 @@ async function loadNotifications() {
             `;
         }).join('');
     } catch {}
+}
+
+async function loadPendingInvites() {
+    try {
+        const invites = await apiCall('/api/users/pending-invites');
+        const card = document.getElementById('pending-invites-card');
+        const list = document.getElementById('pending-invites-list');
+
+        if (invites.length === 0) {
+            card.style.display = 'none';
+            return;
+        }
+
+        card.style.display = 'block';
+        list.innerHTML = invites.map(invite => {
+            const createdTime = new Date(invite.created_at * 1000).toLocaleString();
+            const groupNames = invite.groups.map(gid => {
+                const group = allGroups.find(g => g.id === gid);
+                return group ? group.name : gid;
+            }).join(', ');
+
+            return `
+                <div style="padding: 12px; border-bottom: 1px solid var(--border); line-height: 1.6;">
+                    <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 5px;">
+                        <strong style="color: var(--accent);">${invite.username}</strong>
+                        <span style="color: var(--warning); font-weight: 500;">⏳ ${invite.time_remaining}</span>
+                    </div>
+                    <div style="color: var(--text-secondary); font-size: 13px;">📧 ${invite.email}</div>
+                    ${groupNames ? `<div style="color: var(--text-secondary); font-size: 12px;">Groups: ${groupNames}</div>` : ''}
+                    <div style="color: var(--text-secondary); font-size: 11px; margin-top: 3px;">Created by ${invite.created_by} on ${createdTime}</div>
+                </div>
+            `;
+        }).join('');
+    } catch (err) {
+        console.error('Failed to load pending invites:', err);
+    }
 }
 
 async function updateAuthServicesStatus() {

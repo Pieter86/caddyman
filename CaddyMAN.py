@@ -53,7 +53,7 @@ from passlib.hash import nthash
 from argon2 import PasswordHasher, Type
 from argon2.exceptions import VerifyMismatchError, VerificationError, InvalidHash
 
-VERSION = "1.3.6"
+VERSION = "1.3.7"
 
 # Argon2id migration mode - set at runtime based on existing hashes or user choice
 # This will be auto-detected on startup
@@ -1420,6 +1420,26 @@ def delete_invite_token_from_db(token: str):
         cursor = conn.cursor()
         cursor.execute('DELETE FROM invite_tokens WHERE token = ?', (token,))
         conn.commit()
+
+def get_all_invite_tokens_from_db():
+    """Get all invite tokens from database"""
+    with closing(get_db_connection()) as conn:
+        cursor = conn.cursor()
+        cursor.execute('SELECT * FROM invite_tokens ORDER BY created_at DESC')
+        rows = cursor.fetchall()
+        invites = []
+        for row in rows:
+            row_dict = dict(row)
+            invites.append({
+                'token': row_dict['token'],
+                'username': row_dict['username'],
+                'email': row_dict['email'],
+                'groups': json.loads(row_dict['groups']) if row_dict['groups'] else [],
+                'expires_at': row_dict['expires_at'],
+                'created_by': row_dict['created_by'],
+                'created_at': row_dict['created_at']
+            })
+        return invites
 
 def save_password_reset_token_to_db(reset_token: dict):
     """Save password reset token to database"""
@@ -6571,6 +6591,44 @@ class InviteLinkRequest(BaseModel):
     email: str = Field(..., pattern=r'^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$')
     groups: List[str] = Field(default_factory=list, max_items=20)
     expiry_hours: int = Field(24, ge=1, le=720)  # Min 1 hour, max 30 days
+
+@app.get("/api/users/pending-invites")
+async def get_pending_invites(session_id: Optional[str] = Cookie(None)):
+    """Get all pending (non-expired) invite tokens"""
+    user = get_session_user(session_id)
+    if not user:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+
+    # Only admins can see pending invites
+    if 'admin_group' not in user.get('groups', []):
+        raise HTTPException(status_code=403, detail="Only administrators can view pending invites")
+
+    all_invites = get_all_invite_tokens_from_db()
+    current_time = datetime.now().timestamp()
+
+    # Filter only non-expired invites and add time remaining
+    pending_invites = []
+    for invite in all_invites:
+        if invite['expires_at'] > current_time:
+            time_remaining = invite['expires_at'] - current_time
+            hours_remaining = int(time_remaining / 3600)
+            minutes_remaining = int((time_remaining % 3600) / 60)
+
+            pending_invites.append({
+                'token': invite['token'],
+                'username': invite['username'],
+                'email': invite['email'],
+                'groups': invite['groups'],
+                'expires_at': invite['expires_at'],
+                'created_by': invite['created_by'],
+                'created_at': invite['created_at'],
+                'time_remaining': f"{hours_remaining}h {minutes_remaining}m"
+            })
+        else:
+            # Auto-delete expired invites
+            delete_invite_token_from_db(invite['token'])
+
+    return pending_invites
 
 @app.post("/api/users/invite-link")
 async def generate_invite_link(

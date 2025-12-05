@@ -144,8 +144,14 @@
                             <p style="color: var(--text-secondary);">No notifications sent yet</p>
                         </div>
                     </div>
+                    <div class="card" id="pending-invites-card" style="display: none;">
+                        <h3>📧 Pending Invitations</h3>
+                        <div id="pending-invites-list" style="max-height: 400px; overflow-y: auto;">
+                            <p style="color: var(--text-secondary);">No pending invitations</p>
+                        </div>
+                    </div>
                 </div>
-                
+
                 <!-- Proxies Page -->
                 <div id="proxies-page" class="page hidden">
                     <div class="header">
@@ -813,10 +819,11 @@ rate_limit {
             <!-- Version Information -->
             <div class="card" style="margin-bottom: 20px;">
                 <h2 style="margin-top: 0; color: var(--accent);">Version Information</h2>
-                <p><strong>Current Version:</strong> v1.3.6</p>
+                <p><strong>Current Version:</strong> v1.3.7</p>
 
                 <h3 style="color: var(--accent); margin-top: 20px;">Recent Updates</h3>
                 <ul style="line-height: 1.8;">
+                    <li><strong>v1.3.7:</strong> 🔧 LDAP Search Filter Fix & Pending Invitations Dashboard - Fixed critical LDAP search filter parsing bug (was returning all users instead of filtering by username); Emby, Jellyfin, and other LDAP clients now correctly authenticate specific users; Added Pending Invitations card to dashboard showing active invite links with time remaining; Displays username, email, assigned groups, creator, and expiry countdown; Auto-cleanup of expired invitations from database when dashboard loads; Invitation persistence across reboots (stored in SQLite database)</li>
                     <li><strong>v1.3.6:</strong> 🔐 Argon2id Password Hashing & OIDC Custom Claims - Gradual migration from bcrypt to Argon2id with interactive prompt; Fresh installations automatically use Argon2id by default; 512 MB memory-hard hashing resistant to GPU/ASIC attacks; DPAPI-encrypted pepper on Windows for additional security; 20-second timeout migration prompt (defaults to bcrypt if no input); OIDC Custom Claims support - configure application-specific permissions per group (AudiobookShelf, Jellyfin, Grafana, etc.); Fixed authentication settings persistence (OIDC issuer, SMTP, allowed groups); Fixed group edit duplicate name validation; Updated JavaScript/CSS cache busting to v1.3.6</li>
                     <li><strong>v1.3.5:</strong> 📶 WiFi Password & PEAP Support - Separate WiFi password for RADIUS/PEAP authentication in user portal; PEAP-MSCHAPv2 support for Windows/Android/iOS WiFi clients; Encrypted NT hash storage using Fernet (AES-128); WiFi password must differ from account password (8 char minimum); Full MSCHAPv2 challenge-response per RFC 2759; User portal shows WiFi section only for RADIUS-eligible users; Enhanced RADIUS logging for PEAP/TTLS authentication events</li>
                     <li><strong>v1.3.4:</strong> 🔒 Security & Features Update - Fixed email field loading in user edit form; Implemented hierarchical LDAP search (support for searching base DN or specific group OUs like ou=wifi,dc=example,dc=com); Fixed OAuth/OIDC client group display; Marked unimplemented EAP methods (PEAP, PAP) as "not done" in UI; Added DEBUG_MODE flag (env: CADDYMAN_DEBUG) to control TLS keylog files; Set secure=True on session cookies; Added return_to URL validation to prevent open redirect attacks; Improved IPv4 validation using ipaddress module</li>
@@ -1539,6 +1546,6 @@ https://app.example.com/auth/callback"></textarea>
         </div>
     </div>
 
-     <script src="/static/script.js?v=1.3.6">    </script>
+     <script src="/static/script.js?v=1.3.7">    </script>
 </body>
 </html>
