@@ -70,6 +70,44 @@ function escapeHtml(unsafe) {
         .replace(/'/g, "&#039;");
 }
 
+// Secure way to set HTML content - sanitizes by default
+function setContent(element, content, allowHtml = false) {
+    if (!element) return;
+    if (allowHtml) {
+        // For trusted HTML content only (from our own template strings, not user input)
+        element.innerHTML = content;
+    } else {
+        // Default: treat as plain text to prevent XSS
+        element.textContent = content;
+    }
+}
+
+// Secure way to create HTML from template with escaped values
+function createSecureHtml(template, values = {}) {
+    let result = template;
+    for (const [key, value] of Object.entries(values)) {
+        const escaped = escapeHtml(String(value));
+        result = result.replace(new RegExp(`{{${key}}}`, 'g'), escaped);
+    }
+    return result;
+}
+
+// Toggle password visibility for password fields
+function togglePasswordVisibility(fieldId, button) {
+    const field = document.getElementById(fieldId);
+    if (!field) return;
+
+    if (field.type === 'password') {
+        field.type = 'text';
+        button.textContent = '🙈'; // Eye closed emoji
+        button.title = 'Hide';
+    } else {
+        field.type = 'password';
+        button.textContent = '👁️'; // Eye open emoji
+        button.title = 'Show';
+    }
+}
+
 async function apiCall(url, options = {}, showErrors = true) {
     try {
         // Add CSRF token header for state-changing requests
@@ -168,8 +206,8 @@ async function login() {
                     document.getElementById('login-2fa-group').classList.remove('hidden');
                     document.getElementById('login-2fa-token').value = '';
                     document.getElementById('login-2fa-token').focus();
-                    document.getElementById('login-alert').innerHTML =
-                        '<div class="alert alert-warning">Please enter your 2FA code from your authenticator app</div>';
+                    setContent(document.getElementById('login-alert'),
+                        '<div class="alert alert-warning">Please enter your 2FA code from your authenticator app</div>', true);
                     return;
                 }
             }
@@ -185,7 +223,7 @@ async function login() {
         // Hide 2FA field for next login and clear alert
         document.getElementById('login-2fa-group').classList.add('hidden');
         document.getElementById('login-2fa-token').value = '';
-        document.getElementById('login-alert').innerHTML = '';
+        setContent(document.getElementById('login-alert'), '');
 
         // Check if password change is required
         if (data.needs_password_change) {
@@ -208,8 +246,9 @@ async function login() {
         await initAuthNav();
     } catch (err) {
         console.error('Login error:', err);
-        document.getElementById('login-alert').innerHTML =
-            '<div class="alert alert-error">' + (err.message || 'Invalid credentials') + '</div>';
+        const errorMsg = escapeHtml(err.message || 'Invalid credentials');
+        setContent(document.getElementById('login-alert'),
+            '<div class="alert alert-error">' + errorMsg + '</div>', true);
     }
 }
 
@@ -420,11 +459,13 @@ async function loadSecurityWarnings() {
         }
 
         warningsCard.classList.remove('hidden');
-        warningsList.innerHTML = warnings.warnings.map(w => {
+        setContent(warningsList, warnings.warnings.map(w => {
+            const username = escapeHtml(w.username);
+            const message = escapeHtml(w.message);
             return `<div class="alert alert-warning" style="margin-bottom: 10px;">
-                <strong>${w.username}</strong>: ${w.message}
+                <strong>${username}</strong>: ${message}
             </div>`;
-        }).join('');
+        }).join(''), true);
     } catch (err) {
         console.error('Failed to load security warnings:', err);
     }
@@ -436,30 +477,34 @@ async function loadActivity() {
         const log = document.getElementById('activity-log');
         
         if (data.activities.length === 0) {
-            log.innerHTML = '<p style="color: var(--text-secondary);">No recent activity</p>';
+            setContent(log, '<p style="color: var(--text-secondary);">No recent activity</p>', true);
             return;
         }
-        
-        log.innerHTML = data.activities.map(activity => {
-            const time = new Date(activity.timestamp).toLocaleString();
-            const actionColor = activity.action.includes('FAILED') || activity.action.includes('DENIED') 
-                ? 'var(--danger)' 
+
+        setContent(log, data.activities.map(activity => {
+            const time = escapeHtml(new Date(activity.timestamp).toLocaleString());
+            const username = escapeHtml(activity.username);
+            const action = escapeHtml(activity.action);
+            const details = activity.details ? escapeHtml(activity.details) : '';
+            const ip = escapeHtml(activity.ip);
+            const actionColor = activity.action.includes('FAILED') || activity.action.includes('DENIED')
+                ? 'var(--danger)'
                 : activity.action.includes('SUCCESS') || activity.action.includes('LOGIN')
                 ? 'var(--success)'
                 : 'var(--text-primary)';
-            
+
             return `
                 <div style="padding: 8px; border-bottom: 1px solid var(--border); line-height: 1.6;">
                     <div style="color: var(--text-secondary);">${time}</div>
                     <div>
-                        <strong style="color: var(--accent);">${activity.username}</strong> 
-                        <span style="color: ${actionColor}; font-weight: 500;">${activity.action}</span>
+                        <strong style="color: var(--accent);">${username}</strong>
+                        <span style="color: ${actionColor}; font-weight: 500;">${action}</span>
                     </div>
-                    ${activity.details ? `<div style="color: var(--text-secondary); font-size: 11px;">${activity.details}</div>` : ''}
-                    <div style="color: var(--text-secondary); font-size: 11px;">IP: ${activity.ip}</div>
+                    ${details ? `<div style="color: var(--text-secondary); font-size: 11px;">${details}</div>` : ''}
+                    <div style="color: var(--text-secondary); font-size: 11px;">IP: ${ip}</div>
                 </div>
             `;
-        }).join('');
+        }).join(''), true);
     } catch {}
 }
 
@@ -469,12 +514,14 @@ async function loadNotifications() {
         const log = document.getElementById('notification-log');
 
         if (data.notifications.length === 0) {
-            log.innerHTML = '<p style="color: var(--text-secondary);">No notifications sent yet</p>';
+            setContent(log, '<p style="color: var(--text-secondary);">No notifications sent yet</p>', true);
             return;
         }
 
-        log.innerHTML = data.notifications.map(notif => {
-            const time = new Date(notif.timestamp).toLocaleString();
+        setContent(log, data.notifications.map(notif => {
+            const time = escapeHtml(new Date(notif.timestamp).toLocaleString());
+            const title = escapeHtml(notif.title);
+            const message = escapeHtml(notif.message);
             const typeColors = {
                 'info': 'var(--accent)',
                 'success': 'var(--success)',
@@ -488,12 +535,12 @@ async function loadNotifications() {
                 <div style="padding: 8px; border-bottom: 1px solid var(--border); line-height: 1.6;">
                     <div style="color: var(--text-secondary);">${time}</div>
                     <div>
-                        <strong style="color: ${typeColor};">${notif.title}</strong>
+                        <strong style="color: ${typeColor};">${title}</strong>
                     </div>
-                    <div style="color: var(--text-secondary); font-size: 11px; white-space: pre-wrap;">${notif.message}</div>
+                    <div style="color: var(--text-secondary); font-size: 11px; white-space: pre-wrap;">${message}</div>
                 </div>
             `;
-        }).join('');
+        }).join(''), true);
     } catch {}
 }
 
@@ -509,25 +556,29 @@ async function loadPendingInvites() {
         }
 
         card.style.display = 'block';
-        list.innerHTML = invites.map(invite => {
-            const createdTime = new Date(invite.created_at * 1000).toLocaleString();
+        setContent(list, invites.map(invite => {
+            const createdTime = escapeHtml(new Date(invite.created_at * 1000).toLocaleString());
+            const username = escapeHtml(invite.username);
+            const email = escapeHtml(invite.email);
+            const timeRemaining = escapeHtml(invite.time_remaining);
+            const createdBy = escapeHtml(invite.created_by);
             const groupNames = invite.groups.map(gid => {
                 const group = allGroups.find(g => g.id === gid);
-                return group ? group.name : gid;
+                return group ? escapeHtml(group.name) : escapeHtml(gid);
             }).join(', ');
 
             return `
                 <div style="padding: 12px; border-bottom: 1px solid var(--border); line-height: 1.6;">
                     <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 5px;">
-                        <strong style="color: var(--accent);">${invite.username}</strong>
-                        <span style="color: var(--warning); font-weight: 500;">⏳ ${invite.time_remaining}</span>
+                        <strong style="color: var(--accent);">${username}</strong>
+                        <span style="color: var(--warning); font-weight: 500;">⏳ ${timeRemaining}</span>
                     </div>
-                    <div style="color: var(--text-secondary); font-size: 13px;">📧 ${invite.email}</div>
+                    <div style="color: var(--text-secondary); font-size: 13px;">📧 ${email}</div>
                     ${groupNames ? `<div style="color: var(--text-secondary); font-size: 12px;">Groups: ${groupNames}</div>` : ''}
-                    <div style="color: var(--text-secondary); font-size: 11px; margin-top: 3px;">Created by ${invite.created_by} on ${createdTime}</div>
+                    <div style="color: var(--text-secondary); font-size: 11px; margin-top: 3px;">Created by ${createdBy} on ${createdTime}</div>
                 </div>
             `;
-        }).join('');
+        }).join(''), true);
     } catch (err) {
         console.error('Failed to load pending invites:', err);
     }
@@ -722,10 +773,12 @@ async function loadSettings() {
     // Show/hide Authentication nav item based on setting
     updateAuthenticationNavVisibility(data.auth_protocols_enabled || false);
 
-    document.body.className = data.theme;
+    // Theme: browser-only via localStorage (not synced to backend)
+    const savedTheme = localStorage.getItem('caddy-manager-theme') || 'dark';
+    document.body.className = savedTheme;
     document.querySelectorAll('#theme-toggle .toggle-btn').forEach((btn, idx) => {
         const themes = ['light', 'dark', 'black'];
-        btn.classList.toggle('active', themes[idx] === data.theme);
+        btn.classList.toggle('active', themes[idx] === savedTheme);
     });
 
     // Load notification events and show/hide container based on service selection
@@ -771,7 +824,6 @@ async function saveSettings() {
     });
 
     const settings = {
-        theme: document.body.className,
         health_check_enabled: document.getElementById('health-check-enabled').checked,
         health_check_domain: document.getElementById('health-check-domain').value,
         health_check_interval: parseInt(document.getElementById('health-check-interval').value),
@@ -825,19 +877,24 @@ async function loadGroups() {
     const groups = await apiCall('/api/groups');
     allGroups = groups;
     const list = document.getElementById('group-list');
-    list.innerHTML = groups.map(g => `
+    setContent(list, groups.map(g => {
+        const name = escapeHtml(g.name);
+        const description = escapeHtml(g.description || 'No description');
+        const id = escapeHtml(g.id);
+        return `
         <div class="item">
             <div class="item-info">
-                <h3>${g.name}</h3>
-                <p>${g.description || 'No description'}</p>
+                <h3>${name}</h3>
+                <p>${description}</p>
             </div>
             <div class="item-actions">
-                <button class="btn btn-primary" onclick="editGroup('${g.id}')">Edit</button>
-                ${g.system ? '<span class="status-badge status-active">System</span>' : 
-                `<button class="btn btn-danger" onclick="deleteGroup('${g.id}')">Delete</button>`}
+                <button class="btn btn-primary" onclick="editGroup('${id}')">Edit</button>
+                ${g.system ? '<span class="status-badge status-active">System</span>' :
+                `<button class="btn btn-danger" onclick="deleteGroup('${id}')">Delete</button>`}
             </div>
         </div>
-    `).join('');
+    `;
+    }).join(''), true);
 }
 
 async function openGroupModal() {
@@ -955,31 +1012,34 @@ async function loadUsers() {
     }
 
     const list = document.getElementById('user-list');
-    list.innerHTML = users.map(u => {
+    setContent(list, users.map(u => {
         // Map group IDs to group names
         const groupNames = u.groups.map(gid => {
             const group = allGroups.find(g => g.id === gid);
-            return group ? group.name : gid;
+            return group ? escapeHtml(group.name) : escapeHtml(gid);
         }).join(', ');
 
         // Check if user has 2FA enabled
         const has2FA = u.totp_enabled ? ' <span class="status-badge status-active" style="font-size: 11px; padding: 3px 8px;">🔐 2FA</span>' : '';
 
+        const username = escapeHtml(u.username);
+        const userId = escapeHtml(u.id);
+
         return `
         <div class="item">
             <div class="item-info">
-                <h3>${u.username}</h3>
+                <h3>${username}</h3>
                 <p>Groups: ${groupNames || 'None'}${has2FA}</p>
             </div>
             <div class="item-actions">
-<button class="btn btn-primary" onclick="editUser('${u.id}')">Edit</button>
+<button class="btn btn-primary" onclick="editUser('${userId}')">Edit</button>
 ${u.groups.includes('admin_group') && users.filter(user => user.groups.includes('admin_group')).length === 1
     ? '<span class="status-badge status-active">Last Admin</span>'
-    : `<button class="btn btn-danger" onclick="deleteUser('${u.id}')">Delete</button>`}
+    : `<button class="btn btn-danger" onclick="deleteUser('${userId}')">Delete</button>`}
             </div>
         </div>
         `;
-    }).join('');
+    }).join(''), true);
 }
 
 function openUserModal() {
@@ -999,22 +1059,31 @@ function closeUserModal() {
 
 function renderGroupSelector(elementId, selectedGroups) {
     const container = document.getElementById(elementId);
-    container.innerHTML = `
-        <div class="multi-select" id="${elementId}-display">
-            ${selectedGroups.map(g => `
+    const escapedElementId = escapeHtml(elementId);
+
+    setContent(container, `
+        <div class="multi-select" id="${escapedElementId}-display">
+            ${selectedGroups.map(g => {
+                const groupName = escapeHtml(allGroups.find(gr => gr.id === g)?.name || g);
+                const groupId = escapeHtml(g);
+                const escapedElemId = escapeHtml(elementId);
+                return `
                 <div class="multi-select-tag">
-                    ${allGroups.find(gr => gr.id === g)?.name || g}
-                    <button onclick="removeGroupFromUser('${elementId}', '${g}')">×</button>
+                    ${groupName}
+                    <button onclick="removeGroupFromUser('${escapedElemId}', '${groupId}')">×</button>
                 </div>
-            `).join('')}
+            `;
+            }).join('')}
         </div>
-        <select id="${elementId}-select" onchange="addGroupToUser('${elementId}')" style="width: 100%; padding: 10px; border: 1px solid var(--border); border-radius: 6px; background: var(--bg-tertiary); color: var(--text-primary); font-size: 14px; margin-top: 8px; cursor: pointer;">
+        <select id="${escapedElementId}-select" onchange="addGroupToUser('${escapedElementId}')" style="width: 100%; padding: 10px; border: 1px solid var(--border); border-radius: 6px; background: var(--bg-tertiary); color: var(--text-primary); font-size: 14px; margin-top: 8px; cursor: pointer;">
             <option value="">+ Add group</option>
-            ${allGroups.filter(g => !selectedGroups.includes(g.id)).map(g =>
-                `<option value="${g.id}">${g.name}</option>`
-            ).join('')}
+            ${allGroups.filter(g => !selectedGroups.includes(g.id)).map(g => {
+                const groupId = escapeHtml(g.id);
+                const groupName = escapeHtml(g.name);
+                return `<option value="${groupId}">${groupName}</option>`;
+            }).join('')}
         </select>
-    `;
+    `, true);
     container.dataset.groups = JSON.stringify(selectedGroups);
 }
 
@@ -1285,8 +1354,8 @@ async function generateInviteLink() {
         const groups = JSON.parse(container.dataset.groups || '[]');
 
         const inviteData = {
-            username: document.getElementById('invite-username').value,
-            email: document.getElementById('invite-email').value,
+            username: document.getElementById('invite-username').value.trim(),
+            email: document.getElementById('invite-email').value.trim(),
             groups: groups,
             expiry_hours: parseInt(document.getElementById('invite-expiry').value)
         };
@@ -1323,9 +1392,9 @@ async function copyInviteLink() {
 async function loadProxies() {
     const proxies = await apiCall('/api/proxies');
     const list = document.getElementById('proxy-list');
-    list.innerHTML = proxies.map(p => {
+    setContent(list, proxies.map(p => {
         const features = [];
-        const displayDomain = (p.domains && p.domains.length) ? p.domains.join(', ') : 'All domains';
+        const displayDomain = (p.domains && p.domains.length) ? p.domains.map(d => escapeHtml(d)).join(', ') : 'All domains';
 
         // Handle port display - support both new and legacy format
         let http_ports, https_ports;
@@ -1357,32 +1426,35 @@ async function loadProxies() {
 
         if (p.auto_https) features.push('↗️ Auto HTTPS');
         if (p.websocket) features.push('🔌 WebSocket');
-        if (p.load_balance) features.push(`⚖️ ${p.load_balance}`);
+        if (p.load_balance) features.push(`⚖️ ${escapeHtml(p.load_balance)}`);
         if (p.access_groups && p.access_groups.length) {
             const groupNames = p.access_groups.map(gid => {
                 const group = allGroups.find(g => g.id === gid);
-                return group ? group.name : gid;
+                return group ? escapeHtml(group.name) : escapeHtml(gid);
             }).join(', ');
             features.push(`🔐 ${groupNames}`);
         }
+
+        const upstream = escapeHtml(p.upstream);
+        const proxyId = escapeHtml(p.id);
 
         return `
             <div class="item">
                 <div class="item-info">
                     <h3>${displayDomain}</h3>
-                    <p>→ ${p.upstream}</p>
+                    <p>→ ${upstream}</p>
                     ${features.length ? `<p style="font-size: 12px; margin-top: 5px;">${features.join(' • ')}</p>` : ''}
                 </div>
                 <div class="item-actions">
                     <span class="status-badge ${p.enabled ? 'status-active' : 'status-inactive'}">
                         ${p.enabled ? 'Active' : 'Disabled'}
                     </span>
-                    <button class="btn btn-primary" onclick="editProxy('${p.id}')">Edit</button>
-                    <button class="btn btn-danger" onclick="deleteProxy('${p.id}')">Delete</button>
+                    <button class="btn btn-primary" onclick="editProxy('${proxyId}')">Edit</button>
+                    <button class="btn btn-danger" onclick="deleteProxy('${proxyId}')">Delete</button>
                 </div>
             </div>
         `;
-    }).join('');
+    }).join(''), true);
 }
 
 function toggleLoadBalancingVisibility() {
@@ -1625,9 +1697,9 @@ async function deleteProxy(id) {
 async function loadWebsites() {
     const websites = await apiCall('/api/websites');
     const list = document.getElementById('website-list');
-    list.innerHTML = websites.map(w => {
+    setContent(list, websites.map(w => {
         const features = [];
-        const displayDomain = (w.domains && w.domains.length) ? w.domains.join(', ') : 'All domains';
+        const displayDomain = (w.domains && w.domains.length) ? w.domains.map(d => escapeHtml(d)).join(', ') : 'All domains';
 
         // Handle port display - support both new and legacy format
         let http_ports, https_ports;
@@ -1662,28 +1734,31 @@ async function loadWebsites() {
         if (w.access_groups && w.access_groups.length) {
             const groupNames = w.access_groups.map(gid => {
                 const group = allGroups.find(g => g.id === gid);
-                return group ? group.name : gid;
+                return group ? escapeHtml(group.name) : escapeHtml(gid);
             }).join(', ');
             features.push(`🔐 ${groupNames}`);
         }
+
+        const root = escapeHtml(w.root);
+        const websiteId = escapeHtml(w.id);
 
         return `
             <div class="item">
                 <div class="item-info">
                     <h3>${displayDomain}</h3>
-                    <p>📁 ${w.root}</p>
+                    <p>📁 ${root}</p>
                     ${features.length ? `<p style="font-size: 12px; margin-top: 5px;">${features.join(' • ')}</p>` : ''}
                 </div>
                 <div class="item-actions">
                     <span class="status-badge ${w.enabled ? 'status-active' : 'status-inactive'}">
                         ${w.enabled ? 'Active' : 'Disabled'}
                     </span>
-                    <button class="btn btn-primary" onclick="editWebsite('${w.id}')">Edit</button>
-                    <button class="btn btn-danger" onclick="deleteWebsite('${w.id}')">Delete</button>
+                    <button class="btn btn-primary" onclick="editWebsite('${websiteId}')">Edit</button>
+                    <button class="btn btn-danger" onclick="deleteWebsite('${websiteId}')">Delete</button>
                 </div>
             </div>
         `;
-    }).join('');
+    }).join(''), true);
 }
 
 function openWebsiteModal() {
@@ -1980,9 +2055,9 @@ async function loadAuthenticationPage() {
 function updateProtocolStatus(protocol, enabled) {
     const statusEl = document.getElementById(`${protocol}-status`);
     if (enabled) {
-        statusEl.innerHTML = '<span style="color: var(--success);">● Enabled</span>';
+        setContent(statusEl, '<span style="color: var(--success);">● Enabled</span>', true);
     } else {
-        statusEl.innerHTML = '<span style="color: var(--danger);">● Disabled</span>';
+        setContent(statusEl, '<span style="color: var(--danger);">● Disabled</span>', true);
     }
 }
 
@@ -2084,11 +2159,11 @@ async function loadOAuthClients() {
         const container = document.getElementById('oauth-clients-list');
 
         if (clients.length === 0) {
-            container.innerHTML = '<p style="color: var(--text-muted); text-align: center; padding: 20px;">No OAuth clients configured</p>';
+            setContent(container, '<p style="color: var(--text-muted); text-align: center; padding: 20px;">No OAuth clients configured</p>', true);
             return;
         }
 
-        container.innerHTML = clients.map(client => {
+        setContent(container, clients.map(client => {
             // Get group names for display
             const groupNames = (client.allowed_groups || []).map(groupId => {
                 const group = allGroups.find(g => g.id === groupId);
@@ -2098,31 +2173,38 @@ async function loadOAuthClients() {
                 ? groupNames.map(name => `<span style="background: var(--primary); color: white; padding: 2px 8px; border-radius: 3px; display: inline-block; margin: 2px; font-size: 0.85em;">${escapeHtml(name)}</span>`).join('')
                 : '<span style="color: var(--text-muted); font-style: italic;">All groups</span>';
 
+            const clientId = escapeHtml(client.client_id);
+
             return `
-            <div style="padding: 15px; background: var(--bg-secondary); border-radius: 6px; margin-bottom: 10px;">
-                <div style="display: flex; justify-content: space-between; align-items: flex-start;">
-                    <div style="flex: 1;">
-                        <h4 style="margin: 0 0 10px 0;">${escapeHtml(client.name)}</h4>
-                        <p style="margin: 5px 0; font-size: 0.9em; color: var(--text-muted);">
-                            <strong>Client ID:</strong> <code style="background: var(--bg-primary); padding: 2px 6px; border-radius: 3px;">${escapeHtml(client.client_id)}</code>
-                        </p>
-                        <p style="margin: 5px 0; font-size: 0.9em; color: var(--text-muted);">
-                            <strong>Redirect URIs:</strong><br>
-                            ${client.redirect_uris.map(uri => `<code style="background: var(--bg-primary); padding: 2px 6px; border-radius: 3px; display: inline-block; margin: 2px;">${escapeHtml(uri)}</code>`).join('')}
-                        </p>
-                        <p style="margin: 5px 0; font-size: 0.9em; color: var(--text-muted);">
-                            <strong>Allowed Groups:</strong><br>
-                            ${groupsDisplay}
+            <div style="padding: 15px; background: var(--bg-secondary); border-radius: 6px; margin-bottom: 15px; border: 1px solid var(--border);">
+                <!-- Header row: Name, Client ID, and Action Buttons -->
+                <div class="oauth-client-card">
+                    <div style="flex: 1; min-width: 0;">
+                        <h4 style="margin: 0 0 5px 0;">${escapeHtml(client.name)}</h4>
+                        <p style="margin: 0; font-size: 0.85em; color: var(--text-muted); word-wrap: break-word;">
+                            <strong>Client ID:</strong> <code style="background: var(--bg-primary); padding: 2px 6px; border-radius: 3px; word-break: break-all;">${clientId}</code>
                         </p>
                     </div>
-                    <div style="display: flex; gap: 8px;">
-                        <button class="btn btn-secondary" onclick="editOAuthClient('${client.client_id}')">Edit</button>
-                        <button class="btn btn-danger" onclick="deleteOAuthClient('${client.client_id}')">Delete</button>
+                    <div class="oauth-client-actions">
+                        <button class="btn btn-secondary" onclick="editOAuthClient('${clientId}')">Edit</button>
+                        <button class="btn btn-danger" onclick="deleteOAuthClient('${clientId}')">Delete</button>
                     </div>
+                </div>
+
+                <!-- Full-width details section -->
+                <div style="margin-top: 12px;">
+                    <p style="margin: 0 0 10px 0; font-size: 0.9em; color: var(--text-muted);">
+                        <strong>Redirect URIs:</strong><br>
+                        ${client.redirect_uris.map(uri => `<code style="background: var(--bg-primary); padding: 2px 6px; border-radius: 3px; display: inline-block; margin: 2px; word-break: break-all; max-width: 100%;">${escapeHtml(uri)}</code>`).join('')}
+                    </p>
+                    <p style="margin: 10px 0 0 0; font-size: 0.9em; color: var(--text-muted);">
+                        <strong>Allowed Groups:</strong><br>
+                        ${groupsDisplay}
+                    </p>
                 </div>
             </div>
             `;
-        }).join('');
+        }).join(''), true);
     } catch (error) {
         alert(`Failed to load OAuth clients: ${error.message}`);
     }
@@ -2146,10 +2228,14 @@ async function openOAuthClientModal() {
     renderGroupSelector('oauth-client-groups', []);
 
     // Reset modal title for creating new client
-    document.querySelector('#oauth-client-modal .modal-header h2').textContent = 'Create OAuth Client';
+    document.querySelector('#oauth-client-modal .modal-header h2').textContent = 'Add OAuth/OIDC Client';
 
     // Clear any editing state
     document.getElementById('oauth-client-modal').dataset.editingClientId = '';
+
+    // Show the custom Client ID field for creation (hidden in edit mode)
+    document.getElementById('oauth-custom-client-id-group').style.display = 'block';
+    document.getElementById('oauth-custom-client-id').value = '';
 
     document.getElementById('oauth-client-modal').classList.add('active');
 }
@@ -2181,6 +2267,9 @@ async function editOAuthClient(clientId) {
 
         // Select the allowed groups - this will now properly render with the loaded groups
         renderGroupSelector('oauth-client-groups', client.allowed_groups || []);
+
+        // Hide the custom Client ID field (only shown during creation)
+        document.getElementById('oauth-custom-client-id-group').style.display = 'none';
 
         // Store the client ID in the modal so saveOAuthClient knows we're editing
         document.getElementById('oauth-client-modal').dataset.editingClientId = clientId;
@@ -2219,8 +2308,8 @@ async function saveOAuthClient() {
         const editingClientId = document.getElementById('oauth-client-modal').dataset.editingClientId;
 
         if (editingClientId) {
-            // Update existing client
-            const result = await apiCall(`/api/oauth/clients/${editingClientId}`, {
+            // Edit mode - update existing client (Client ID cannot be changed)
+            await apiCall(`/api/oauth/clients/${editingClientId}`, {
                 method: 'PUT',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({ name, redirect_uris, allowed_groups })
@@ -2230,11 +2319,24 @@ async function saveOAuthClient() {
             closeOAuthClientModal();
             await loadOAuthClients();
         } else {
-            // Create new client
+            // Create mode - get custom Client ID if provided
+            const customClientId = document.getElementById('oauth-custom-client-id').value.trim();
+
+            const requestBody = {
+                name,
+                redirect_uris,
+                allowed_groups
+            };
+
+            // Include custom_client_id only if provided
+            if (customClientId) {
+                requestBody.custom_client_id = customClientId;
+            }
+
             const result = await apiCall('/api/oauth/clients', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ name, redirect_uris, allowed_groups })
+                body: JSON.stringify(requestBody)
             });
 
             // Show credentials modal with copy buttons

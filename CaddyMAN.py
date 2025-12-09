@@ -53,7 +53,7 @@ from passlib.hash import nthash
 from argon2 import PasswordHasher, Type
 from argon2.exceptions import VerifyMismatchError, VerificationError, InvalidHash
 
-VERSION = "1.3.7"
+VERSION = "1.3.9"
 
 # Argon2id migration mode - set at runtime based on existing hashes or user choice
 # This will be auto-detected on startup
@@ -205,7 +205,14 @@ async def lifespan(app: FastAPI):
     await stop_php_cgi()
     await stop_caddy()
     sessions.clear()
-app = FastAPI(title="CaddyMAN", version=VERSION, lifespan=lifespan)
+app = FastAPI(
+    title="CaddyMAN",
+    version=VERSION,
+    lifespan=lifespan,
+    docs_url=None,  # Disable /docs
+    redoc_url=None,  # Disable /redoc
+    openapi_url=None  # Disable /openapi.json
+)
 
 
 
@@ -614,7 +621,7 @@ default_settings = {
 
 # Models
 class Settings(BaseModel):
-    theme: str
+    theme: Optional[str] = None  # Deprecated but kept for backwards compatibility
     health_check_enabled: bool = False
     health_check_domain: str = ""
     health_check_interval: int = 60
@@ -5914,9 +5921,57 @@ def build_caddy_config():
                     "upstreams": [{"dial": "localhost:8000"}]
                 }]
             }
-            # Bypass for auth pages (login, 2FA challenge)
+            # Bypass for auth pages (login, 2FA challenge) - for CaddyMAN admin domain AND protected sites
+            # Only include sites that have access_groups configured (CaddyMAN handles their auth)
+            # Exclude sites with no access control or sites that handle their own auth (like Audiobookshelf)
+            manager_domains = [settings.get("domain_url", "localhost:8000")]
+            # Extract just the domain from domain_url (remove http:// and port)
+            import re
+            manager_domain = re.sub(r'^https?://', '', manager_domains[0]).split(':')[0]
+
+            # Collect all domains that have CaddyMAN access control enabled
+            auth_allowed_hosts = [manager_domain]
+            with closing(get_db_connection()) as conn:
+                cursor = conn.cursor()
+                import json
+
+                # Check file_server sites (websites table)
+                cursor.execute('SELECT domains, access_groups FROM websites WHERE enabled = 1')
+                for row in cursor.fetchall():
+                    domains_json = row[0]
+                    access_groups_json = row[1]
+                    if domains_json and access_groups_json:
+                        domains = json.loads(domains_json)
+                        access_groups = json.loads(access_groups_json)
+                        # Only include if access control is configured
+                        if access_groups:  # Not empty list
+                            for domain in domains:
+                                clean_domain = domain.split(':')[0]
+                                if clean_domain not in auth_allowed_hosts:
+                                    auth_allowed_hosts.append(clean_domain)
+
+                # Check reverse_proxy sites (reverse_proxies table)
+                cursor.execute('SELECT domains, access_groups FROM reverse_proxies WHERE enabled = 1')
+                for row in cursor.fetchall():
+                    domains_json = row[0]
+                    access_groups_json = row[1]
+                    if domains_json and access_groups_json:
+                        domains = json.loads(domains_json)
+                        access_groups = json.loads(access_groups_json)
+                        # Only include if access control is configured
+                        if access_groups:  # Not empty list
+                            for domain in domains:
+                                clean_domain = domain.split(':')[0]
+                                if clean_domain not in auth_allowed_hosts:
+                                    auth_allowed_hosts.append(clean_domain)
+
             auth_pages_bypass_route = {
-                "match": [{"path": ["/auth/*"]}],
+                "match": [
+                    {
+                        "host": auth_allowed_hosts,
+                        "path": ["/auth/*"]
+                    }
+                ],
                 "handle": [{
                     "handler": "reverse_proxy",
                     "upstreams": [{"dial": "localhost:8000"}]
@@ -6655,9 +6710,11 @@ async def generate_invite_link(
 
     # Input validation - username
     if not invite_data.username or len(invite_data.username) < 1 or len(invite_data.username) > 50:
+        logger.warning(f"Invalid invite link username length: '{invite_data.username}' (len={len(invite_data.username) if invite_data.username else 0}) from {user.get('username')}")
         raise HTTPException(status_code=400, detail="Username must be between 1 and 50 characters")
 
     if not re.match(r'^[a-zA-Z0-9_-]+$', invite_data.username):
+        logger.warning(f"Invalid invite link username characters: '{invite_data.username}' from {user.get('username')}")
         raise HTTPException(status_code=400, detail="Username can only contain letters, numbers, hyphens, and underscores")
 
     # Security: Prevent creating admin users via invite links
@@ -6668,6 +6725,14 @@ async def generate_invite_link(
     # Check if username already exists
     if get_user_by_username_from_db(invite_data.username):
         raise HTTPException(status_code=400, detail="Username already exists")
+
+    # Delete any existing pending invites for this username (replace old with new)
+    all_invites = get_all_invite_tokens_from_db()
+    current_time = datetime.now().timestamp()
+    for existing_invite in all_invites:
+        if existing_invite['username'] == invite_data.username and existing_invite['expires_at'] > current_time:
+            delete_invite_token_from_db(existing_invite['token'])
+            logger.info(f"Replaced existing invite for username '{invite_data.username}' with new invite by {user.get('username')}")
 
     # Validate groups exist
     all_groups = get_all_groups_from_db()
@@ -6780,6 +6845,15 @@ async def get_user_portal_branding():
         "organization_name": settings.get("organization_name", "CaddyMAN")
     }
 
+@app.get("/api/user-portal/settings")
+async def get_user_portal_settings():
+    """Get public settings for user portal (no authentication required)"""
+    settings = get_settings_from_db()
+    return {
+        "enhanced_security": settings.get("enhanced_security", False),
+        "organization_name": settings.get("organization_name", "CaddyMAN")
+    }
+
 @app.get("/api/user-portal/invite/{token}")
 async def verify_invite_token(token: str):
     """Verify an invite token and return user details for setup page"""
@@ -6827,9 +6901,15 @@ async def setup_account(setup_data: SetupAccountRequest, request: Request):
     if get_user_by_username_from_db(invite['username']):
         raise HTTPException(status_code=400, detail="User already exists")
 
-    # Validate password
-    if len(setup_data.password) < 4:
-        raise HTTPException(status_code=400, detail="Password must be at least 4 characters")
+    # Validate password with Enhanced Security Mode check
+    settings = get_settings_from_db()
+    if settings.get("enhanced_security", False):
+        is_valid, error_msg = validate_password_strength(setup_data.password)
+        if not is_valid:
+            raise HTTPException(status_code=400, detail=error_msg)
+    else:
+        if len(setup_data.password) < 4:
+            raise HTTPException(status_code=400, detail="Password must be at least 4 characters")
 
     # Create the user
     new_user = {
@@ -6846,6 +6926,9 @@ async def setup_account(setup_data: SetupAccountRequest, request: Request):
     # Delete the consumed invite token
     delete_invite_token_from_db(setup_data.token)
 
+    # Check if user needs to enable 2FA due to group requirements
+    requires_2fa = user_requires_2fa(new_user)
+
     # Log activity
     await log_activity(invite['username'], "ACCOUNT_SETUP", f"Account activated via invite link", client_ip)
     await send_event_notification("user_created", "New User Account Created",
@@ -6854,7 +6937,11 @@ async def setup_account(setup_data: SetupAccountRequest, request: Request):
 
     logger.info(f"User {invite['username']} completed account setup via invite link")
 
-    return {"status": "success", "message": "Account activated successfully"}
+    return {
+        "status": "success",
+        "message": "Account activated successfully",
+        "requires_2fa": requires_2fa
+    }
 
 class ChangePasswordRequest(BaseModel):
     current_password: str
@@ -6876,9 +6963,15 @@ async def change_password(password_data: ChangePasswordRequest, request: Request
         await log_activity(user.get('username'), "PASSWORD_CHANGE_FAILED", "Incorrect current password", client_ip)
         raise HTTPException(status_code=401, detail="Current password is incorrect")
 
-    # Validate new password
-    if len(password_data.new_password) < 4:
-        raise HTTPException(status_code=400, detail="New password must be at least 4 characters")
+    # Validate new password with Enhanced Security Mode check
+    settings = get_settings_from_db()
+    if settings.get("enhanced_security", False):
+        is_valid, error_msg = validate_password_strength(password_data.new_password)
+        if not is_valid:
+            raise HTTPException(status_code=400, detail=error_msg)
+    else:
+        if len(password_data.new_password) < 4:
+            raise HTTPException(status_code=400, detail="New password must be at least 4 characters")
 
     # Update password
     user['password_hash'] = hash_password(password_data.new_password)
@@ -7263,9 +7356,15 @@ async def reset_password(reset_data: ResetPasswordRequest, request: Request):
     if reset['used']:
         raise HTTPException(status_code=410, detail="Reset link has already been used")
 
-    # Validate new password
-    if len(reset_data.new_password) < 4:
-        raise HTTPException(status_code=400, detail="Password must be at least 4 characters")
+    # Validate new password with Enhanced Security Mode check
+    settings = get_settings_from_db()
+    if settings.get("enhanced_security", False):
+        is_valid, error_msg = validate_password_strength(reset_data.new_password)
+        if not is_valid:
+            raise HTTPException(status_code=400, detail=error_msg)
+    else:
+        if len(reset_data.new_password) < 4:
+            raise HTTPException(status_code=400, detail="Password must be at least 4 characters")
 
     # Get user
     users = get_all_users_from_db()
@@ -7406,11 +7505,11 @@ async def oidc_discovery():
         "grant_types_supported": ["authorization_code", "refresh_token"],
         "subject_types_supported": ["public"],
         "id_token_signing_alg_values_supported": ["RS256"],
-        "scopes_supported": ["openid", "profile", "email", "groups"],
+        "scopes_supported": ["openid", "profile", "email", "groups", "abspermissions"],
         "token_endpoint_auth_methods_supported": ["client_secret_post", "client_secret_basic"],
         "claims_supported": [
             "sub", "iss", "aud", "exp", "iat", "username", "email", "email_verified",
-            "name", "given_name", "family_name", "groups"
+            "name", "given_name", "family_name", "groups", "permissions"
         ],
         "code_challenge_methods_supported": ["S256"]
     }
@@ -7453,6 +7552,7 @@ async def jwks_endpoint():
     return {"keys": [jwk_key]}
 
 @app.get("/oauth/authorize")
+@app.get("/auth/openid")  # Alias for Audiobookshelf mobile app compatibility
 async def oauth_authorize(
     request: Request,
     response_type: str,
@@ -7593,7 +7693,10 @@ async def oauth_authorize(
         params['state'] = state
 
     redirect_url = f"{redirect_uri}?{urlencode(params)}"
-    return HTMLResponse(f'<html><head><meta http-equiv="refresh" content="0;url={redirect_url}"></head></html>')
+
+    # Use HTTP 302 redirect for mobile app compatibility (custom URI schemes like audiobookshelf://)
+    # HTML meta refresh doesn't work for native apps
+    return RedirectResponse(url=redirect_url, status_code=302)
 
 @app.post("/oauth/token")
 async def oauth_token(
@@ -7857,7 +7960,7 @@ async def oauth_userinfo(authorization: Optional[str] = Header(None)):
     if 'groups' in scopes:
         userinfo['groups'] = user.get('groups', [])
 
-    # Merge custom OIDC claims from user's groups
+    # Merge custom OIDC claims from user's groups (includes abspermissions if configured)
     custom_claims = merge_group_oidc_claims(user)
     userinfo.update(custom_claims)
 
@@ -7968,6 +8071,7 @@ class OAuthClientCreate(BaseModel):
     name: str
     redirect_uris: List[str]
     allowed_groups: Optional[List[str]] = []
+    custom_client_id: Optional[str] = None  # Allow manual client ID for special cases (e.g., mobile apps)
 
 @app.post("/api/oauth/clients")
 async def create_oauth_client(
@@ -7985,8 +8089,22 @@ async def create_oauth_client(
     redirect_uris = client_data.redirect_uris
     allowed_groups = client_data.allowed_groups if client_data.allowed_groups else []
 
-    # Generate client ID and secret
-    client_id = secrets.token_urlsafe(16)
+    # Use custom client ID if provided (for mobile apps with hardcoded IDs), otherwise generate
+    if client_data.custom_client_id:
+        # Validate custom client ID
+        if not re.match(r'^[a-zA-Z0-9_-]+$', client_data.custom_client_id):
+            raise HTTPException(status_code=400, detail="Custom Client ID can only contain letters, numbers, hyphens, and underscores")
+        if len(client_data.custom_client_id) < 3 or len(client_data.custom_client_id) > 100:
+            raise HTTPException(status_code=400, detail="Custom Client ID must be between 3 and 100 characters")
+        # Check if custom ID already exists
+        existing = get_oauth_client_by_id_from_db(client_data.custom_client_id)
+        if existing:
+            raise HTTPException(status_code=400, detail=f"Client ID '{client_data.custom_client_id}' already exists")
+        client_id = client_data.custom_client_id
+        logger.info(f"Creating OAuth client with custom Client ID: {client_id}")
+    else:
+        client_id = secrets.token_urlsafe(16)
+
     client_secret = secrets.token_urlsafe(32)
     client_secret_hash = bcrypt.hashpw(client_secret.encode('utf-8'), bcrypt.gensalt()).decode('utf-8')
 
@@ -8089,7 +8207,9 @@ async def get_settings(session_id: Optional[str] = Cookie(None)):
     user = get_session_user(session_id)
     if not user:
         raise HTTPException(status_code=401, detail="Not authenticated")
-    # Get settings from database
+
+    # Get settings from database and return all settings
+    # Passwords will be displayed in password-type fields with show/hide buttons
     return get_settings_from_db()
 
 @app.post("/api/settings")

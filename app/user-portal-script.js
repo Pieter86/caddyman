@@ -1,8 +1,32 @@
 // User Portal JavaScript
 const API_BASE = '';
 
-// Store branding info globally
+// Store branding info and settings globally
 let organizationName = 'CaddyMAN'; // Default fallback
+let enhancedSecurityEnabled = false; // Enhanced Security Mode status
+
+// Security helper functions
+function escapeHtml(unsafe) {
+    if (typeof unsafe !== 'string') return '';
+    return unsafe
+        .replace(/&/g, "&amp;")
+        .replace(/</g, "&lt;")
+        .replace(/>/g, "&gt;")
+        .replace(/"/g, "&quot;")
+        .replace(/'/g, "&#039;");
+}
+
+// Secure way to set HTML content - sanitizes by default
+function setContent(element, content, allowHtml = false) {
+    if (!element) return;
+    if (allowHtml) {
+        // For trusted HTML content only (from our own template strings, not user input)
+        element.innerHTML = content;
+    } else {
+        // Default: treat as plain text to prevent XSS
+        element.textContent = content;
+    }
+}
 
 // Helper function for API calls
 async function apiCall(endpoint, options = {}) {
@@ -22,14 +46,15 @@ async function apiCall(endpoint, options = {}) {
     return response.json();
 }
 
-// Load branding configuration
+// Load branding and settings configuration
 async function loadBranding() {
     try {
-        // Fetch public branding info without authentication
-        const response = await fetch('/api/user-portal/branding');
+        // Fetch public settings info without authentication
+        const response = await fetch('/api/user-portal/settings');
         if (response.ok) {
-            const branding = await response.json();
-            organizationName = branding.organization_name || 'CaddyMAN';
+            const settings = await response.json();
+            organizationName = settings.organization_name || 'CaddyMAN';
+            enhancedSecurityEnabled = settings.enhanced_security || false;
 
             // Update page elements
             const orgNameEl = document.getElementById('org-name');
@@ -37,13 +62,47 @@ async function loadBranding() {
 
             const pageTitleEl = document.getElementById('page-title');
             if (pageTitleEl) pageTitleEl.textContent = `${organizationName} User Portal`;
+
+            // Update password field hints and minlength based on Enhanced Security Mode
+            updatePasswordFieldRequirements();
         }
     } catch (err) {
         console.error('Failed to load branding:', err);
         // Use defaults if fetch fails
         const orgNameEl = document.getElementById('org-name');
         if (orgNameEl) orgNameEl.textContent = 'CaddyMAN';
+        updatePasswordFieldRequirements();
     }
+}
+
+// Update password field requirements based on Enhanced Security Mode
+function updatePasswordFieldRequirements() {
+    const passwordFields = [
+        { id: 'setup-password', hintSelector: '#setup-password + .hint' },
+        { id: 'setup-password-confirm', hintSelector: null },
+        { id: 'new-password', hintSelector: '#new-password + .hint' },
+        { id: 'new-password-confirm', hintSelector: null },
+        { id: 'reset-new-password', hintSelector: '#reset-new-password + .hint' },
+        { id: 'reset-new-password-confirm', hintSelector: null }
+    ];
+
+    const minLength = enhancedSecurityEnabled ? 8 : 4;
+    const hintText = enhancedSecurityEnabled
+        ? 'Min 8 chars (all 4 types: A-Z, a-z, 0-9, symbols) OR 10 (any 3) OR 14 (any 2) OR 20 (one type)'
+        : 'Minimum 4 characters';
+
+    passwordFields.forEach(field => {
+        const input = document.getElementById(field.id);
+        if (input) {
+            input.setAttribute('minlength', minLength);
+        }
+        if (field.hintSelector) {
+            const hint = document.querySelector(field.hintSelector);
+            if (hint) {
+                hint.textContent = hintText;
+            }
+        }
+    });
 }
 
 // Alert system
@@ -131,22 +190,28 @@ document.getElementById('setup-form').addEventListener('submit', async (e) => {
         return;
     }
 
-    if (password.length < 4) {
-        showAlert('Password must be at least 4 characters', 'error');
+    const minLength = enhancedSecurityEnabled ? 8 : 4;
+    if (password.length < minLength) {
+        showAlert(`Password must be at least ${minLength} characters`, 'error');
         return;
     }
 
     try {
-        await apiCall('/api/user-portal/setup', {
+        const result = await apiCall('/api/user-portal/setup', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ token, password })
         });
 
-        showAlert('Account activated successfully! Please log in.', 'success');
+        if (result.requires_2fa) {
+            showAlert('Account activated! Your group requires 2FA. Please log in and enable 2FA immediately.', 'warning');
+        } else {
+            showAlert('Account activated successfully! Please log in.', 'success');
+        }
+
         setTimeout(() => {
             window.location.href = '/user-portal';
-        }, 2000);
+        }, 3000);
     } catch (err) {
         showAlert(err.message, 'error');
     }
@@ -315,11 +380,11 @@ async function loadWifiPasswordStatus() {
 
             // Update status text
             if (status.has_wifi_password) {
-                wifiStatusText.innerHTML = '<strong style="color: var(--success);">Status:</strong> WiFi password is configured ✓';
+                setContent(wifiStatusText, '<strong style="color: var(--success);">Status:</strong> WiFi password is configured ✓', true);
                 deleteBtn.style.display = 'inline-block';
                 setBtn.textContent = 'Update WiFi Password';
             } else {
-                wifiStatusText.innerHTML = '<strong style="color: var(--warning);">Status:</strong> No WiFi password set';
+                setContent(wifiStatusText, '<strong style="color: var(--warning);">Status:</strong> No WiFi password set', true);
                 deleteBtn.style.display = 'none';
                 setBtn.textContent = 'Set WiFi Password';
             }
