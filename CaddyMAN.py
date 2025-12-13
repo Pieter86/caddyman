@@ -53,7 +53,7 @@ from passlib.hash import nthash
 from argon2 import PasswordHasher, Type
 from argon2.exceptions import VerifyMismatchError, VerificationError, InvalidHash
 
-VERSION = "1.3.10"
+VERSION = "1.3.11"
 
 # Argon2id migration mode - set at runtime based on existing hashes or user choice
 # This will be auto-detected on startup
@@ -171,6 +171,67 @@ logger = logging.getLogger(__name__)
 if DEBUG_MODE:
     logger.info("[STARTUP] DEBUG_MODE enabled - TLS keylog files will be created")
 
+async def migrate_settings_encryption():
+    """
+    v1.3.11 Migration: Encrypt sensitive settings with pepper and fix boolean types.
+    This runs once on startup to:
+    1. Convert string booleans ("true"/"false") to actual booleans
+    2. Encrypt sensitive settings (SMTP password, RADIUS secret, tokens) with pepper
+    3. Migrate WiFi password encryption from DB-stored key to pepper-based encryption
+    """
+    logger.info("[MIGRATION] Starting settings encryption and type migration...")
+
+    with closing(get_db_connection()) as conn:
+        cursor = conn.cursor()
+
+        # List of settings that should be booleans
+        boolean_settings = [
+            'ldap_enabled', 'radius_enabled', 'enhanced_security', 'auth_protocols_enabled',
+            'oidc_enabled', 'radius_eap_ttls_enabled', 'radius_eap_peap_enabled',
+            'notification_gotify_enabled', 'notification_ntfy_enabled'
+        ]
+
+        # List of settings that should be encrypted
+        sensitive_settings = [
+            'smtp_password', 'radius_secret', 'notification_token',
+            'gotify_token', 'ntfy_token'
+        ]
+
+        # Fix boolean settings (convert string "true"/"false" to JSON true/false)
+        for setting_key in boolean_settings:
+            cursor.execute('SELECT value FROM settings WHERE key = ?', (setting_key,))
+            row = cursor.fetchone()
+            if row:
+                value = row['value']
+                # Convert string booleans to JSON booleans
+                if value == 'true':
+                    cursor.execute('UPDATE settings SET value = ? WHERE key = ?', (json.dumps(True), setting_key))
+                    logger.info(f"[MIGRATION] Fixed boolean setting: {setting_key} = True")
+                elif value == 'false':
+                    cursor.execute('UPDATE settings SET value = ? WHERE key = ?', (json.dumps(False), setting_key))
+                    logger.info(f"[MIGRATION] Fixed boolean setting: {setting_key} = False")
+
+        # Encrypt sensitive settings
+        for setting_key in sensitive_settings:
+            cursor.execute('SELECT value FROM settings WHERE key = ?', (setting_key,))
+            row = cursor.fetchone()
+            if row and row['value']:
+                value = row['value']
+                # Only encrypt if not already encrypted
+                if not value.startswith('enc:'):
+                    try:
+                        encrypted_value = encrypt_setting(value)
+                        cursor.execute('UPDATE settings SET value = ? WHERE key = ?', (encrypted_value, setting_key))
+                        logger.info(f"[MIGRATION] Encrypted setting: {setting_key}")
+                    except Exception as e:
+                        logger.error(f"[MIGRATION] Failed to encrypt {setting_key}: {e}")
+
+        conn.commit()
+
+    # Force reload settings cache after migration
+    reload_settings_cache()
+    logger.info("[MIGRATION] Settings encryption and type migration complete")
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # Startup
@@ -178,6 +239,7 @@ async def lifespan(app: FastAPI):
     logger.info(f"Starting CaddyMAN v{VERSION}")
     load_last_restart_time()  # Load restart tracking from database
     get_settings_from_db()  # Initialize settings cache on startup
+    await migrate_settings_encryption()  # v1.3.11: Encrypt sensitive settings and fix types
     await start_caddy()
     await start_php_cgi()
     await start_ldap_server()  # Start LDAP server if enabled
@@ -595,6 +657,9 @@ default_settings = {
         "user_created": {"enabled": True, "severity": "info"},
         "user_deleted": {"enabled": True, "severity": "warning"},
         "password_changed": {"enabled": False, "severity": "info"},
+        # User Portal
+        "user_portal_login_success": {"enabled": False, "severity": "info"},
+        "user_portal_login_failed": {"enabled": True, "severity": "warning"},
         # Website Authentication
         "website_login_success": {"enabled": False, "severity": "info"},
         "website_login_failed": {"enabled": True, "severity": "warning"},
@@ -607,6 +672,22 @@ default_settings = {
         "radius_auth_denied": {"enabled": True, "severity": "warning"},
         "oidc_auth_success": {"enabled": False, "severity": "info"},
         "oidc_auth_denied": {"enabled": True, "severity": "warning"},
+        # User Management
+        "invite_created": {"enabled": False, "severity": "info"},
+        "invite_used": {"enabled": True, "severity": "info"},
+        "password_reset_requested": {"enabled": True, "severity": "warning"},
+        "password_reset_completed": {"enabled": False, "severity": "info"},
+        "2fa_enabled": {"enabled": False, "severity": "info"},
+        "2fa_disabled": {"enabled": True, "severity": "warning"},
+        "wifi_password_set": {"enabled": False, "severity": "info"},
+        "wifi_password_deleted": {"enabled": False, "severity": "info"},
+        # Group & OAuth Management
+        "group_created": {"enabled": False, "severity": "info"},
+        "group_modified": {"enabled": False, "severity": "info"},
+        "group_deleted": {"enabled": True, "severity": "warning"},
+        "oauth_client_created": {"enabled": False, "severity": "info"},
+        "oauth_client_modified": {"enabled": False, "severity": "info"},
+        "oauth_client_deleted": {"enabled": True, "severity": "warning"},
         # System Events
         "caddy_started": {"enabled": True, "severity": "success"},
         "caddy_stopped": {"enabled": True, "severity": "warning"},
@@ -945,6 +1026,53 @@ def hash_password(password: str) -> str:
         logger.debug("Password hashed with bcrypt")
         return hashed
 
+def _get_pepper_fernet_key() -> bytes:
+    """
+    Get Fernet encryption key derived from DPAPI-protected pepper.
+    Uses the same pepper as password hashing for consistent security.
+    """
+    pepper = _get_dpapi_pepper()
+    # Derive a Fernet-compatible key from the pepper using HKDF
+    from cryptography.hazmat.primitives.kdf.hkdf import HKDF
+    hkdf = HKDF(
+        algorithm=hashes.SHA256(),
+        length=32,
+        salt=b'caddyman-settings-encryption',
+        info=b'fernet-key-derivation',
+        backend=default_backend()
+    )
+    key = hkdf.derive(pepper)
+    return base64.urlsafe_b64encode(key)
+
+def encrypt_setting(plaintext: str) -> str:
+    """
+    Encrypt a setting value using pepper-based Fernet encryption.
+    Returns encrypted value with 'enc:' prefix to mark it as encrypted.
+    """
+    if not plaintext:
+        return plaintext
+    fernet_key = _get_pepper_fernet_key()
+    f = Fernet(fernet_key)
+    encrypted = f.encrypt(plaintext.encode('utf-8'))
+    return 'enc:' + encrypted.decode('utf-8')
+
+def decrypt_setting(encrypted_or_plain: str) -> str:
+    """
+    Decrypt a setting value encrypted with pepper-based Fernet.
+    If value doesn't start with 'enc:', returns it as-is (plaintext).
+    """
+    if not encrypted_or_plain or not encrypted_or_plain.startswith('enc:'):
+        return encrypted_or_plain
+    try:
+        encrypted_value = encrypted_or_plain[4:]  # Remove 'enc:' prefix
+        fernet_key = _get_pepper_fernet_key()
+        f = Fernet(fernet_key)
+        decrypted = f.decrypt(encrypted_value.encode('utf-8'))
+        return decrypted.decode('utf-8')
+    except Exception as e:
+        logger.error(f"Failed to decrypt setting: {e}")
+        raise RuntimeError("Failed to decrypt setting - pepper may be incorrect")
+
 def verify_password(password: str, hashed: str) -> bool:
     """
     Verify password against hash.
@@ -1263,6 +1391,13 @@ def init_database():
         except sqlite3.OperationalError:
             pass
 
+        # Migration v1.3.11: Add WiFi password hash to users
+        try:
+            cursor.execute("ALTER TABLE users ADD COLUMN wifi_password_hash TEXT")
+            logger.info("Added wifi_password_hash column to users table")
+        except sqlite3.OperationalError:
+            pass
+
         # Create OAuth clients table
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS oauth_clients (
@@ -1563,11 +1698,31 @@ def get_settings_from_db():
         settings = {}
         for row in rows:
             try:
-                settings[row['key']] = json.loads(row['value'])
+                value = json.loads(row['value'])
             except:
-                settings[row['key']] = row['value']
+                value = row['value']
+            # Automatically decrypt encrypted settings (those starting with 'enc:')
+            if isinstance(value, str) and value.startswith('enc:'):
+                try:
+                    value = decrypt_setting(value)
+                except Exception as e:
+                    logger.error(f"Failed to decrypt setting {row['key']}: {e}")
+                    # Keep the encrypted value to avoid breaking things
+            settings[row['key']] = value
+
         # Merge with defaults for any missing keys
-        _cached_settings = {**default_settings, **settings}
+        merged_settings = {**default_settings, **settings}
+
+        # Special handling for notification_events: merge defaults with saved events
+        # This ensures new events added in updates are included with their defaults
+        if 'notification_events' in settings and 'notification_events' in default_settings:
+            # Start with defaults, then overlay user's saved preferences
+            default_events = default_settings['notification_events']
+            saved_events = settings['notification_events']
+            merged_events = {**default_events, **saved_events}
+            merged_settings['notification_events'] = merged_events
+
+        _cached_settings = merged_settings
         return _cached_settings
 
 def reload_settings_cache():
@@ -2516,22 +2671,37 @@ async def check_for_updates():
             if response.status_code == 200:
                 data = response.json()
                 remote_version = data.get("version", "0.0.0")
-                
+
                 # Parse versions properly
                 def parse_version(v):
                     try:
                         return tuple(int(x) for x in v.split('.'))
                     except:
                         return (0, 0, 0)
-                
+
                 current = parse_version(VERSION)
                 remote = parse_version(remote_version)
             #    print("========================")
             #    print("T.V:"+str(current)+" - L.V:"+str(remote))
             #    print("========================")
                 if remote > current:
+                    # Only send notification if this is a new update
+                    was_update_available = update_available is not None
                     update_available = data
                     logger.info(f"Update available: {remote_version}")
+
+                    # Send notification only if this is a newly detected update
+                    if not was_update_available:
+                        await send_event_notification(
+                            "update_available",
+                            "CaddyMAN Update Available",
+                            f"Version {remote_version} is now available for download.\n\n"
+                            f"Current version: {VERSION}\n"
+                            f"New version: {remote_version}\n\n"
+                            f"Download from the dashboard or use caddyman-update.exe to install.",
+                            current_version=VERSION,
+                            new_version=remote_version
+                        )
                 else:
                     update_available = None
                     logger.debug(f"No update. Current: {VERSION}, Remote: {remote_version}")
@@ -3717,20 +3887,12 @@ def parse_eap_packet(data: bytes) -> dict:
 
 def get_wifi_encryption_key() -> bytes:
     """
-    Get or generate the encryption key for WiFi passwords.
-    Uses a key derived from a secret stored in settings.
+    Get encryption key for WiFi passwords using pepper-based encryption (v1.3.11+).
+    This ensures WiFi passwords are protected with the same security as other secrets.
     """
-    settings = get_settings_from_db()
-    encryption_secret = settings.get('wifi_password_encryption_secret')
-
-    if not encryption_secret:
-        # Generate a new secret
-        encryption_secret = base64.urlsafe_b64encode(secrets.token_bytes(32)).decode()
-        update_setting_in_db('wifi_password_encryption_secret', encryption_secret)
-
-    # Derive a Fernet key from the secret
-    key = hashlib.sha256(encryption_secret.encode()).digest()
-    return base64.urlsafe_b64encode(key)
+    # Use the same pepper-based Fernet key as other settings
+    # This is more secure than storing an encryption key in the database
+    return _get_pepper_fernet_key()
 
 def encrypt_wifi_password(plaintext_password: str) -> str:
     """
@@ -8583,80 +8745,9 @@ async def check_update(session_id: Optional[str] = Cookie(None)):
     await check_for_updates()
     return {"current_version": VERSION, "update_available": update_available}
 
-@app.post("/api/update/install")
-async def install_update(request: Request, session_id: Optional[str] = Cookie(None)):
-    user = get_session_user(session_id)
-    if not user:
-        raise HTTPException(status_code=401, detail="Not authenticated")
-    require_csrf(request, session_id)
-    if not update_available:
-        raise HTTPException(status_code=400, detail="No update available")
+# Auto-install endpoint removed in v1.3.11 - use caddyman-update.exe instead
+# Manual download still available via download button in dashboard
 
-    try:
-        download_url = update_available.get("download_url")
-        async with httpx.AsyncClient(timeout=300.0) as client:
-            response = await client.get(download_url)
-            if response.status_code != 200:
-                raise HTTPException(status_code=500, detail="Failed to download update")
-
-        # Determine current executable path (works for both .py and .exe)
-        if getattr(sys, 'frozen', False):
-            # Running as PyInstaller executable (includes auto-py-to-exe builds)
-            # sys.frozen is set by PyInstaller when creating executables
-            current_exe = os.path.abspath(sys.executable)
-        else:
-            # Running as Python script
-            current_exe = os.path.abspath(__file__)
-
-        # Get directory where executable is located
-        exe_dir = os.path.dirname(current_exe)
-        exe_name = os.path.basename(current_exe)
-
-        new_exe_name = "CaddyMAN_new.exe" if platform.system() == "Windows" else "CaddyMAN_new"
-        new_exe_path = os.path.join(exe_dir, new_exe_name)
-
-        # Download update to same directory as current executable
-        with open(new_exe_path, "wb") as f:
-            f.write(response.content)
-
-        if platform.system() != "Windows":
-            os.chmod(new_exe_path, 0o755)
-
-        logger.info(f"Update downloaded to {new_exe_path}")
-
-        # Create backup and replace
-        backup_exe = current_exe + ".backup"
-
-        logger.info(f"Creating backup: {current_exe} -> {backup_exe}")
-        if os.path.exists(backup_exe):
-            os.remove(backup_exe)
-        shutil.move(current_exe, backup_exe)
-
-        logger.info(f"Installing update: {new_exe_path} -> {current_exe}")
-        shutil.move(new_exe_path, current_exe)
-
-        logger.info("Update installed - restarting...")
-        await send_notification(
-            "Update Successful",
-            f"✨ CaddyMAN has been updated\n\n"
-            f"New version: {update_available['version']}\n"
-            f"Previous version: {VERSION}\n"
-            f"Status: Restarting application...",
-            "success"
-        )
-
-        # Restart the application
-        if platform.system() == "Windows":
-            # Use subprocess to start new instance and exit current one
-            subprocess.Popen([current_exe], creationflags=subprocess.CREATE_NEW_CONSOLE if hasattr(subprocess, 'CREATE_NEW_CONSOLE') else 0)
-            os._exit(0)
-        else:
-            os.execv(current_exe, [current_exe])
-
-    except Exception as e:
-        logger.error(f"Update failed: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-        
 @app.get("/api/activity")
 async def get_activity(session_id: Optional[str] = Cookie(None)):
     user = get_session_user(session_id)

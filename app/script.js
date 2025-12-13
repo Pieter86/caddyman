@@ -294,12 +294,7 @@ async function checkForUpdates() {
     } catch {}
 }
 
-async function installUpdate() {
-    if (confirm('Install update and restart? This will take a few moments.')) {
-        showAlert('Downloading update...', 'success');
-        await apiCall('/api/update/install', {method: 'POST'});
-    }
-}
+// Auto-install removed in v1.3.11 - use caddyman-update.exe instead
 
 // Navigation
 function showPage(page, sourceEvent = null) {
@@ -422,20 +417,11 @@ async function checkForUpdates() {
 }
 
 async function handleUpdate() {
-    if (!runtimeInfo) {
-        await loadRuntimeInfo();
-    }
-
-    if (runtimeInfo && runtimeInfo.is_executable) {
-        // EXE mode: Auto-install
-        await installUpdate();
-    } else {
-        // Script mode: Open download page
-        const updateData = await apiCall('/api/update/check');
-        if (updateData.update_available && updateData.update_available.download_url) {
-            window.open(updateData.update_available.download_url, '_blank');
-            showAlert('Download the new version and replace your current files.', 'info');
-        }
+    // Always show download link - use caddyman-update.exe for auto-install
+    const updateData = await apiCall('/api/update/check');
+    if (updateData.update_available && updateData.update_available.download_url) {
+        window.open(updateData.update_available.download_url, '_blank');
+        showAlert('Download started. Use caddyman-update.exe to automatically install updates.', 'info');
     }
 }
 
