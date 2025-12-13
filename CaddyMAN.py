@@ -53,7 +53,7 @@ from passlib.hash import nthash
 from argon2 import PasswordHasher, Type
 from argon2.exceptions import VerifyMismatchError, VerificationError, InvalidHash
 
-VERSION = "1.3.9"
+VERSION = "1.3.10"
 
 # Argon2id migration mode - set at runtime based on existing hashes or user choice
 # This will be auto-detected on startup
@@ -214,6 +214,56 @@ app = FastAPI(
     openapi_url=None  # Disable /openapi.json
 )
 
+# Custom CORS middleware for OAuth endpoints that allows subdomains
+class OAuthCORSMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request: Request, call_next):
+        origin = request.headers.get("origin")
+
+        # Only apply CORS to OAuth endpoints
+        if request.url.path.startswith("/oauth/") or request.url.path.startswith("/.well-known/"):
+            # Get domain from settings to allow all subdomains
+            try:
+                settings = get_settings_from_db()
+                domain_url = settings.get('domain_url', '')
+                if domain_url:
+                    parsed = urlparse(domain_url)
+                    base_domain = parsed.netloc
+                    # Extract base domain (e.g., jvr.nz from users.jvr.nz)
+                    parts = base_domain.split('.')
+                    if len(parts) >= 2:
+                        base_domain = '.'.join(parts[-2:])  # Get last two parts (e.g., jvr.nz)
+
+                    # Check if origin matches the base domain or any subdomain
+                    if origin:
+                        origin_parsed = urlparse(origin)
+                        origin_host = origin_parsed.netloc
+
+                        # Allow if origin is the base domain or any subdomain
+                        if origin_host == base_domain or origin_host.endswith('.' + base_domain):
+                            if request.method == "OPTIONS":
+                                # Preflight request
+                                return Response(
+                                    status_code=200,
+                                    headers={
+                                        "Access-Control-Allow-Origin": origin,
+                                        "Access-Control-Allow-Credentials": "true",
+                                        "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+                                        "Access-Control-Allow-Headers": "*",
+                                    }
+                                )
+                            else:
+                                # Actual request
+                                response = await call_next(request)
+                                response.headers["Access-Control-Allow-Origin"] = origin
+                                response.headers["Access-Control-Allow-Credentials"] = "true"
+                                return response
+            except Exception as e:
+                logger.warning(f"CORS middleware error: {e}")
+
+        # For non-OAuth endpoints or if CORS check fails, proceed normally
+        return await call_next(request)
+
+app.add_middleware(OAuthCORSMiddleware)
 
 
 class AdminAuthMiddleware(BaseHTTPMiddleware):
@@ -222,7 +272,7 @@ class AdminAuthMiddleware(BaseHTTPMiddleware):
         client_ip = request.headers.get("x-forwarded-for", request.client.host if request.client else "unknown")
         if "," in client_ip:
             client_ip = client_ip.split(",")[0].strip()
-        
+
         # Allow login page, OAuth, user portal, auth endpoints, and admin page
         if (request.url.path in ["/", "/admin", "/login", "/api/auth/login", "/api/auth/logout", "/api/auth/verify", "/api/login", "/api/user"] or
             request.url.path.startswith("/static/") or
@@ -233,7 +283,7 @@ class AdminAuthMiddleware(BaseHTTPMiddleware):
             request.url.path.startswith("/api/user-portal/") or
             request.url.path.startswith("/api/user-portal/branding")):
             return await call_next(request)
-        
+
         # All other pages require admin group membership
         if request.url.path.startswith("/api/"):
             session_id = request.cookies.get("session_id")
@@ -795,6 +845,7 @@ class LoginRequest(BaseModel):
     username: str
     password: str
     totp_token: Optional[str] = None
+    two_factor_token: Optional[str] = None  # User portal sends this instead of totp_token
 
 # ====================================================================
 # Argon2id Password Hashing with DPAPI-Encrypted Pepper
@@ -1681,7 +1732,7 @@ def create_jwt_token(user_id: str, client_id: str, scopes: List[str], expires_in
     token = jwt.encode(payload, private_key, algorithm='RS256')
     return token
 
-def create_id_token(user_id: str, client_id: str, username: str, email: str, nonce: Optional[str] = None):
+def create_id_token(user_id: str, client_id: str, username: str, email: str, nonce: Optional[str] = None, groups: Optional[List[str]] = None):
     """
     Create an OpenID Connect ID token
     """
@@ -1707,8 +1758,25 @@ def create_id_token(user_id: str, client_id: str, username: str, email: str, non
     if nonce:
         payload['nonce'] = nonce
 
+    # Include groups if provided
+    if groups:
+        payload['groups'] = groups
+
     token = jwt.encode(payload, private_key, algorithm='RS256')
     return token
+
+def get_group_names_from_ids(group_ids: List[str]) -> List[str]:
+    """Convert group IDs to group names for OIDC claims"""
+    if not group_ids:
+        return []
+
+    with closing(get_db_connection()) as conn:
+        cursor = conn.cursor()
+        # Create placeholders for SQL IN clause
+        placeholders = ','.join('?' * len(group_ids))
+        cursor.execute(f'SELECT name FROM groups WHERE id IN ({placeholders})', group_ids)
+        rows = cursor.fetchall()
+        return [row['name'] for row in rows]
 
 # OAuth Database Functions
 def get_all_oauth_clients_from_db():
@@ -5914,13 +5982,8 @@ def build_caddy_config():
             server_data["routes"].insert(0, acme_bypass_route)
 
             # Bypass for API auth endpoints (manager login, website auth, etc.)
-            api_auth_bypass_route = {
-                "match": [{"path": ["/api/auth/*", "/api/website-auth/*"]}],
-                "handle": [{
-                    "handler": "reverse_proxy",
-                    "upstreams": [{"dial": "localhost:8000"}]
-                }]
-            }
+            # Note: auth_allowed_hosts is populated below, so we'll create this route after that
+            api_auth_bypass_route_placeholder = True
             # Bypass for auth pages (login, 2FA challenge) - for CaddyMAN admin domain AND protected sites
             # Only include sites that have access_groups configured (CaddyMAN handles their auth)
             # Exclude sites with no access control or sites that handle their own auth (like Audiobookshelf)
@@ -5964,6 +6027,20 @@ def build_caddy_config():
                                 clean_domain = domain.split(':')[0]
                                 if clean_domain not in auth_allowed_hosts:
                                     auth_allowed_hosts.append(clean_domain)
+
+            # Create API auth bypass route with host restriction (only for CaddyMAN and protected sites)
+            api_auth_bypass_route = {
+                "match": [
+                    {
+                        "host": auth_allowed_hosts,
+                        "path": ["/api/auth/*", "/api/website-auth/*"]
+                    }
+                ],
+                "handle": [{
+                    "handler": "reverse_proxy",
+                    "upstreams": [{"dial": "localhost:8000"}]
+                }]
+            }
 
             auth_pages_bypass_route = {
                 "match": [
@@ -6151,11 +6228,17 @@ async def oauth_login(login_data: LoginRequest, request: Request, response: Resp
     # Check 2FA if enabled for this user AND enhanced security is enabled
     settings = get_settings_from_db()
     if settings.get("enhanced_security", False) and user.get("totp_enabled", False):
-        if not login_data.totp_token:
-            # User has 2FA enabled but didn't provide token
-            raise HTTPException(status_code=403, detail="2FA token required")
+        # Accept either totp_token or two_factor_token (user portal uses the latter)
+        token = login_data.totp_token or login_data.two_factor_token
 
-        if not verify_totp(user.get("totp_secret", ""), login_data.totp_token):
+        if not token:
+            # User has 2FA enabled but didn't provide token - return requires_2fa response
+            return {
+                "requires_2fa": True,
+                "message": "Please enter your 2FA code"
+            }
+
+        if not verify_totp(user.get("totp_secret", ""), token):
             await log_activity(user["username"], "LOGIN_FAILED", "Invalid 2FA token", client_ip)
             raise HTTPException(status_code=401, detail="Invalid 2FA token")
 
@@ -7801,13 +7884,17 @@ async def oauth_token(
         # Ensure we have valid strings for required fields
         username = user.get('username') or auth_code['user_id']
         email = user.get('email', '')
+        group_ids = user.get('groups', [])
+        # Convert group IDs to names for better compatibility with apps like Mealie
+        group_names = get_group_names_from_ids(group_ids)
 
         id_token = create_id_token(
             user_id=auth_code['user_id'],
             client_id=client_id,
             username=username,
             email=email,
-            nonce=auth_code.get('nonce')
+            nonce=auth_code.get('nonce'),
+            groups=group_names
         )
 
         # Save tokens

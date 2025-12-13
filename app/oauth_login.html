@@ -117,7 +117,7 @@
             </div>
             <div class="form-group hidden" id="2fa-group">
                 <label>2FA Code</label>
-                <input type="text" id="2fa-token" maxlength="6" pattern="[0-9]{6}" autocomplete="one-time-code">
+                <input type="text" id="2fa-token" maxlength="6" pattern="[0-9]{6}" autocomplete="one-time-code" placeholder="000000" style="text-align: center; font-size: 18px; letter-spacing: 5px;">
             </div>
             <button type="submit">Sign In</button>
         </form>
@@ -146,22 +146,21 @@
 
                 if (!response.ok) {
                     const error = await response.json();
-
-                    // Check if 2FA is required
-                    if (response.status === 403 && (error.detail === '2FA token required' || error.detail.includes('2FA'))) {
-                        document.getElementById('2fa-group').classList.remove('hidden');
-                        document.getElementById('2fa-info').classList.remove('hidden');
-                        document.getElementById('2fa-token').focus();
-                        errorDiv.style.display = 'none';
-                        return;
-                    }
-
                     errorDiv.textContent = error.detail || 'Login failed';
                     errorDiv.style.display = 'block';
                     return;
                 }
 
                 const data = await response.json();
+
+                // Check if 2FA is required
+                if (data.requires_2fa) {
+                    document.getElementById('2fa-group').classList.remove('hidden');
+                    document.getElementById('2fa-info').classList.remove('hidden');
+                    document.getElementById('2fa-token').focus();
+                    errorDiv.style.display = 'none';
+                    return;
+                }
 
                 // Check if there's a return URL from OAuth flow
                 const returnTo = sessionStorage.getItem('returnTo');
