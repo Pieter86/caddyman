@@ -53,7 +53,7 @@ from passlib.hash import nthash
 from argon2 import PasswordHasher, Type
 from argon2.exceptions import VerifyMismatchError, VerificationError, InvalidHash
 
-VERSION = "1.3.11"
+VERSION = "1.3.13"
 
 # Argon2id migration mode - set at runtime based on existing hashes or user choice
 # This will be auto-detected on startup
@@ -156,6 +156,24 @@ UPDATE_CHECK_URL = "https://raw.githubusercontent.com/Pieter86/updates/refs/head
 LOG_DIR = "logs"
 Path(LOG_DIR).mkdir(exist_ok=True)
 
+# Custom logging filter to suppress httpx INFO logs (primarily health check spam)
+class HttpxInfoFilter(logging.Filter):
+    """Suppress httpx INFO logs to prevent console spam from health checks
+
+    Health checks run every 60 seconds and generate:
+    "HTTP Request: GET https://domain.com HTTP/1.1 200 OK"
+
+    Important application logs are still visible:
+    - "Update available: x.x.x" (from check_for_updates)
+    - "Notification sent: {title}" (from send_notification)
+    - httpx WARNING/ERROR logs still shown
+    """
+    def filter(self, record):
+        # Suppress httpx INFO logs (health checks dominate these)
+        if record.name == "httpx" and record.levelno == logging.INFO:
+            return False
+        return True
+
 # Configure logging to write to logs/app.log
 logging.basicConfig(
     level=logging.INFO,
@@ -166,6 +184,10 @@ logging.basicConfig(
     ]
 )
 logger = logging.getLogger(__name__)
+
+# Apply filter to suppress httpx INFO spam (health checks every 60s)
+for handler in logging.root.handlers:
+    handler.addFilter(HttpxInfoFilter())
 
 # Log DEBUG_MODE status after logger is configured
 if DEBUG_MODE:
@@ -238,8 +260,10 @@ async def lifespan(app: FastAPI):
     global health_check_task, caddy_monitor_task
     logger.info(f"Starting CaddyMAN v{VERSION}")
     load_last_restart_time()  # Load restart tracking from database
-    get_settings_from_db()  # Initialize settings cache on startup
-    await migrate_settings_encryption()  # v1.3.11: Encrypt sensitive settings and fix types
+    settings = get_settings_from_db()  # Initialize settings cache on startup
+    apply_log_level(settings)  # Apply log level from settings to CaddyMAN logger
+    # Migration removed - root cause fixed in script.js saveSettings() function
+    # The Settings page now preserves all settings instead of sending partial updates
     await start_caddy()
     await start_php_cgi()
     await start_ldap_server()  # Start LDAP server if enabled
@@ -1729,7 +1753,51 @@ def reload_settings_cache():
     """Force reload of settings cache from database"""
     global _cached_settings
     _cached_settings = None
-    return get_settings_from_db()
+    settings = get_settings_from_db()
+    # Apply log level to CaddyMAN logger when settings reload
+    apply_log_level(settings)
+    return settings
+
+def apply_log_level(settings: dict = None):
+    """Apply log level from settings to CaddyMAN logger
+
+    Log levels:
+    - DEBUG: Detailed information, typically only for debugging
+    - INFO: General informational messages (default)
+    - WARN: Warning messages for potentially harmful situations
+    - ERROR: Error messages for serious problems
+    """
+    if settings is None:
+        settings = get_settings_from_db()
+
+    log_level_str = settings.get("caddy_log_level", "WARN").upper()
+
+    # Map Caddy log levels to Python logging levels
+    level_map = {
+        "DEBUG": logging.DEBUG,
+        "INFO": logging.INFO,
+        "WARN": logging.WARNING,
+        "WARNING": logging.WARNING,
+        "ERROR": logging.ERROR,
+        "CRITICAL": logging.CRITICAL
+    }
+
+    log_level = level_map.get(log_level_str, logging.INFO)
+
+    # Apply to CaddyMAN logger
+    logger.setLevel(log_level)
+
+    # Also apply to all handlers (console and file)
+    for handler in logger.handlers:
+        handler.setLevel(log_level)
+
+    # Apply to root logger handlers too (affects all loggers)
+    for handler in logging.root.handlers:
+        handler.setLevel(log_level)
+
+    # Log at WARNING level so it shows for WARN/ERROR/CRITICAL settings
+    # (INFO and DEBUG users will see other logs confirming level is working)
+    logger.warning(f"CaddyMAN log level set to: {log_level_str}")
 
 def save_settings_to_db(settings: dict):
     """Save settings to database and update cache"""
@@ -9169,4 +9237,19 @@ if __name__ == "__main__":
     import uvicorn
     settings = get_settings_from_db()
     manager_port = settings.get("manager_port", 8000)
-    uvicorn.run(app, host="0.0.0.0", port=manager_port)
+
+    # When running as frozen exe with --windowed, disable uvicorn's default logging
+    # Our own logging is already configured above
+    is_frozen = getattr(sys, 'frozen', False)
+
+    if is_frozen:
+        # Frozen exe: disable uvicorn's logging config, use our own
+        uvicorn.run(
+            app,
+            host="0.0.0.0",
+            port=manager_port,
+            log_config=None  # Disable uvicorn's logging config
+        )
+    else:
+        # Running as script: use uvicorn's default logging
+        uvicorn.run(app, host="0.0.0.0", port=manager_port)

@@ -809,26 +809,28 @@ async function saveSettings() {
         };
     });
 
-    const settings = {
-        health_check_enabled: document.getElementById('health-check-enabled').checked,
-        health_check_domain: document.getElementById('health-check-domain').value,
-        health_check_interval: parseInt(document.getElementById('health-check-interval').value),
-        restart_after_failures: parseInt(document.getElementById('restart-after-failures').value),
-        notification_service: document.getElementById('notification-service').value,
-        notification_url: document.getElementById('notification-url').value,
-        notification_token: document.getElementById('notification-token').value,
-        notification_events: notificationEvents,
-        php_enabled: document.getElementById('php-enabled').checked,
-        php_path: document.getElementById('php-path').value,
-        manager_port: parseInt(document.getElementById('manager-port').value),
-        caddy_admin_port: parseInt(document.getElementById('caddy-admin-port').value),
-        enhanced_security: document.getElementById('enhanced-security').checked,
-        auth_protocols_enabled: document.getElementById('auth-protocols-enabled').checked,
-        caddy_log_level: document.getElementById('caddy-log-level').value,
-        organization_name: document.getElementById('organization-name').value,
-        domain_url: document.getElementById('domain-url').value,
-        admin_path_mode: document.getElementById('admin-path-mode').checked
-    };
+    // Start with current settings to preserve authentication settings
+    const settings = {...currentSettings};
+
+    // Update only the fields from this page
+    settings.health_check_enabled = document.getElementById('health-check-enabled').checked;
+    settings.health_check_domain = document.getElementById('health-check-domain').value;
+    settings.health_check_interval = parseInt(document.getElementById('health-check-interval').value);
+    settings.restart_after_failures = parseInt(document.getElementById('restart-after-failures').value);
+    settings.notification_service = document.getElementById('notification-service').value;
+    settings.notification_url = document.getElementById('notification-url').value;
+    settings.notification_token = document.getElementById('notification-token').value;
+    settings.notification_events = notificationEvents;
+    settings.php_enabled = document.getElementById('php-enabled').checked;
+    settings.php_path = document.getElementById('php-path').value;
+    settings.manager_port = parseInt(document.getElementById('manager-port').value);
+    settings.caddy_admin_port = parseInt(document.getElementById('caddy-admin-port').value);
+    settings.enhanced_security = document.getElementById('enhanced-security').checked;
+    settings.auth_protocols_enabled = document.getElementById('auth-protocols-enabled').checked;
+    settings.caddy_log_level = document.getElementById('caddy-log-level').value;
+    settings.organization_name = document.getElementById('organization-name').value;
+    settings.domain_url = document.getElementById('domain-url').value;
+    settings.admin_path_mode = document.getElementById('admin-path-mode').checked;
     await apiCall('/api/settings', {
         method: 'POST',
         headers: {'Content-Type': 'application/json'},

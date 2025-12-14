@@ -426,7 +426,7 @@
                         </div>
                     </div>
                     <div class="card">
-                        <h3>Caddy Logging</h3>
+                        <h3>Application Logging</h3>
                         <div class="form-group">
                             <label>Global Log Level</label>
                             <select id="caddy-log-level">
@@ -435,7 +435,7 @@
                                 <option value="WARN" selected>WARN - Warnings only (default)</option>
                                 <option value="ERROR">ERROR - Errors only</option>
                             </select>
-                            <small style="color: var(--text-secondary); font-size: 12px;">Sets the logging level for Caddy server (requires restart)</small>
+                            <small style="color: var(--text-secondary); font-size: 12px;">Sets the logging level for both CaddyMAN and Caddy. CaddyMAN applies immediately; Caddy requires restart.</small>
                         </div>
                     </div>
                 </div>
@@ -870,10 +870,11 @@ rate_limit {
             <!-- Version Information -->
             <div class="card" style="margin-bottom: 20px;">
                 <h2 style="margin-top: 0; color: var(--accent);">Version Information</h2>
-                <p><strong>Current Version:</strong> v1.3.11</p>
+                <p><strong>Current Version:</strong> v1.3.13</p>
 
                 <h3 style="color: var(--accent); margin-top: 20px;">Recent Updates</h3>
                 <ul style="line-height: 1.8;">
+                    <li><strong>v1.3.12:</strong> 🐛 Critical Bug Fixes & Enhancements - Fixed settings page overwriting authentication settings (LDAP/RADIUS/OIDC were being disabled when saving general settings); Settings page now preserves all authentication settings when saving; Removed noisy migration messages that appeared on every startup; Added configurable log level for both CaddyMAN and Caddy (DEBUG/INFO/WARN/ERROR) with immediate application for CaddyMAN; Suppressed httpx INFO logs to reduce console spam while keeping important application logs visible; Added automatic update system with SHA256 hash verification for security; Created caddyman-update.exe standalone updater with --auto mode for Windows Task Scheduler; Added build-release.py script for automated build/release process; Updated notification system to send alerts when updates are available</li>
                     <li><strong>v1.3.11:</strong> 🔒 CRITICAL Security Hardening - All sensitive settings now encrypted with pepper-based encryption (SMTP password, RADIUS secret, notification tokens); Fixed critical bug where LDAP and RADIUS servers wouldn't start due to boolean settings stored as strings; Added wifi_password_hash column for separate WiFi RADIUS authentication; Migrated WiFi password encryption from insecure DB-stored key to DPAPI-protected pepper; Auto-migration on startup transparently encrypts existing plaintext secrets; Moving database to new PC now invalidates ALL secrets (not just passwords) for defense-in-depth; Settings cache now automatically decrypts encrypted values; Comprehensive startup migration handles both type fixes and encryption</li>
                     <li><strong>v1.3.10:</strong> 🔐 Auth & UX Fixes - Fixed Caddy config generation bug where /api/auth/* routes were being applied to all proxies, preventing services like Mealie from using their own /api/auth/login endpoints; Fixed user portal & OAuth login 2FA flow to properly show 2FA input field (backend now returns requires_2fa response instead of 403 error); Added support for two_factor_token field in LoginRequest (user portal uses this instead of totp_token); Enhanced 2FA input styling across all login pages (centered text, larger font, letter spacing) for better UX consistency with admin panel</li>
                     <li><strong>v1.3.9:</strong> 🔒 Major Security Hardening & UX Improvements - Fixed XSS vulnerabilities across all admin interface JavaScript (14+ innerHTML usages now properly escaped); Added password visibility toggles (👁️/🙈) for RADIUS secret, SMTP password, and notification token fields; Disabled FastAPI documentation endpoints (/docs, /redoc, /openapi.json) to prevent API schema exposure; Mobile responsive fixes for OIDC settings and OAuth client cards; OAuth client cards redesigned with cleaner layout (header with edit/delete buttons, full-width redirect URIs and groups section); Improved invite link system - creating new invite for existing username now automatically replaces old invite instead of blocking; Enhanced HTML security helper functions (escapeHtml, setContent) across script.js and user-portal-script.js; Fixed settings API to use password-type fields with show/hide buttons for credential management</li>
@@ -902,7 +903,14 @@ rate_limit {
                 </ul>
 
                 <h3 style="color: var(--accent); margin-top: 20px;">Update Mechanism</h3>
-                <p>CaddyMAN includes an automatic update checker that notifies you when new versions are available. Updates can be downloaded and applied from the Dashboard.</p>
+                <p>CaddyMAN includes an automatic update checker that notifies you when new versions are available. Updates can be downloaded from the Dashboard with SHA256 hash verification for security.</p>
+                <p>For automated updates, use <strong>caddyman-update.exe</strong> with Windows Task Scheduler:</p>
+                <ul style="line-height: 1.8;">
+                    <li>Run <code>caddyman-update.exe</code> for interactive updates</li>
+                    <li>Run <code>caddyman-update.exe --auto</code> for unattended updates (perfect for scheduled tasks)</li>
+                    <li>Automatically verifies file integrity with SHA256 hash before installing</li>
+                    <li>Stops CaddyMAN if running, installs update, restarts automatically</li>
+                </ul>
             </div>
 
             <!-- Support -->
@@ -911,8 +919,9 @@ rate_limit {
 
                 <h3 style="color: var(--accent); margin-top: 15px;">Log Files</h3>
                 <ul style="line-height: 1.8;">
-                    <li><strong>app.log:</strong> CaddyMAN application logs</li>
-                    <li><strong>Caddy logs:</strong> Controlled via Log Level setting</li>
+                    <li><strong>logs/app.log:</strong> CaddyMAN application logs (configurable level: DEBUG/INFO/WARN/ERROR)</li>
+                    <li><strong>Caddy logs:</strong> Controlled via Global Log Level setting in Settings page</li>
+                    <li><strong>Log Level:</strong> Set in Settings → Application Logging. CaddyMAN applies immediately; Caddy requires restart</li>
                 </ul>
 
                 <h3 style="color: var(--accent); margin-top: 20px;">Running CaddyMAN</h3>
@@ -932,8 +941,9 @@ rate_limit {
                     <li>Enable Enhanced Security Mode for production</li>
                     <li>Enable 2FA for all user accounts</li>
                     <li>Use strong, unique passwords (min 8 characters with complexity)</li>
-                    <li>Regular backups of CaddyMAN.db</li>
-                    <li>Keep CaddyMAN and Caddy updated to latest versions</li>
+                    <li>Regular backups of CaddyMAN.db and pepper.enc (both required for recovery)</li>
+                    <li><strong>pepper.enc Security:</strong> This file encrypts all sensitive settings (SMTP passwords, RADIUS secrets, notification tokens). Store it securely and never commit to version control</li>
+                    <li>Keep CaddyMAN and Caddy updated to latest versions using the built-in update checker</li>
                     <li>Restrict management interface to trusted networks</li>
                 </ul>
             </div>
