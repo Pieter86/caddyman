@@ -1952,7 +1952,8 @@ def create_jwt_token(user_id: str, client_id: str, scopes: List[str], expires_in
         'groups': user.get('groups', [])
     }
 
-    token = jwt.encode(payload, private_key, algorithm='RS256')
+    # Include kid (key ID) in JWT header for JWKS validation
+    token = jwt.encode(payload, private_key, algorithm='RS256', headers={'kid': 'default'})
     return token
 
 def create_id_token(user_id: str, client_id: str, username: str, email: str, nonce: Optional[str] = None, groups: Optional[List[str]] = None):
@@ -1985,7 +1986,8 @@ def create_id_token(user_id: str, client_id: str, username: str, email: str, non
     if groups:
         payload['groups'] = groups
 
-    token = jwt.encode(payload, private_key, algorithm='RS256')
+    # Include kid (key ID) in JWT header for JWKS validation
+    token = jwt.encode(payload, private_key, algorithm='RS256', headers={'kid': 'default'})
     return token
 
 def get_group_names_from_ids(group_ids: List[str]) -> List[str]:
