@@ -339,11 +339,21 @@
                                     <div class="checkbox-wrapper"><input type="checkbox" id="notif-ldap_auth_success"><label>LDAP: Successful Auth</label></div>
                                     <div class="checkbox-wrapper"><input type="checkbox" id="notif-ldap_auth_failed"><label>LDAP: Failed Auth</label></div>
                                     <div class="checkbox-wrapper"><input type="checkbox" id="notif-ldap_auth_denied"><label>LDAP: Access Denied</label></div>
+                                    <div class="checkbox-wrapper"><input type="checkbox" id="notif-ldap_external_connection"><label style="color: var(--danger); font-weight: 500;">🚨 LDAP: External IP Connection (SECURITY)</label></div>
                                     <div class="checkbox-wrapper"><input type="checkbox" id="notif-radius_auth_success"><label>RADIUS: Successful Auth</label></div>
                                     <div class="checkbox-wrapper"><input type="checkbox" id="notif-radius_auth_failed"><label>RADIUS: Failed Auth</label></div>
                                     <div class="checkbox-wrapper"><input type="checkbox" id="notif-radius_auth_denied"><label>RADIUS: Access Denied</label></div>
+                                    <div class="checkbox-wrapper"><input type="checkbox" id="notif-radius_external_connection"><label style="color: var(--danger); font-weight: 500;">🚨 RADIUS: External IP Connection (SECURITY)</label></div>
                                     <div class="checkbox-wrapper"><input type="checkbox" id="notif-oidc_auth_success"><label>OIDC: Successful Auth</label></div>
                                     <div class="checkbox-wrapper"><input type="checkbox" id="notif-oidc_auth_denied"><label>OIDC: Access Denied</label></div>
+                                </div>
+                            </details>
+
+                            <details style="margin-bottom: 10px;">
+                                <summary style="cursor: pointer; font-weight: 500; color: var(--danger); margin-bottom: 10px;">🔒 Security Threats</summary>
+                                <div style="margin-left: 20px;">
+                                    <div class="checkbox-wrapper"><input type="checkbox" id="notif-insecure_bind_detected"><label style="color: var(--danger);">Insecure Bind Address Detected</label></div>
+                                    <div class="checkbox-wrapper"><input type="checkbox" id="notif-suspicious_activity"><label style="color: var(--danger);">Suspicious Activity</label></div>
                                 </div>
                             </details>
 
@@ -383,6 +393,10 @@
                                     <div class="checkbox-wrapper"><input type="checkbox" id="notif-php_started"><label>PHP Started</label></div>
                                     <div class="checkbox-wrapper"><input type="checkbox" id="notif-php_stopped"><label>PHP Stopped</label></div>
                                     <div class="checkbox-wrapper"><input type="checkbox" id="notif-health_check_failed"><label>Health Check Failed</label></div>
+                                    <div class="checkbox-wrapper"><input type="checkbox" id="notif-proxy_down"><label style="color: var(--danger); font-weight: 500;">🔴 Reverse Proxy Down</label></div>
+                                    <div class="checkbox-wrapper"><input type="checkbox" id="notif-proxy_back_online"><label style="color: var(--success);">🟢 Reverse Proxy Back Online</label></div>
+                                    <div class="checkbox-wrapper"><input type="checkbox" id="notif-website_down"><label style="color: var(--danger); font-weight: 500;">🔴 Website Down</label></div>
+                                    <div class="checkbox-wrapper"><input type="checkbox" id="notif-website_back_online"><label style="color: var(--success);">🟢 Website Back Online</label></div>
                                     <div class="checkbox-wrapper"><input type="checkbox" id="notif-system_restart"><label>System Restart</label></div>
                                 </div>
                             </details>
@@ -621,10 +635,12 @@
                 <p>Authenticate legacy applications that support LDAP:</p>
                 <ul style="line-height: 1.8;">
                     <li><strong>Port:</strong> Default 389 (configurable)</li>
+                    <li><strong>Network Binding:</strong> Automatically listens on all network interfaces (0.0.0.0) - works on any private network</li>
                     <li><strong>Base DN:</strong> Your LDAP base (e.g., dc=example,dc=com)</li>
                     <li><strong>Bind DN:</strong> Admin bind DN (e.g., cn=admin,dc=example,dc=com)</li>
                     <li><strong>Group Filtering:</strong> Restrict LDAP access to specific user groups (v1.3.1+)</li>
-                    <li><strong>Security:</strong> Rate limiting, admin users blocked from LDAP access</li>
+                    <li><strong>Security:</strong> Rate limiting, admin users blocked, external/public IPs automatically rejected (v1.3.14+)</li>
+                    <li><strong>Allowed IPs:</strong> Only private networks (10.x.x.x, 172.16-31.x.x, 192.168.x.x) and localhost - external connections blocked with security alerts</li>
                 </ul>
 
                 <h3 style="color: var(--accent); margin-top: 20px;">RADIUS Server (WiFi WPA2-Enterprise)</h3>
@@ -632,6 +648,7 @@
                 <ul style="line-height: 1.8;">
                     <li><strong>Authentication Port:</strong> Default 1812</li>
                     <li><strong>Accounting Port:</strong> Default 1813</li>
+                    <li><strong>Network Binding:</strong> Automatically listens on all network interfaces (0.0.0.0) - works on any private network</li>
                     <li><strong>Shared Secret:</strong> 512-bit random secret (use Generate button) - configure on both RADIUS server and WiFi access point</li>
                     <li><strong>EAP Methods:</strong>
                         <ul>
@@ -643,7 +660,8 @@
                     <li><strong>Router Support:</strong> Works with ASUS routers and most WPA2/WPA3-Enterprise capable access points</li>
                     <li><strong>VLAN Assignment:</strong> Dynamically assign VLANs based on user groups</li>
                     <li><strong>Group Filtering:</strong> Control WiFi access by user groups (v1.3.1+)</li>
-                    <li><strong>Security:</strong> Rate limiting, admin users blocked from RADIUS access</li>
+                    <li><strong>Security:</strong> Rate limiting, admin users blocked, external/public IPs automatically rejected (v1.3.14+)</li>
+                    <li><strong>Allowed IPs:</strong> Only private networks (10.x.x.x, 172.16-31.x.x, 192.168.x.x) and localhost - external connections blocked with security alerts</li>
                 </ul>
 
                 <h3 style="color: var(--accent); margin-top: 20px;">SMTP/Email System (v1.3.1)</h3>
@@ -702,11 +720,21 @@
                     <li><strong>Best Practice:</strong> Enable for production environments</li>
                 </ul>
 
-                <h3 style="color: var(--accent); margin-top: 20px;">Notifications</h3>
+                <h3 style="color: var(--accent); margin-top: 20px;">Notifications (v1.3.14+)</h3>
                 <ul style="line-height: 1.8;">
                     <li><strong>Gotify:</strong> Receive notifications via Gotify (self-hosted notification service)</li>
                     <li><strong>Ntfy:</strong> Send notifications to Ntfy (https://ntfy.sh or self-hosted)</li>
-                    <li><strong>Events:</strong> Get notified on Caddy restarts, configuration changes, and updates</li>
+                    <li><strong>Events:</strong> Get notified on Caddy restarts, configuration changes, updates, and security events</li>
+                    <li><strong>Security Alerts (v1.3.14):</strong> Automatic notifications for:
+                        <ul>
+                            <li>External IP connections to LDAP/RADIUS (CRITICAL)</li>
+                            <li>Brute force attack detection and IP blocking</li>
+                            <li>Unsafe website path attempts</li>
+                            <li>Suspicious activity monitoring</li>
+                        </ul>
+                    </li>
+                    <li><strong>Retry Logic (v1.3.14):</strong> Failed notifications automatically retry 3 times with 15-second delays</li>
+                    <li><strong>Non-blocking:</strong> Notifications run in background to prevent application delays</li>
                 </ul>
             </div>
 
@@ -801,6 +829,18 @@ rate_limit {
                     <li><strong>Check Groups:</strong> Verify which groups have force_2fa enabled in group settings</li>
                     <li><strong>Service Accounts:</strong> LDAP bind DN users bypass force-2FA requirement</li>
                 </ul>
+
+                <h3 style="color: var(--accent); margin-top: 20px;">LDAP/RADIUS Connection Issues (v1.3.14+)</h3>
+                <ul style="line-height: 1.8;">
+                    <li><strong>Network Binding:</strong> Servers automatically bind to all interfaces (0.0.0.0) - no configuration needed</li>
+                    <li><strong>Works On Any Network:</strong> Clients can connect from any private IP (10.x, 172.16-31.x, 192.168.x, localhost)</li>
+                    <li><strong>External IPs Blocked:</strong> Public/internet IPs are automatically rejected with security notifications</li>
+                    <li><strong>Check Startup Logs:</strong> Verify servers started successfully: "LDAP server listening on 0.0.0.0:389"</li>
+                    <li><strong>Port Conflicts:</strong> Use <code>netstat -an | findstr :389</code> (LDAP) or <code>netstat -an | findstr :1812</code> (RADIUS) to check if ports are in use</li>
+                    <li><strong>Firewall Rules:</strong> Ensure Windows Firewall allows inbound connections on LDAP/RADIUS ports</li>
+                    <li><strong>Group Filtering:</strong> If allowed groups are configured, verify user is in one of those groups</li>
+                    <li><strong>Security Notifications:</strong> Check notifications for external connection attempts or security alerts</li>
+                </ul>
             </div>
 
             <!-- API Documentation -->
@@ -870,11 +910,13 @@ rate_limit {
             <!-- Version Information -->
             <div class="card" style="margin-bottom: 20px;">
                 <h2 style="margin-top: 0; color: var(--accent);">Version Information</h2>
-                <p><strong>Current Version:</strong> v1.3.13</p>
+                <p><strong>Current Version:</strong> v1.3.14</p>
 
                 <h3 style="color: var(--accent); margin-top: 20px;">Recent Updates</h3>
                 <ul style="line-height: 1.8;">
-                    <li><strong>v1.3.12:</strong> 🐛 Critical Bug Fixes & Enhancements - Fixed settings page overwriting authentication settings (LDAP/RADIUS/OIDC were being disabled when saving general settings); Settings page now preserves all authentication settings when saving; Removed noisy migration messages that appeared on every startup; Added configurable log level for both CaddyMAN and Caddy (DEBUG/INFO/WARN/ERROR) with immediate application for CaddyMAN; Suppressed httpx INFO logs to reduce console spam while keeping important application logs visible; Added automatic update system with SHA256 hash verification for security; Created caddyman-update.exe standalone updater with --auto mode for Windows Task Scheduler; Added build-release.py script for automated build/release process; Updated notification system to send alerts when updates are available</li>
+                    <li><strong>v1.3.14:</strong> 🔒 CRITICAL Security Hardening - LDAP/RADIUS Network Security Overhaul - Removed bind address configuration (now automatically binds to 0.0.0.0 for all network interfaces); Added automatic external/public IP blocking with security notifications for LDAP and RADIUS servers; Only private networks allowed (10.x, 172.16-31.x, 192.168.x, localhost) - external connections rejected immediately; Fixed JWT kid header for audiobookshelf browser authentication compatibility; Enhanced notification system with 3-attempt retry logic and 15-second delays; Non-blocking notifications prevent application startup delays; Added brute force protection with rate limiting (20 req/min) and 30-minute IP blocks; Website path security prevents hosting from CaddyMAN directory; Improved mobile responsive design for RADIUS settings; All security events trigger configurable notifications</li>
+                    <li><strong>v1.3.13:</strong> 🐛 Critical Bug Fixes & Enhancements - Fixed settings page overwriting authentication settings (LDAP/RADIUS/OIDC were being disabled when saving general settings); Settings page now preserves all authentication settings when saving; Fixed update notifications not being sent; Added configurable log level for both CaddyMAN and Caddy (DEBUG/INFO/WARN/ERROR) with immediate application for CaddyMAN; Reduced console log spam from health checks; Created caddyman-update.exe standalone updater with --auto mode for Windows Task Scheduler; Update banner button now properly opens download page; Log levels apply immediately for CaddyMAN (Caddy requires restart); Better error handling for frozen executable logging</li>
+                    <li><strong>v1.3.12:</strong> 🐛 Bug Fixes - Removed noisy migration messages that appeared on every startup; Suppressed httpx INFO logs to reduce console spam while keeping important application logs visible; Added automatic update system with SHA256 hash verification for security; Added build-release.py script for automated build/release process</li>
                     <li><strong>v1.3.11:</strong> 🔒 CRITICAL Security Hardening - All sensitive settings now encrypted with pepper-based encryption (SMTP password, RADIUS secret, notification tokens); Fixed critical bug where LDAP and RADIUS servers wouldn't start due to boolean settings stored as strings; Added wifi_password_hash column for separate WiFi RADIUS authentication; Migrated WiFi password encryption from insecure DB-stored key to DPAPI-protected pepper; Auto-migration on startup transparently encrypts existing plaintext secrets; Moving database to new PC now invalidates ALL secrets (not just passwords) for defense-in-depth; Settings cache now automatically decrypts encrypted values; Comprehensive startup migration handles both type fixes and encryption</li>
                     <li><strong>v1.3.10:</strong> 🔐 Auth & UX Fixes - Fixed Caddy config generation bug where /api/auth/* routes were being applied to all proxies, preventing services like Mealie from using their own /api/auth/login endpoints; Fixed user portal & OAuth login 2FA flow to properly show 2FA input field (backend now returns requires_2fa response instead of 403 error); Added support for two_factor_token field in LoginRequest (user portal uses this instead of totp_token); Enhanced 2FA input styling across all login pages (centered text, larger font, letter spacing) for better UX consistency with admin panel</li>
                     <li><strong>v1.3.9:</strong> 🔒 Major Security Hardening & UX Improvements - Fixed XSS vulnerabilities across all admin interface JavaScript (14+ innerHTML usages now properly escaped); Added password visibility toggles (👁️/🙈) for RADIUS secret, SMTP password, and notification token fields; Disabled FastAPI documentation endpoints (/docs, /redoc, /openapi.json) to prevent API schema exposure; Mobile responsive fixes for OIDC settings and OAuth client cards; OAuth client cards redesigned with cleaner layout (header with edit/delete buttons, full-width redirect URIs and groups section); Improved invite link system - creating new invite for existing username now automatically replaces old invite instead of blocking; Enhanced HTML security helper functions (escapeHtml, setContent) across script.js and user-portal-script.js; Fixed settings API to use password-type fields with show/hide buttons for credential management</li>
@@ -1104,10 +1146,10 @@ rate_limit {
                                 </div>
                                 <div>
                                     <label>Shared Secret:</label>
-                                    <div style="display: flex; gap: 10px; align-items: center;">
-                                        <input type="password" id="radius_secret" placeholder="Enter RADIUS shared secret" style="flex: 1;">
-                                        <button type="button" class="btn btn-secondary" onclick="togglePasswordVisibility('radius_secret', this)" title="Show/Hide secret">👁️</button>
-                                        <button type="button" class="btn btn-secondary" onclick="generateRadiusSecret()" title="Generate secure 512-bit secret">🎲 Generate</button>
+                                    <div style="display: flex; gap: 10px; align-items: center; flex-wrap: wrap;">
+                                        <input type="password" id="radius_secret" placeholder="Enter RADIUS shared secret" style="flex: 1; min-width: 200px;">
+                                        <button type="button" class="btn btn-secondary" onclick="togglePasswordVisibility('radius_secret', this)" title="Show/Hide secret" style="flex-shrink: 0;">👁️</button>
+                                        <button type="button" class="btn btn-secondary" onclick="generateRadiusSecret()" title="Generate secure 512-bit secret" style="flex-shrink: 0;">🎲 Generate</button>
                                     </div>
                                     <small style="color: var(--text-secondary); font-size: 12px; display: block; margin-top: 5px;">
                                         Use the same secret on your WiFi access point. Click Generate for a secure 512-bit random secret.

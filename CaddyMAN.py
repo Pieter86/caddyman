@@ -53,7 +53,7 @@ from passlib.hash import nthash
 from argon2 import PasswordHasher, Type
 from argon2.exceptions import VerifyMismatchError, VerificationError, InvalidHash
 
-VERSION = "1.3.13"
+VERSION = "1.3.14"
 
 # Argon2id migration mode - set at runtime based on existing hashes or user choice
 # This will be auto-detected on startup
@@ -274,6 +274,7 @@ async def lifespan(app: FastAPI):
     except:
         pass
     health_check_task = asyncio.create_task(health_check_loop())
+    status_monitor_task = asyncio.create_task(status_monitor_loop())
     caddy_monitor_task = asyncio.create_task(monitor_caddy())
     asyncio.create_task(periodic_update_check())
     asyncio.create_task(cleanup_expired_sessions())
@@ -600,10 +601,18 @@ notification_log = []  # Store recent notifications
 MAX_NOTIFICATION_LOG = 100  # Keep last 100 notifications
 failed_login_attempts = {}  # Track failed login attempts by IP
 pending_2fa_challenges = {}  # Track pending 2FA challenges {challenge_id: {username, expires, original_url}}
+auth_verify_attempts = {}  # Track /api/auth/verify attempts by IP: {ip: [timestamps]}
+blocked_ips = {}  # Temporarily blocked IPs: {ip: block_until_timestamp}
+
+# Status monitoring - track online/offline state of proxies and websites
+status_cache = {}  # {proxy_id: online_status, website_id: online_status}
 
 # Security constants
 MAX_LOGIN_ATTEMPTS = 5  # Lock account after this many failures
 LOCKOUT_DURATION = 900  # 15 minutes lockout in seconds
+MAX_AUTH_VERIFY_ATTEMPTS = 20  # Max auth verify requests per minute
+AUTH_VERIFY_WINDOW = 60  # Check attempts in last 60 seconds
+AUTH_VERIFY_BLOCK_DURATION = 1800  # Block for 30 minutes
 
 # Settings cache - reduces disk I/O by keeping settings in memory
 _cached_settings = None
@@ -691,11 +700,16 @@ default_settings = {
         "ldap_auth_success": {"enabled": False, "severity": "info"},
         "ldap_auth_failed": {"enabled": True, "severity": "warning"},
         "ldap_auth_denied": {"enabled": True, "severity": "warning"},
+        "ldap_external_connection": {"enabled": True, "severity": "critical"},
         "radius_auth_success": {"enabled": False, "severity": "info"},
         "radius_auth_failed": {"enabled": True, "severity": "warning"},
         "radius_auth_denied": {"enabled": True, "severity": "warning"},
+        "radius_external_connection": {"enabled": True, "severity": "critical"},
         "oidc_auth_success": {"enabled": False, "severity": "info"},
         "oidc_auth_denied": {"enabled": True, "severity": "warning"},
+        # Security Threats
+        "insecure_bind_detected": {"enabled": True, "severity": "critical"},
+        "suspicious_activity": {"enabled": True, "severity": "alert"},
         # User Management
         "invite_created": {"enabled": False, "severity": "info"},
         "invite_used": {"enabled": True, "severity": "info"},
@@ -720,6 +734,10 @@ default_settings = {
         "php_started": {"enabled": False, "severity": "info"},
         "php_stopped": {"enabled": False, "severity": "warning"},
         "health_check_failed": {"enabled": True, "severity": "warning"},
+        "proxy_down": {"enabled": True, "severity": "critical"},
+        "proxy_back_online": {"enabled": True, "severity": "success"},
+        "website_down": {"enabled": True, "severity": "critical"},
+        "website_back_online": {"enabled": True, "severity": "success"},
         "system_restart": {"enabled": True, "severity": "critical"},
         # Configuration Changes
         "website_added": {"enabled": False, "severity": "info"},
@@ -2633,52 +2651,67 @@ async def send_notification(title: str, message: str, notification_type: str = "
 
     style = notification_styles.get(notification_type, notification_styles["info"])
 
-    try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            if settings["notification_service"] == "gotify":
-                await client.post(f"{settings['notification_url']}/message",
-                    params={"token": settings["notification_token"]},
-                    json={"title": title, "message": message, "priority": style["priority"]})
-            elif settings["notification_service"] == "ntfy":
-                # Get hostname for better context
-                import socket
-                hostname = socket.gethostname()
+    # Retry logic: 3 attempts with 15 second delays
+    max_attempts = 3
+    retry_delay = 15
 
-                # Build ntfy headers (ntfy uses X- prefixed headers for metadata)
-                # Note: HTTP headers must be ASCII-only, so emojis go in the message body
-                headers = {
-                    "X-Title": f"{hostname} - {title}",
-                    "X-Priority": str(style["priority"]),
-                    "X-Tags": ",".join(style["tags"]),
-                    "X-Icon": style["icon"],
-                    "Content-Type": "text/plain; charset=utf-8"
-                }
+    for attempt in range(1, max_attempts + 1):
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                if settings["notification_service"] == "gotify":
+                    await client.post(f"{settings['notification_url']}/message",
+                        params={"token": settings["notification_token"]},
+                        json={"title": title, "message": message, "priority": style["priority"]})
+                elif settings["notification_service"] == "ntfy":
+                    # Get hostname for better context
+                    import socket
+                    hostname = socket.gethostname()
 
-                # Add click action for certain notification types
-                if notification_type in ["critical", "alert"]:
-                    headers["X-Click"] = f"http://{hostname}:8000"
+                    # Build ntfy headers (ntfy uses X- prefixed headers for metadata)
+                    # Note: HTTP headers must be ASCII-only, so emojis go in the message body
+                    headers = {
+                        "X-Title": f"{hostname} - {title}",
+                        "X-Priority": str(style["priority"]),
+                        "X-Tags": ",".join(style["tags"]),
+                        "X-Icon": style["icon"],
+                        "Content-Type": "text/plain; charset=utf-8"
+                    }
 
-                # Send message as plain text body to ntfy
-                await client.post(
-                    settings["notification_url"],
-                    content=message.encode('utf-8'),
-                    headers=headers
-                )
-        logger.info(f"Notification sent: {title} (type: {notification_type})")
+                    # Add click action for certain notification types
+                    if notification_type in ["critical", "alert"]:
+                        headers["X-Click"] = f"http://{hostname}:8000"
 
-        # Log notification to in-memory list
-        notification_entry = {
-            "timestamp": datetime.now().isoformat(),
-            "title": title,
-            "message": message,
-            "type": notification_type
-        }
-        notification_log.insert(0, notification_entry)
-        if len(notification_log) > MAX_NOTIFICATION_LOG:
-            notification_log.pop()
+                    # Send message as plain text body to ntfy
+                    await client.post(
+                        settings["notification_url"],
+                        content=message.encode('utf-8'),
+                        headers=headers
+                    )
 
-    except Exception as e:
-        logger.error(f"Failed to send notification: {e}")
+            # Success! Log and exit retry loop
+            logger.info(f"Notification sent: {title} (type: {notification_type})" + (f" (attempt {attempt})" if attempt > 1 else ""))
+
+            # Log notification to in-memory list
+            notification_entry = {
+                "timestamp": datetime.now().isoformat(),
+                "title": title,
+                "message": message,
+                "type": notification_type
+            }
+            notification_log.insert(0, notification_entry)
+            if len(notification_log) > MAX_NOTIFICATION_LOG:
+                notification_log.pop()
+
+            return  # Success, exit function
+
+        except Exception as e:
+            if attempt < max_attempts:
+                logger.warning(f"Failed to send notification '{title}' (attempt {attempt}/{max_attempts}): {type(e).__name__}: {e}. Retrying in {retry_delay}s...")
+                await asyncio.sleep(retry_delay)
+            else:
+                # Final attempt failed
+                logger.error(f"Failed to send notification '{title}' after {max_attempts} attempts: {type(e).__name__}: {e}")
+                logger.debug(f"Notification details - Type: {notification_type}, Message: {message[:100]}", exc_info=True)
 
 def should_send_notification(event_type: str) -> bool:
     """Check if notifications are enabled for a specific event type"""
@@ -2714,7 +2747,8 @@ async def send_event_notification(event_type: str, title: str, message: str, **c
         if context_lines:
             message = f"{message}\n\n" + "\n".join(context_lines)
 
-    await send_notification(title, message, severity)
+    # Send notification in background to avoid blocking the caller (especially during startup)
+    asyncio.create_task(send_notification(title, message, severity))
 
 async def log_activity(username: str, action: str, details: str = "", ip: str = ""):
     """Log user activity with timestamp"""
@@ -2832,14 +2866,14 @@ async def health_check_loop():
 
                 if time_since_restart < 3600:
                     logger.warning(f"Skipping restart - last restart was {hours_since_restart:.1f} hours ago (cooldown: 1 hour)")
-                    await send_notification(
+                    asyncio.create_task(send_notification(
                         "Restart Cooldown Active",
                         f"⏱️ {domain} is down but restart skipped\n\n"
                         f"Last restart: {hours_since_restart:.1f}h ago\n"
                         f"Cooldown period: 1 hour\n"
                         f"Time remaining: {60 - (hours_since_restart * 60):.0f} minutes",
                         "warning"
-                    )
+                    ))
                     continue
 
                 try:
@@ -2847,14 +2881,14 @@ async def health_check_loop():
                         await client.get("https://1.1.1.1")
 
                     logger.critical(f"{domain} down - initiating system restart (last restart: {hours_since_restart:.1f}h ago)")
-                    await send_notification(
+                    asyncio.create_task(send_notification(
                         "System Restart Initiated",
                         f"🔄 System will restart in 10 seconds\n\n"
                         f"Reason: {domain} health check failed\n"
                         f"Last restart: {hours_since_restart:.1f}h ago\n"
                         f"Consecutive failures: {max_failures}",
                         "critical"
-                    )
+                    ))
 
                     # Update and save restart time BEFORE restarting
                     last_restart_time = time.time()
@@ -2866,16 +2900,166 @@ async def health_check_loop():
                         subprocess.Popen(["sudo", "reboot"])
                 except:
                     logger.warning("Domain down but no internet")
-                    await send_notification(
+                    asyncio.create_task(send_notification(
                         "Health Check Failed",
                         f"⚠️ {domain} is unreachable\n\n"
                         f"Status: Domain down\n"
                         f"Internet: Not available\n"
                         f"Action: Restart skipped (no internet connection)",
                         "alert"
-                    )
+                    ))
         except Exception as e:
             logger.error(f"Health check error: {e}")
+
+async def status_monitor_loop():
+    """
+    Background task to monitor proxy and website status.
+    Checks every 5 minutes and sends notifications on status changes.
+    """
+    global status_cache
+    while True:
+        try:
+            # Wait 5 minutes between checks (300 seconds)
+            await asyncio.sleep(300)
+
+            # Check all enabled proxies
+            proxies = get_all_proxies_from_db()
+            for proxy in proxies:
+                if not proxy.get('enabled', False):
+                    continue
+
+                proxy_id = proxy.get('id')
+                upstream = proxy.get('upstream', '')
+                if not upstream:
+                    continue
+
+                # Extract first upstream if load balanced
+                if ',' in upstream:
+                    upstream = upstream.split(',')[0].strip()
+
+                # Check status
+                is_online = False
+                try:
+                    async with httpx.AsyncClient(timeout=5.0, follow_redirects=False) as client:
+                        response = await client.head(upstream)
+                        # ANY response code means the server is online
+                        is_online = True
+                except (httpx.TimeoutException, httpx.ConnectError):
+                    is_online = False
+                except:
+                    # Even other errors (SSL, etc.) mean server is technically responding
+                    is_online = False
+
+                # Check for status change
+                previous_status = status_cache.get(f'proxy_{proxy_id}')
+                if previous_status is None:
+                    # First check - just store status, no notification
+                    status_cache[f'proxy_{proxy_id}'] = is_online
+                elif previous_status and not is_online:
+                    # Was online, now offline
+                    logger.warning(f"Proxy went offline: {proxy.get('domains', ['Unknown'])[0]} -> {upstream}")
+                    await send_event_notification(
+                        "proxy_down",
+                        "Reverse Proxy Down",
+                        f"Reverse proxy is no longer responding!\n\n"
+                        f"Domain: {', '.join(proxy.get('domains', ['Unknown']))}\n"
+                        f"Upstream: {upstream}\n"
+                        f"Status: Connection timeout or refused\n\n"
+                        f"Action: Check if the upstream service is running.",
+                        domains=', '.join(proxy.get('domains', [])),
+                        upstream=upstream
+                    )
+                    status_cache[f'proxy_{proxy_id}'] = False
+                elif not previous_status and is_online:
+                    # Was offline, now online
+                    logger.info(f"Proxy back online: {proxy.get('domains', ['Unknown'])[0]} -> {upstream}")
+                    await send_event_notification(
+                        "proxy_back_online",
+                        "Reverse Proxy Back Online",
+                        f"Reverse proxy is responding again!\n\n"
+                        f"Domain: {', '.join(proxy.get('domains', ['Unknown']))}\n"
+                        f"Upstream: {upstream}\n"
+                        f"Status: Online",
+                        domains=', '.join(proxy.get('domains', [])),
+                        upstream=upstream
+                    )
+                    status_cache[f'proxy_{proxy_id}'] = True
+
+            # Check all enabled websites
+            websites = get_all_websites_from_db()
+            for website in websites:
+                if not website.get('enabled', False):
+                    continue
+
+                website_id = website.get('id')
+                domains = website.get('domains', [])
+                if not domains:
+                    continue
+
+                domain = domains[0] if isinstance(domains, list) else domains
+                http_ports = website.get('http_ports', [])
+                https_ports = website.get('https_ports', [])
+
+                # Construct URL
+                if https_ports:
+                    port = https_ports[0] if isinstance(https_ports, list) else https_ports
+                    url = f"https://{domain}:{port}" if port not in [443, '443'] else f"https://{domain}"
+                elif http_ports:
+                    port = http_ports[0] if isinstance(http_ports, list) else http_ports
+                    url = f"http://{domain}:{port}" if port not in [80, '80'] else f"http://{domain}"
+                else:
+                    url = f"http://{domain}"
+
+                # Check status
+                is_online = False
+                try:
+                    async with httpx.AsyncClient(timeout=5.0, follow_redirects=False, verify=False) as client:
+                        response = await client.head(url)
+                        # ANY response code means the server is online
+                        is_online = True
+                except (httpx.TimeoutException, httpx.ConnectError):
+                    is_online = False
+                except:
+                    # Even other errors mean server is responding
+                    is_online = False
+
+                # Check for status change
+                previous_status = status_cache.get(f'website_{website_id}')
+                if previous_status is None:
+                    # First check - just store status, no notification
+                    status_cache[f'website_{website_id}'] = is_online
+                elif previous_status and not is_online:
+                    # Was online, now offline
+                    logger.warning(f"Website went offline: {domain} ({url})")
+                    await send_event_notification(
+                        "website_down",
+                        "Website Down",
+                        f"Website is no longer responding!\n\n"
+                        f"Domain: {', '.join(domains)}\n"
+                        f"URL: {url}\n"
+                        f"Status: Connection timeout or refused\n\n"
+                        f"Action: Check if Caddy is running and the website files are accessible.",
+                        domains=', '.join(domains),
+                        url=url
+                    )
+                    status_cache[f'website_{website_id}'] = False
+                elif not previous_status and is_online:
+                    # Was offline, now online
+                    logger.info(f"Website back online: {domain} ({url})")
+                    await send_event_notification(
+                        "website_back_online",
+                        "Website Back Online",
+                        f"Website is responding again!\n\n"
+                        f"Domain: {', '.join(domains)}\n"
+                        f"URL: {url}\n"
+                        f"Status: Online",
+                        domains=', '.join(domains),
+                        url=url
+                    )
+                    status_cache[f'website_{website_id}'] = True
+
+        except Exception as e:
+            logger.error(f"Status monitor error: {e}")
 
 async def cleanup_expired_sessions():
     while True:
@@ -3453,6 +3637,32 @@ async def handle_ldap_client(client, addr, settings: dict):
     Handle LDAP client connection
     Security: Connection timeout, size limits, proper error handling
     """
+    # Security: Check if connection is from external/non-private IP
+    import ipaddress
+    try:
+        client_ip = ipaddress.ip_address(addr[0])
+        if not (client_ip.is_loopback or client_ip.is_private):
+            logger.critical(f"LDAP: SECURITY ALERT - External IP attempting connection: {addr[0]}")
+            await send_event_notification(
+                "ldap_external_connection",
+                "LDAP Security Alert",
+                f"External IP address attempted to connect to LDAP server!\n\n"
+                f"Source IP: {addr[0]}\n"
+                f"Source Port: {addr[1]}\n"
+                f"This could indicate:\n"
+                f"- VPN failure exposing your server\n"
+                f"- Port forwarding misconfiguration\n"
+                f"- Network scan/attack attempt\n\n"
+                f"Action: Verify firewall and VPN settings immediately.",
+                source_ip=addr[0],
+                source_port=addr[1]
+            )
+            # Close connection immediately for external IPs
+            client.close()
+            return
+    except ValueError:
+        pass  # Invalid IP, continue processing
+
     authenticated = False
     try:
         client.settimeout(30)  # 30 second timeout
@@ -3521,11 +3731,13 @@ async def ldap_server():
     try:
         server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        # Security: Bind to all interfaces (0.0.0.0) but filter connections by IP in handle_ldap_client
+        # This allows connections from any private network (10.x, 172.16-31.x, 192.168.x) while blocking external IPs
         server.bind(('0.0.0.0', port))
         server.listen(10)
         server.setblocking(False)
 
-        logger.info(f"LDAP server listening on 0.0.0.0:{port}")
+        logger.info(f"LDAP server listening on 0.0.0.0:{port} (accepting connections from private networks only)")
 
         while True:
             try:
@@ -5303,6 +5515,31 @@ async def handle_radius_request(data: bytes, addr, server, settings: dict):
     Security: Rate limiting, no admin access, proper authentication
     """
     try:
+        # Security: Check if connection is from external/non-private IP
+        import ipaddress
+        try:
+            client_ip = ipaddress.ip_address(addr[0])
+            if not (client_ip.is_loopback or client_ip.is_private):
+                logger.critical(f"RADIUS: SECURITY ALERT - External IP attempting connection: {addr[0]} - REJECTED")
+                await send_event_notification(
+                    "radius_external_connection",
+                    "RADIUS Security Alert",
+                    f"External IP address attempted to connect to RADIUS server!\n\n"
+                    f"Source IP: {addr[0]}\n"
+                    f"Source Port: {addr[1]}\n"
+                    f"This could indicate:\n"
+                    f"- VPN failure exposing your server\n"
+                    f"- Port forwarding misconfiguration\n"
+                    f"- Network scan/attack attempt\n\n"
+                    f"Action: Connection REJECTED. Verify firewall and VPN settings immediately.",
+                    source_ip=addr[0],
+                    source_port=addr[1]
+                )
+                # REJECT external connections - do not process
+                return
+        except ValueError:
+            pass  # Invalid IP, continue processing
+
         secret = settings.get('radius_secret', '').encode('utf-8')
         if not secret:
             logger.error("RADIUS: No shared secret configured")
@@ -5452,10 +5689,12 @@ async def radius_server():
     try:
         server = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        # Security: Bind to all interfaces (0.0.0.0) but filter connections by IP in handle_radius_request
+        # This allows connections from any private network (10.x, 172.16-31.x, 192.168.x) while blocking external IPs
         server.bind(('0.0.0.0', auth_port))
         server.setblocking(False)
 
-        logger.info(f"RADIUS server listening on 0.0.0.0:{auth_port}")
+        logger.info(f"RADIUS server listening on 0.0.0.0:{auth_port} (accepting connections from private networks only)")
 
         while True:
             try:
@@ -6694,6 +6933,66 @@ async def verify_auth(request: Request, website_session: Optional[str] = Cookie(
     Forward auth endpoint for Caddy to verify website authentication
     SSO: Checks both website_session (legacy) and session_id (CaddyMAN main session) for unified SSO
     """
+    # Security: Rate limiting and brute force protection
+    client_ip = request.client.host if request.client else "unknown"
+    current_time = time.time()
+
+    # Check if IP is temporarily blocked
+    if client_ip in blocked_ips:
+        block_until = blocked_ips[client_ip]
+        if current_time < block_until:
+            # Still blocked
+            raise HTTPException(status_code=429, detail="Too many requests. Temporarily blocked.")
+        else:
+            # Block expired, remove from list
+            del blocked_ips[client_ip]
+
+    # Track this attempt
+    if client_ip not in auth_verify_attempts:
+        auth_verify_attempts[client_ip] = []
+
+    # Clean old attempts outside the time window
+    auth_verify_attempts[client_ip] = [
+        ts for ts in auth_verify_attempts[client_ip]
+        if current_time - ts < AUTH_VERIFY_WINDOW
+    ]
+
+    # Add current attempt
+    auth_verify_attempts[client_ip].append(current_time)
+
+    # Check if exceeded rate limit
+    if len(auth_verify_attempts[client_ip]) > MAX_AUTH_VERIFY_ATTEMPTS:
+        # Block this IP
+        blocked_ips[client_ip] = current_time + AUTH_VERIFY_BLOCK_DURATION
+        logger.critical(f"BRUTE FORCE DETECTED: {client_ip} made {len(auth_verify_attempts[client_ip])} auth attempts in {AUTH_VERIFY_WINDOW}s. Blocked for {AUTH_VERIFY_BLOCK_DURATION/60} minutes.")
+
+        # Send security notification
+        import ipaddress
+        try:
+            ip_obj = ipaddress.ip_address(client_ip)
+            is_external = not (ip_obj.is_loopback or ip_obj.is_private)
+        except:
+            is_external = False
+
+        event_type = "suspicious_activity" if is_external else "suspicious_activity"
+        await send_event_notification(
+            event_type,
+            "BRUTE FORCE ATTACK DETECTED" if is_external else "Suspicious Activity Detected",
+            f"IP address blocked due to excessive authentication attempts!\n\n"
+            f"Source IP: {client_ip}\n"
+            f"IP Type: {'EXTERNAL (Internet)' if is_external else 'Internal/Private'}\n"
+            f"Attempts: {len(auth_verify_attempts[client_ip])} requests in {AUTH_VERIFY_WINDOW} seconds\n"
+            f"Endpoint: /api/auth/verify\n"
+            f"Block Duration: {AUTH_VERIFY_BLOCK_DURATION/60} minutes\n\n"
+            f"{'⚠️ CRITICAL: Your server may be exposed to the internet!' if is_external else 'This may indicate compromised device on your network.'}\n"
+            f"Action: IP temporarily blocked.",
+            source_ip=client_ip,
+            attempts=len(auth_verify_attempts[client_ip]),
+            is_external=is_external
+        )
+
+        raise HTTPException(status_code=429, detail="Too many requests. Temporarily blocked.")
+
     session = None
     session_source = None
 
@@ -8699,6 +8998,47 @@ async def get_proxies(session_id: Optional[str] = Cookie(None)):
         raise HTTPException(status_code=401, detail="Not authenticated")
     return get_all_proxies_from_db()
 
+@app.get("/api/proxies/{proxy_id}/status")
+async def check_proxy_status(proxy_id: str, session_id: Optional[str] = Cookie(None)):
+    """
+    Check if a reverse proxy's upstream is online.
+    Returns online: true if ANY HTTP response received (even 404, 401, 500).
+    Returns online: false only on connection timeout/refused.
+    """
+    user = get_session_user(session_id)
+    if not user:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+
+    proxy = get_proxy_by_id_from_db(proxy_id)
+    if not proxy:
+        raise HTTPException(status_code=404, detail="Proxy not found")
+
+    # If proxy is disabled, return offline
+    if not proxy.get('enabled', False):
+        return {"online": False, "status": "disabled"}
+
+    upstream = proxy.get('upstream', '')
+    if not upstream:
+        return {"online": False, "status": "no_upstream"}
+
+    # Extract first upstream if load balanced
+    if ',' in upstream:
+        upstream = upstream.split(',')[0].strip()
+
+    # Make a quick HEAD request with short timeout
+    try:
+        async with httpx.AsyncClient(timeout=5.0, follow_redirects=False) as client:
+            response = await client.head(upstream)
+            # ANY response code means the server is online
+            return {"online": True, "status": response.status_code}
+    except httpx.TimeoutException:
+        return {"online": False, "status": "timeout"}
+    except httpx.ConnectError:
+        return {"online": False, "status": "connection_refused"}
+    except Exception as e:
+        # Even errors like SSL errors mean the server is technically online
+        return {"online": False, "status": f"error: {type(e).__name__}"}
+
 @app.post("/api/proxies")
 async def create_or_update_proxy(proxy: ReverseProxy, request: Request, session_id: Optional[str] = Cookie(None)):
     user = get_session_user(session_id)
@@ -8754,12 +9094,121 @@ async def get_websites(session_id: Optional[str] = Cookie(None)):
         raise HTTPException(status_code=401, detail="Not authenticated")
     return get_all_websites_from_db()
 
+@app.get("/api/websites/{website_id}/status")
+async def check_website_status(website_id: str, session_id: Optional[str] = Cookie(None)):
+    """
+    Check if a website is online.
+    Returns online: true if ANY HTTP response received (even 404, 401, 500).
+    Returns online: false only on connection timeout/refused.
+    """
+    user = get_session_user(session_id)
+    if not user:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+
+    website = get_website_by_id_from_db(website_id)
+    if not website:
+        raise HTTPException(status_code=404, detail="Website not found")
+
+    # If website is disabled, return offline
+    if not website.get('enabled', False):
+        return {"online": False, "status": "disabled"}
+
+    domains = website.get('domains', [])
+    if not domains:
+        return {"online": False, "status": "no_domains"}
+
+    # Use first domain
+    domain = domains[0] if isinstance(domains, list) else domains
+
+    # Construct URL - try HTTPS first, then HTTP
+    http_ports = website.get('http_ports', [])
+    https_ports = website.get('https_ports', [])
+
+    # Prefer HTTPS if configured
+    if https_ports:
+        port = https_ports[0] if isinstance(https_ports, list) else https_ports
+        url = f"https://{domain}:{port}" if port not in [443, '443'] else f"https://{domain}"
+    elif http_ports:
+        port = http_ports[0] if isinstance(http_ports, list) else http_ports
+        url = f"http://{domain}:{port}" if port not in [80, '80'] else f"http://{domain}"
+    else:
+        url = f"http://{domain}"
+
+    # Make a quick HEAD request with short timeout
+    try:
+        async with httpx.AsyncClient(timeout=5.0, follow_redirects=False, verify=False) as client:
+            response = await client.head(url)
+            # ANY response code means the server is online
+            return {"online": True, "status": response.status_code}
+    except httpx.TimeoutException:
+        return {"online": False, "status": "timeout"}
+    except httpx.ConnectError:
+        return {"online": False, "status": "connection_refused"}
+    except Exception as e:
+        # Even errors like SSL errors mean the server is technically online
+        return {"online": False, "status": f"error: {type(e).__name__}"}
+
 @app.post("/api/websites")
 async def create_or_update_website(website: Website, request: Request, session_id: Optional[str] = Cookie(None)):
     user = get_session_user(session_id)
     if not user:
         raise HTTPException(status_code=401, detail="Not authenticated")
     require_csrf(request, session_id)
+
+    # Security: Validate root path to prevent exposing sensitive files
+    if website.root:
+        import os
+        try:
+            # Get absolute paths
+            caddyman_dir = os.path.abspath(os.path.dirname(__file__))
+            website_root = os.path.abspath(website.root)
+
+            # Check if website root is the same as or parent of CaddyMAN directory
+            if website_root == caddyman_dir:
+                await send_event_notification(
+                    "insecure_bind_detected",
+                    "Security: Unsafe Website Path Blocked",
+                    f"User attempted to host website from CaddyMAN directory!\n\n"
+                    f"User: {user.get('username', 'Unknown')}\n"
+                    f"Attempted Path: {website_root}\n"
+                    f"CaddyMAN Path: {caddyman_dir}\n\n"
+                    f"This would expose: CaddyMAN.db, pepper.enc, and other sensitive files.\n"
+                    f"Action: Blocked automatically.",
+                    username=user.get("username", "Unknown"),
+                    attempted_path=website_root
+                )
+                raise HTTPException(
+                    status_code=400,
+                    detail="Security Error: Cannot host website from CaddyMAN directory. "
+                           "This would expose sensitive files (database, config, etc.). "
+                           "Please use a subdirectory like 'www' or 'public'."
+                )
+
+            # Check if website root is a parent directory of CaddyMAN
+            if caddyman_dir.startswith(website_root + os.sep):
+                await send_event_notification(
+                    "insecure_bind_detected",
+                    "Security: Unsafe Website Path Blocked",
+                    f"User attempted to host website from parent of CaddyMAN directory!\n\n"
+                    f"User: {user.get('username', 'Unknown')}\n"
+                    f"Attempted Path: {website_root}\n"
+                    f"CaddyMAN Path: {caddyman_dir}\n\n"
+                    f"This would expose the entire CaddyMAN installation.\n"
+                    f"Action: Blocked automatically.",
+                    username=user.get("username", "Unknown"),
+                    attempted_path=website_root
+                )
+                raise HTTPException(
+                    status_code=400,
+                    detail="Security Error: Cannot host website from a parent directory of CaddyMAN. "
+                           "This would expose the CaddyMAN installation. "
+                           "Please use a separate directory."
+                )
+        except HTTPException:
+            raise
+        except Exception as e:
+            logger.warning(f"Path validation error: {e}")
+            # Continue if path validation fails (path might not exist yet)
 
     # Check if this is an update or create
     existing = get_website_by_id_from_db(website.id)
