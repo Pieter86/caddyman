@@ -1,10 +1,10 @@
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.responses import Response as StarletteResponse
 from fastapi import FastAPI, HTTPException, Request, Response, Cookie, Header, Form
-from fastapi.responses import HTMLResponse, JSONResponse, FileResponse, RedirectResponse
+from fastapi.responses import HTMLResponse, JSONResponse, FileResponse, RedirectResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from packaging import version
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator, ValidationInfo
 from typing import Optional, Dict, Any, List
 import httpx
 import subprocess
@@ -19,6 +19,7 @@ import logging
 import hashlib
 import uuid
 import time
+import copy
 from pathlib import Path
 from datetime import datetime, timezone
 import platform
@@ -53,7 +54,7 @@ from passlib.hash import nthash
 from argon2 import PasswordHasher, Type
 from argon2.exceptions import VerifyMismatchError, VerificationError, InvalidHash
 
-VERSION = "1.3.14"
+VERSION = "1.3.15"
 
 # Argon2id migration mode - set at runtime based on existing hashes or user choice
 # This will be auto-detected on startup
@@ -353,6 +354,32 @@ class OAuthCORSMiddleware(BaseHTTPMiddleware):
 app.add_middleware(OAuthCORSMiddleware)
 
 
+class SecurityHeadersMiddleware(BaseHTTPMiddleware):
+    """Add security headers to all responses"""
+    async def dispatch(self, request: Request, call_next):
+        response = await call_next(request)
+
+        # Add security headers
+        response.headers["X-Content-Type-Options"] = "nosniff"
+        response.headers["Content-Security-Policy"] = "frame-ancestors 'self'"
+
+        # Add cache control for HTML responses
+        if response.headers.get("content-type", "").startswith("text/html"):
+            response.headers["Cache-Control"] = "no-store"
+            # Ensure charset is set for HTML
+            if "charset" not in response.headers.get("content-type", ""):
+                response.headers["Content-Type"] = "text/html; charset=utf-8"
+
+        # Ensure charset is set for JSON responses
+        if response.headers.get("content-type", "").startswith("application/json"):
+            if "charset" not in response.headers.get("content-type", ""):
+                response.headers["Content-Type"] = "application/json; charset=utf-8"
+
+        return response
+
+app.add_middleware(SecurityHeadersMiddleware)
+
+
 class AdminAuthMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next):
         # Get client IP
@@ -606,6 +633,7 @@ blocked_ips = {}  # Temporarily blocked IPs: {ip: block_until_timestamp}
 
 # Status monitoring - track online/offline state of proxies and websites
 status_cache = {}  # {proxy_id: online_status, website_id: online_status}
+status_sse_clients = []  # List of SSE clients for real-time status updates
 
 # Security constants
 MAX_LOGIN_ATTEMPTS = 5  # Lock account after this many failures
@@ -845,9 +873,9 @@ class Settings(BaseModel):
 
     @field_validator('php_path')
     @classmethod
-    def validate_php_path(cls, v, values):
+    def validate_php_path(cls, v, info: ValidationInfo):
         # Only validate if PHP is enabled
-        if values.data.get('php_enabled', False) and v:
+        if info.data.get('php_enabled', False) and v:
             php_path = v
             # If path is a directory, append platform-specific php-cgi executable
             if os.path.isdir(php_path):
@@ -932,15 +960,16 @@ class ReverseProxy(BaseModel):
     # Legacy fields for backward compatibility
     listen_port: Optional[int] = None
     tls: Optional[bool] = None
-    @field_validator('domains')
-    def validate_domains(cls, v, values):
+
+    @model_validator(mode='after')
+    def validate_domains_required(self):
         # In advanced mode, domains are defined in the JSON config, not required here
-        if values.data.get('advanced'):
-            return v if v else []
+        if self.advanced:
+            return self
         # In simple mode, at least one domain is required
-        if not v or len(v) == 0:
+        if not self.domains or len(self.domains) == 0:
             raise ValueError('At least one domain is required for reverse proxy')
-        return v
+        return self
 
 class Website(BaseModel):
     id: str
@@ -2911,6 +2940,28 @@ async def health_check_loop():
         except Exception as e:
             logger.error(f"Health check error: {e}")
 
+async def broadcast_status_update(item_type: str, item_id: str, online: bool):
+    """
+    Broadcast status update to all connected SSE clients.
+    """
+    global status_sse_clients
+    if not status_sse_clients:
+        return
+
+    message = f"data: {json.dumps({'type': item_type, 'id': item_id, 'online': online})}\n\n"
+
+    # Send to all connected clients, remove disconnected ones
+    disconnected = []
+    for queue in status_sse_clients:
+        try:
+            await queue.put(message)
+        except:
+            disconnected.append(queue)
+
+    # Remove disconnected clients
+    for queue in disconnected:
+        status_sse_clients.remove(queue)
+
 async def status_monitor_loop():
     """
     Background task to monitor proxy and website status.
@@ -2920,7 +2971,7 @@ async def status_monitor_loop():
     while True:
         try:
             # Wait 5 minutes between checks (300 seconds)
-            await asyncio.sleep(300)
+            await asyncio.sleep(30)
 
             # Check all enabled proxies
             proxies = get_all_proxies_from_db()
@@ -2930,7 +2981,36 @@ async def status_monitor_loop():
 
                 proxy_id = proxy.get('id')
                 upstream = proxy.get('upstream', '')
+
+                # If no upstream field, try to extract from advanced config
+                if not upstream and proxy.get('advanced'):
+                    advanced_config = proxy.get('advanced')
+                    logger.info(f"Background health check for proxy {proxy_id}: advanced config type={type(advanced_config)}, has routes={'routes' in advanced_config if isinstance(advanced_config, dict) else 'N/A'}")
+                    # Check if it's a routes array format
+                    if isinstance(advanced_config, dict) and 'routes' in advanced_config:
+                        # Extract upstream from first route's handler
+                        routes = advanced_config.get('routes', [])
+                        logger.info(f"Background health check for proxy {proxy_id}: found {len(routes)} routes")
+                        for route in routes:
+                            if isinstance(route, dict) and 'handle' in route:
+                                handlers = route.get('handle', [])
+                                for handler in handlers:
+                                    if isinstance(handler, dict) and handler.get('handler') == 'reverse_proxy':
+                                        upstreams = handler.get('upstreams', [])
+                                        if upstreams and isinstance(upstreams, list) and len(upstreams) > 0:
+                                            dial = upstreams[0].get('dial', '')
+                                            if dial:
+                                                # Convert dial address to HTTP URL for health check
+                                                upstream = f"http://{dial}"
+                                                logger.info(f"Background health check for proxy {proxy_id}: extracted upstream={upstream}")
+                                                break
+                                if upstream:
+                                    break
+                            if upstream:
+                                break
+
                 if not upstream:
+                    logger.warning(f"Background health check for proxy {proxy_id}: no upstream found, skipping")
                     continue
 
                 # Extract first upstream if load balanced
@@ -2940,21 +3020,33 @@ async def status_monitor_loop():
                 # Check status
                 is_online = False
                 try:
-                    async with httpx.AsyncClient(timeout=5.0, follow_redirects=False) as client:
+                    async with httpx.AsyncClient(timeout=5.0, follow_redirects=True, verify=False) as client:
                         response = await client.head(upstream)
                         # ANY response code means the server is online
                         is_online = True
                 except (httpx.TimeoutException, httpx.ConnectError):
                     is_online = False
-                except:
-                    # Even other errors (SSL, etc.) mean server is technically responding
-                    is_online = False
+                except Exception as e:
+                    # Other errors (redirects, SSL issues, etc.) likely mean server is responding
+                    # Try a GET request as fallback (some servers don't support HEAD)
+                    try:
+                        async with httpx.AsyncClient(timeout=5.0, follow_redirects=True, verify=False) as client:
+                            response = await client.get(upstream)
+                            is_online = True
+                    except (httpx.TimeoutException, httpx.ConnectError):
+                        is_online = False
+                    except:
+                        # Even if GET fails with other errors, server is likely responding
+                        is_online = True
+                        logger.debug(f"Proxy {upstream} responded with error but is online: {type(e).__name__}")
 
                 # Check for status change
                 previous_status = status_cache.get(f'proxy_{proxy_id}')
                 if previous_status is None:
                     # First check - just store status, no notification
                     status_cache[f'proxy_{proxy_id}'] = is_online
+                    # Send initial status to SSE clients
+                    await broadcast_status_update('proxy', proxy_id, is_online)
                 elif previous_status and not is_online:
                     # Was online, now offline
                     logger.warning(f"Proxy went offline: {proxy.get('domains', ['Unknown'])[0]} -> {upstream}")
@@ -2970,6 +3062,8 @@ async def status_monitor_loop():
                         upstream=upstream
                     )
                     status_cache[f'proxy_{proxy_id}'] = False
+                    # Broadcast status change to SSE clients
+                    await broadcast_status_update('proxy', proxy_id, False)
                 elif not previous_status and is_online:
                     # Was offline, now online
                     logger.info(f"Proxy back online: {proxy.get('domains', ['Unknown'])[0]} -> {upstream}")
@@ -2984,80 +3078,109 @@ async def status_monitor_loop():
                         upstream=upstream
                     )
                     status_cache[f'proxy_{proxy_id}'] = True
+                    # Broadcast status change to SSE clients
+                    await broadcast_status_update('proxy', proxy_id, True)
 
-            # Check all enabled websites
-            websites = get_all_websites_from_db()
-            for website in websites:
-                if not website.get('enabled', False):
-                    continue
-
-                website_id = website.get('id')
-                domains = website.get('domains', [])
-                if not domains:
-                    continue
-
-                domain = domains[0] if isinstance(domains, list) else domains
-                http_ports = website.get('http_ports', [])
-                https_ports = website.get('https_ports', [])
-
-                # Construct URL
-                if https_ports:
-                    port = https_ports[0] if isinstance(https_ports, list) else https_ports
-                    url = f"https://{domain}:{port}" if port not in [443, '443'] else f"https://{domain}"
-                elif http_ports:
-                    port = http_ports[0] if isinstance(http_ports, list) else http_ports
-                    url = f"http://{domain}:{port}" if port not in [80, '80'] else f"http://{domain}"
-                else:
-                    url = f"http://{domain}"
-
-                # Check status
-                is_online = False
-                try:
-                    async with httpx.AsyncClient(timeout=5.0, follow_redirects=False, verify=False) as client:
-                        response = await client.head(url)
-                        # ANY response code means the server is online
-                        is_online = True
-                except (httpx.TimeoutException, httpx.ConnectError):
-                    is_online = False
-                except:
-                    # Even other errors mean server is responding
-                    is_online = False
-
-                # Check for status change
-                previous_status = status_cache.get(f'website_{website_id}')
-                if previous_status is None:
-                    # First check - just store status, no notification
-                    status_cache[f'website_{website_id}'] = is_online
-                elif previous_status and not is_online:
-                    # Was online, now offline
-                    logger.warning(f"Website went offline: {domain} ({url})")
-                    await send_event_notification(
-                        "website_down",
-                        "Website Down",
-                        f"Website is no longer responding!\n\n"
-                        f"Domain: {', '.join(domains)}\n"
-                        f"URL: {url}\n"
-                        f"Status: Connection timeout or refused\n\n"
-                        f"Action: Check if Caddy is running and the website files are accessible.",
-                        domains=', '.join(domains),
-                        url=url
-                    )
-                    status_cache[f'website_{website_id}'] = False
-                elif not previous_status and is_online:
-                    # Was offline, now online
-                    logger.info(f"Website back online: {domain} ({url})")
-                    await send_event_notification(
-                        "website_back_online",
-                        "Website Back Online",
-                        f"Website is responding again!\n\n"
-                        f"Domain: {', '.join(domains)}\n"
-                        f"URL: {url}\n"
-                        f"Status: Online",
-                        domains=', '.join(domains),
-                        url=url
-                    )
-                    status_cache[f'website_{website_id}'] = True
-
+            # Static websites don't need health checks - if Caddy is running, they're serving files
+            # Health checks are only useful for reverse proxies with upstream services
+            # Disabled to reduce unnecessary HTTP requests and log spam
+            pass
+            # websites = get_all_websites_from_db()
+            # for website in websites:
+            #     if not website.get('enabled', False):
+            #         continue
+            #
+            #     website_id = website.get('id')
+            #     domains = website.get('domains', [])
+            #     if not domains:
+            #         continue
+            #
+            #     domain = domains[0] if isinstance(domains, list) else domains
+            #     http_ports = website.get('http_ports', [])
+            #     https_ports = website.get('https_ports', [])
+            #
+            #     # Construct URL
+            #     if https_ports:
+            #         port = https_ports[0] if isinstance(https_ports, list) else https_ports
+            #         url = f"https://{domain}:{port}" if port not in [443, '443'] else f"https://{domain}"
+            #     elif http_ports:
+            #         port = http_ports[0] if isinstance(http_ports, list) else http_ports
+            #         url = f"http://{domain}:{port}" if port not in [80, '80'] else f"http://{domain}"
+            #     else:
+            #         url = f"http://{domain}"
+            #
+            #     # Check status
+            #     is_online = False
+            #     error_msg = None
+            #     try:
+            #         async with httpx.AsyncClient(timeout=5.0, follow_redirects=True, verify=False) as client:
+            #             response = await client.head(url)
+            #             # ANY response code means the server is online
+            #             is_online = True
+            #             logger.debug(f"Website {domain}: HEAD request success - {response.status_code}")
+            #     except (httpx.TimeoutException, httpx.ConnectError) as e:
+            #         is_online = False
+            #         error_msg = f"{type(e).__name__}"
+            #         logger.debug(f"Website {domain}: Connection failed - {error_msg}")
+            #     except Exception as e:
+            #         # Other errors (redirects, SSL issues, etc.) likely mean server is responding
+            #         # Try a GET request as fallback (some servers don't support HEAD)
+            #         logger.debug(f"Website {domain}: HEAD failed with {type(e).__name__}, trying GET fallback")
+            #         try:
+            #             async with httpx.AsyncClient(timeout=5.0, follow_redirects=True, verify=False) as client:
+            #                 response = await client.get(url)
+            #                 is_online = True
+            #                 logger.debug(f"Website {domain}: GET request success - {response.status_code}")
+            #         except (httpx.TimeoutException, httpx.ConnectError) as e2:
+            #             is_online = False
+            #             error_msg = f"GET failed: {type(e2).__name__}"
+            #             logger.debug(f"Website {domain}: GET connection failed - {error_msg}")
+            #         except Exception as e2:
+            #             # Even if GET fails with other errors, server is likely responding
+            #             is_online = True
+            #             logger.debug(f"Website {domain}: GET responded with error but marking online: {type(e2).__name__}")
+            #
+            #     # Check for status change
+            #     previous_status = status_cache.get(f'website_{website_id}')
+            #     if previous_status is None:
+            #         # First check - just store status, no notification
+            #         status_cache[f'website_{website_id}'] = is_online
+            #         # Send initial status to SSE clients
+            #         await broadcast_status_update('website', website_id, is_online)
+            #     elif previous_status and not is_online:
+            #         # Was online, now offline
+            #         logger.warning(f"Website went offline: {domain} ({url})")
+            #         await send_event_notification(
+            #             "website_down",
+            #             "Website Down",
+            #             f"Website is no longer responding!\n\n"
+            #             f"Domain: {', '.join(domains)}\n"
+            #             f"URL: {url}\n"
+            #             f"Status: Connection timeout or refused\n\n"
+            #             f"Action: Check if Caddy is running and the website files are accessible.",
+            #             domains=', '.join(domains),
+            #             url=url
+            #         )
+            #         status_cache[f'website_{website_id}'] = False
+            #         # Broadcast status change to SSE clients
+            #         await broadcast_status_update('website', website_id, False)
+            #     elif not previous_status and is_online:
+            #         # Was offline, now online
+            #         logger.info(f"Website back online: {domain} ({url})")
+            #         await send_event_notification(
+            #             "website_back_online",
+            #             "Website Back Online",
+            #             f"Website is responding again!\n\n"
+            #             f"Domain: {', '.join(domains)}\n"
+            #             f"URL: {url}\n"
+            #             f"Status: Online",
+            #             domains=', '.join(domains),
+            #             url=url
+            #         )
+            #         status_cache[f'website_{website_id}'] = True
+            #         # Broadcast status change to SSE clients
+            #         await broadcast_status_update('website', website_id, True)
+            await asyncio.sleep(270)
         except Exception as e:
             logger.error(f"Status monitor error: {e}")
 
@@ -6056,6 +6179,84 @@ def build_caddy_config():
         for proxy in proxies:
             if not proxy.get("enabled", True):
                 continue
+
+            # Check if advanced config is in routes array format
+            advanced_config = proxy.get("advanced")
+            if advanced_config and isinstance(advanced_config, dict) and "routes" in advanced_config:
+                # Handle advanced routes array format: {"routes": [...]}
+                advanced_routes = advanced_config.get("routes", [])
+                if not advanced_routes:
+                    continue
+
+                # Extract domains from the routes
+                extracted_domains = []
+                for route in advanced_routes:
+                    if isinstance(route, dict) and "match" in route:
+                        for matcher in route.get("match", []):
+                            if isinstance(matcher, dict) and "host" in matcher:
+                                extracted_domains.extend(matcher["host"])
+
+                # Remove duplicates while preserving order
+                unique_domains = []
+                for domain in extracted_domains:
+                    if domain not in unique_domains:
+                        unique_domains.append(domain)
+
+                domains = unique_domains if unique_domains else proxy.get("domains", [])
+
+                # Handle legacy format (listen_port + tls)
+                if "listen_port" in proxy and proxy.get("listen_port") is not None:
+                    if proxy.get("tls"):
+                        https_ports = [proxy["listen_port"]]
+                        http_ports = []
+                    else:
+                        http_ports = [proxy["listen_port"]]
+                        https_ports = []
+                else:
+                    # New format with http_ports and https_ports
+                    http_ports = proxy.get("http_ports", [])
+                    https_ports = proxy.get("https_ports", [])
+
+                # If no ports specified but we have advanced routes, default to 443 (HTTPS)
+                if not http_ports and not https_ports:
+                    logger.info(f"Advanced routes proxy has no ports configured, defaulting to HTTPS port 443")
+                    https_ports = [443]
+
+                # Auto HTTPS redirect setup
+                if proxy.get("auto_https") and http_ports and domains:
+                    # Only add default 443 if user didn't specify any HTTPS ports
+                    if not https_ports:
+                        https_ports.append(443)
+                    # Store redirect mappings for each HTTP port to target HTTPS port
+                    target_https_port = https_ports[0] if https_ports else 443
+                    for http_port in http_ports:
+                        for domain in domains:
+                            https_redirects[(http_port, domain)] = target_https_port
+
+                # Add the advanced routes directly to servers (not wrapped)
+                for port in http_ports:
+                    if port not in servers:
+                        servers[port] = {"routes": [], "has_tls": False}
+                    for route in advanced_routes:
+                        # Deep copy the route to avoid mutation
+                        route_copy = copy.deepcopy(route)
+                        add_auth_handler(route_copy, proxy.get("access_groups", []))
+                        servers[port]["routes"].append(route_copy)
+
+                for port in https_ports:
+                    if port not in servers:
+                        servers[port] = {"routes": [], "has_tls": True}
+                    for route in advanced_routes:
+                        # Deep copy the route to avoid mutation
+                        route_copy = copy.deepcopy(route)
+                        add_auth_handler(route_copy, proxy.get("access_groups", []))
+                        servers[port]["routes"].append(route_copy)
+                    servers[port]["has_tls"] = True
+
+                # Continue to next proxy - skip normal processing
+                continue
+
+            # Standard processing for non-routes-array proxies
             domains = proxy.get("domains", [])
             if not domains:
                 continue
@@ -6090,8 +6291,10 @@ def build_caddy_config():
 
             # Build route handler
             route_base = {"match": [{"host": domains}], "handle": []}
-            if proxy.get("advanced"):
-                route_base["handle"].append(proxy["advanced"])
+            if advanced_config:
+                # Advanced config exists but is not routes array format
+                # Could be full Caddy JSON format or custom handler JSON
+                route_base["handle"].append(advanced_config)
             else:
                 handler = {"handler": "reverse_proxy", "upstreams": []}
                 upstreams = proxy["upstream"].split(",") if "," in proxy["upstream"] else [proxy["upstream"]]
@@ -6210,6 +6413,15 @@ def build_caddy_config():
                                     handler["headers"]["response"] = handler["headers"].get("response", {})
                                     handler["headers"]["response"]["set"] = handler["headers"]["response"].get("set", {})
                                     handler["headers"]["response"]["set"][header_name] = [header_value]
+
+                            # Handle flush_interval directive (for SSE and streaming)
+                            elif line.startswith('flush_interval '):
+                                flush_value = line[15:].strip()  # Remove 'flush_interval '
+                                try:
+                                    # Parse the value as integer (supports -1 for immediate flush)
+                                    handler["flush_interval"] = int(flush_value)
+                                except ValueError:
+                                    logger.warning(f"Invalid flush_interval value: {flush_value}")
 
                 route_base["handle"].append(handler)
 
@@ -6588,6 +6800,15 @@ async def periodic_update_check():
         await check_for_updates()
 
 # API Endpoints
+@app.get("/favicon.ico")
+async def favicon():
+    """Serve favicon"""
+    favicon_path = resource_path("ico.ico")
+    if os.path.exists(favicon_path):
+        return FileResponse(favicon_path, media_type="image/x-icon")
+    # Return 204 No Content instead of 404 to avoid console errors
+    return Response(status_code=204)
+
 @app.get("/", response_class=HTMLResponse)
 async def root():
     """Root endpoint - behavior depends on admin_path_mode setting"""
@@ -7637,10 +7858,9 @@ async def get_wifi_password_status(session_id: Optional[str] = Cookie(None)):
     if not user:
         raise HTTPException(status_code=401, detail="Not authenticated")
 
-    # Check if PEAP is enabled
+    # Check if RADIUS is enabled (works with all EAP methods: PAP, PEAP, EAP-TTLS)
     settings = get_settings_from_db()
-    radius_eap_method = settings.get('radius_eap_method', 'TTLS')
-    peap_enabled = (radius_eap_method == 'PEAP')
+    radius_enabled = settings.get('radius_enabled', False)
 
     # Check if user is in allowed RADIUS groups
     # If no groups specified, all users are eligible (matches RADIUS auth logic)
@@ -7653,8 +7873,8 @@ async def get_wifi_password_status(session_id: Optional[str] = Cookie(None)):
 
     return {
         "has_wifi_password": has_wifi_password,
-        "is_eligible": peap_enabled and is_in_radius_group,
-        "peap_enabled": peap_enabled,
+        "is_eligible": radius_enabled and is_in_radius_group,
+        "radius_enabled": radius_enabled,
         "in_radius_group": is_in_radius_group
     }
 
@@ -9018,7 +9238,36 @@ async def check_proxy_status(proxy_id: str, session_id: Optional[str] = Cookie(N
         return {"online": False, "status": "disabled"}
 
     upstream = proxy.get('upstream', '')
+
+    # If no upstream field, try to extract from advanced config
+    if not upstream and proxy.get('advanced'):
+        advanced_config = proxy.get('advanced')
+        logger.info(f"Health check for proxy {proxy_id}: advanced config type={type(advanced_config)}, has routes={'routes' in advanced_config if isinstance(advanced_config, dict) else 'N/A'}")
+        # Check if it's a routes array format
+        if isinstance(advanced_config, dict) and 'routes' in advanced_config:
+            # Extract upstream from first route's handler
+            routes = advanced_config.get('routes', [])
+            logger.info(f"Health check for proxy {proxy_id}: found {len(routes)} routes")
+            for route in routes:
+                if isinstance(route, dict) and 'handle' in route:
+                    handlers = route.get('handle', [])
+                    for handler in handlers:
+                        if isinstance(handler, dict) and handler.get('handler') == 'reverse_proxy':
+                            upstreams = handler.get('upstreams', [])
+                            if upstreams and isinstance(upstreams, list) and len(upstreams) > 0:
+                                dial = upstreams[0].get('dial', '')
+                                if dial:
+                                    # Convert dial address to HTTP URL for health check
+                                    upstream = f"http://{dial}"
+                                    logger.info(f"Health check for proxy {proxy_id}: extracted upstream={upstream}")
+                                    break
+                        if upstream:
+                            break
+                if upstream:
+                    break
+
     if not upstream:
+        logger.warning(f"Health check for proxy {proxy_id}: no upstream found")
         return {"online": False, "status": "no_upstream"}
 
     # Extract first upstream if load balanced
@@ -9027,17 +9276,25 @@ async def check_proxy_status(proxy_id: str, session_id: Optional[str] = Cookie(N
 
     # Make a quick HEAD request with short timeout
     try:
-        async with httpx.AsyncClient(timeout=5.0, follow_redirects=False) as client:
+        async with httpx.AsyncClient(timeout=5.0, follow_redirects=True, verify=False) as client:
             response = await client.head(upstream)
             # ANY response code means the server is online
-            return {"online": True, "status": response.status_code}
+            return {"online": True, "status": response.status_code, "upstream": upstream}
     except httpx.TimeoutException:
-        return {"online": False, "status": "timeout"}
+        return {"online": False, "status": "timeout", "upstream": upstream}
     except httpx.ConnectError:
-        return {"online": False, "status": "connection_refused"}
+        return {"online": False, "status": "connection_refused", "upstream": upstream}
     except Exception as e:
-        # Even errors like SSL errors mean the server is technically online
-        return {"online": False, "status": f"error: {type(e).__name__}"}
+        # HEAD failed, try GET as fallback (some servers don't support HEAD)
+        try:
+            async with httpx.AsyncClient(timeout=5.0, follow_redirects=True, verify=False) as client:
+                response = await client.get(upstream)
+                return {"online": True, "status": response.status_code, "upstream": upstream, "method": "GET"}
+        except (httpx.TimeoutException, httpx.ConnectError) as e2:
+            return {"online": False, "status": f"connection_failed", "error": type(e2).__name__, "upstream": upstream}
+        except Exception as e2:
+            # Even if GET fails with other errors, server is responding
+            return {"online": True, "status": f"responding_with_error", "error": type(e2).__name__, "upstream": upstream}
 
 @app.post("/api/proxies")
 async def create_or_update_proxy(proxy: ReverseProxy, request: Request, session_id: Optional[str] = Cookie(None)):
@@ -9086,6 +9343,93 @@ async def delete_proxy(proxy_id: str, request: Request, session_id: Optional[str
 @app.get("/api/version")
 async def get_version():
     return {"version": VERSION}
+
+@app.get("/api/status/all")
+async def get_all_status(session_id: Optional[str] = Cookie(None)):
+    """
+    Get current status for all enabled proxies and websites.
+    Returns cached status from the background monitor.
+    """
+    user = get_session_user(session_id)
+    if not user:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+
+    result = {
+        "proxies": {},
+        "websites": {}
+    }
+
+    # Get all enabled proxies
+    proxies = get_all_proxies_from_db()
+    for proxy in proxies:
+        if proxy.get('enabled', False):
+            proxy_id = proxy.get('id')
+            result["proxies"][proxy_id] = status_cache.get(f'proxy_{proxy_id}', False)
+
+    # Get all enabled websites
+    websites = get_all_websites_from_db()
+    for website in websites:
+        if website.get('enabled', False):
+            website_id = website.get('id')
+            result["websites"][website_id] = status_cache.get(f'website_{website_id}', False)
+
+    return result
+
+@app.get("/api/status/stream")
+async def status_stream(session_id: Optional[str] = Cookie(None)):
+    """
+    Server-Sent Events endpoint for real-time status updates.
+    Streams proxy and website status changes to connected clients.
+    """
+    user = get_session_user(session_id)
+    if not user:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+
+    global status_sse_clients
+
+    async def event_generator():
+        # Create a queue for this client
+        queue = asyncio.Queue()
+        status_sse_clients.append(queue)
+
+        try:
+            # Send initial status for all proxies and websites
+            proxies = get_all_proxies_from_db()
+            for proxy in proxies:
+                if proxy.get('enabled', False):
+                    proxy_id = proxy.get('id')
+                    online = status_cache.get(f'proxy_{proxy_id}', False)
+                    yield f"data: {json.dumps({'type': 'proxy', 'id': proxy_id, 'online': online})}\n\n"
+
+            websites = get_all_websites_from_db()
+            for website in websites:
+                if website.get('enabled', False):
+                    website_id = website.get('id')
+                    online = status_cache.get(f'website_{website_id}', False)
+                    yield f"data: {json.dumps({'type': 'website', 'id': website_id, 'online': online})}\n\n"
+
+            # Keep connection alive and send updates
+            while True:
+                try:
+                    message = await asyncio.wait_for(queue.get(), timeout=30.0)
+                    yield message
+                except asyncio.TimeoutError:
+                    # Send keep-alive comment every 30 seconds
+                    yield ": keep-alive\n\n"
+        finally:
+            # Remove client from list when disconnected
+            if queue in status_sse_clients:
+                status_sse_clients.remove(queue)
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache, no-transform",
+            "X-Accel-Buffering": "no",  # Disable buffering in nginx
+            "Connection": "keep-alive"
+        }
+    )
 
 @app.get("/api/websites")
 async def get_websites(session_id: Optional[str] = Cookie(None)):
@@ -9136,17 +9480,25 @@ async def check_website_status(website_id: str, session_id: Optional[str] = Cook
 
     # Make a quick HEAD request with short timeout
     try:
-        async with httpx.AsyncClient(timeout=5.0, follow_redirects=False, verify=False) as client:
+        async with httpx.AsyncClient(timeout=5.0, follow_redirects=True, verify=False) as client:
             response = await client.head(url)
             # ANY response code means the server is online
-            return {"online": True, "status": response.status_code}
+            return {"online": True, "status": response.status_code, "url": url}
     except httpx.TimeoutException:
-        return {"online": False, "status": "timeout"}
+        return {"online": False, "status": "timeout", "url": url}
     except httpx.ConnectError:
-        return {"online": False, "status": "connection_refused"}
+        return {"online": False, "status": "connection_refused", "url": url}
     except Exception as e:
-        # Even errors like SSL errors mean the server is technically online
-        return {"online": False, "status": f"error: {type(e).__name__}"}
+        # HEAD failed, try GET as fallback (some servers don't support HEAD)
+        try:
+            async with httpx.AsyncClient(timeout=5.0, follow_redirects=True, verify=False) as client:
+                response = await client.get(url)
+                return {"online": True, "status": response.status_code, "url": url, "method": "GET"}
+        except (httpx.TimeoutException, httpx.ConnectError) as e2:
+            return {"online": False, "status": f"connection_failed", "error": type(e2).__name__, "url": url}
+        except Exception as e2:
+            # Even if GET fails with other errors, server is responding
+            return {"online": True, "status": f"responding_with_error", "error": type(e2).__name__, "url": url}
 
 @app.post("/api/websites")
 async def create_or_update_website(website: Website, request: Request, session_id: Optional[str] = Cookie(None)):
