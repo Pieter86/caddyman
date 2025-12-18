@@ -4,7 +4,8 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>CaddyMAN</title>
-    <link rel="stylesheet" href="/static/style.css?v=1.3.9">
+    <link rel="icon" type="image/x-icon" href="/favicon.ico">
+    <link rel="stylesheet" href="/static/style.css?v=1.3.14">
 
 </head>
 <body class="dark">
@@ -16,15 +17,15 @@
 
     <form id="login-form" onsubmit="event.preventDefault(); login(); return false;">
       <div class="form-group">
-        <label>Username</label>
+        <label for="login-username">Username</label>
         <input type="text" id="login-username" placeholder="Enter username" required autocomplete="username">
       </div>
       <div class="form-group">
-        <label>Password</label>
+        <label for="login-password">Password</label>
         <input type="password" id="login-password" placeholder="Enter password" required autocomplete="current-password">
       </div>
       <div class="form-group hidden" id="login-2fa-group">
-        <label>2FA Code</label>
+        <label for="login-2fa-token">2FA Code</label>
         <input type="text" id="login-2fa-token" placeholder="000000" maxlength="6" pattern="[0-9]{6}" autocomplete="off" style="text-align: center; font-size: 18px; letter-spacing: 5px;">
         <small style="color: var(--text-secondary); font-size: 12px; display: block; margin-top: 5px;">Enter the 6-digit code from your authenticator app</small>
       </div>
@@ -208,19 +209,19 @@
                             </div>
                         </div>
                         <div class="form-group">
-                            <label>Manager Port</label>
+                            <label for="manager-port">Manager Port</label>
                             <input type="number" id="manager-port" min="1" max="65535" value="8000">
                             <small style="color: var(--text-secondary); font-size: 12px;">Port for Caddy Manager web interface (requires restart)</small>
                         </div>
                         <div class="form-group">
-                            <label>Caddy Admin Port</label>
+                            <label for="caddy-admin-port">Caddy Admin Port</label>
                             <input type="number" id="caddy-admin-port" min="1" max="65535" value="12999">
                             <small style="color: var(--text-secondary); font-size: 12px;">Port for Caddy's admin API (default: 12999, requires Caddy restart)</small>
                         </div>
                         <div class="form-group">
                             <div class="checkbox-wrapper">
                                 <input type="checkbox" id="enhanced-security">
-                                <label>Enable Enhanced Security Mode</label>
+                                <label for="enhanced-security">Enable Enhanced Security Mode</label>
                             </div>
                             <small style="color: var(--text-secondary); font-size: 12px; display: block; margin-top: 5px;">
                                 Enables strict password requirements, Have I Been Pwned checking, and allows 2FA for users
@@ -229,7 +230,7 @@
                         <div class="form-group">
                             <div class="checkbox-wrapper">
                                 <input type="checkbox" id="auth-protocols-enabled">
-                                <label>Enable Authentication Protocols (Experimental)</label>
+                                <label for="auth-protocols-enabled">Enable Authentication Protocols (Experimental)</label>
                             </div>
                             <small style="color: var(--text-secondary); font-size: 12px; display: block; margin-top: 5px;">
                                 Enables the Authentication page with OIDC, LDAP, RADIUS, and SMTP features
@@ -239,19 +240,19 @@
                     <div class="card">
                         <h3>Branding & Domain</h3>
                         <div class="form-group">
-                            <label>Organization Name</label>
+                            <label for="organization-name">Organization Name</label>
                             <input type="text" id="organization-name" placeholder="CaddyMAN" value="CaddyMAN">
                             <small style="color: var(--text-secondary); font-size: 12px;">Used in email templates and user-facing messages</small>
                         </div>
                         <div class="form-group">
-                            <label>Domain URL</label>
+                            <label for="domain-url">Domain URL</label>
                             <input type="text" id="domain-url" placeholder="http://localhost:8000" value="http://localhost:8000">
                             <small style="color: var(--text-secondary); font-size: 12px;">Public URL for invite/reset links (e.g., https://users.mydomain.nz)</small>
                         </div>
                         <div class="form-group">
                             <div class="checkbox-wrapper">
                                 <input type="checkbox" id="admin-path-mode">
-                                <label>Admin Path Mode</label>
+                                <label for="admin-path-mode">Admin Path Mode</label>
                             </div>
                             <small style="color: var(--text-secondary); font-size: 12px; display: block; margin-top: 5px;">
                                 When enabled: Admin interface at /admin, User portal login at / (root). When disabled: Current behavior (Admin at /, User portal at /user-portal)
@@ -263,7 +264,7 @@
                         <div class="form-group">
                             <div class="checkbox-wrapper">
                                 <input type="checkbox" id="health-check-enabled">
-                                <label>Enable Health Monitoring</label>
+                                <label for="health-check-enabled">Enable Health Monitoring</label>
                             </div>
                         </div>
                         <div class="form-group">
@@ -271,18 +272,18 @@
                             <input type="text" id="health-check-domain" placeholder="example.com">
                         </div>
                         <div class="form-group">
-                            <label>Check Interval (seconds)</label>
+                            <label for="health-check-interval">Check Interval (seconds)</label>
                             <input type="number" id="health-check-interval" value="60" min="30">
                         </div>
                         <div class="form-group">
-                            <label>Restart After Failures</label>
+                            <label for="restart-after-failures">Restart After Failures</label>
                             <input type="number" id="restart-after-failures" value="3" min="1">
                         </div>
                     </div>
                     <div class="card">
                         <h3>Notifications</h3>
                         <div class="form-group">
-                            <label>Service</label>
+                            <label for="notification-service">Service</label>
                             <select id="notification-service">
                                 <option value="">None</option>
                                 <option value="gotify">Gotify</option>
@@ -308,119 +309,119 @@
                             <details style="margin-bottom: 10px;" open>
                                 <summary style="cursor: pointer; font-weight: 500; color: var(--accent); margin-bottom: 10px;">Security Events</summary>
                                 <div style="margin-left: 20px;">
-                                    <div class="checkbox-wrapper"><input type="checkbox" id="notif-admin_login"><label>Admin Login</label></div>
-                                    <div class="checkbox-wrapper"><input type="checkbox" id="notif-failed_login"><label>Failed Login Attempts</label></div>
-                                    <div class="checkbox-wrapper"><input type="checkbox" id="notif-account_lockout"><label>Account Lockout</label></div>
-                                    <div class="checkbox-wrapper"><input type="checkbox" id="notif-user_created"><label>User Created</label></div>
-                                    <div class="checkbox-wrapper"><input type="checkbox" id="notif-user_deleted"><label>User Deleted</label></div>
-                                    <div class="checkbox-wrapper"><input type="checkbox" id="notif-password_changed"><label>Password Changed</label></div>
+                                    <div class="checkbox-wrapper"><input type="checkbox" id="notif-admin_login"><label for="notif-admin_login">Admin Login</label></div>
+                                    <div class="checkbox-wrapper"><input type="checkbox" id="notif-failed_login"><label for="notif-failed_login">Failed Login Attempts</label></div>
+                                    <div class="checkbox-wrapper"><input type="checkbox" id="notif-account_lockout"><label for="notif-account_lockout">Account Lockout</label></div>
+                                    <div class="checkbox-wrapper"><input type="checkbox" id="notif-user_created"><label for="notif-user_created">User Created</label></div>
+                                    <div class="checkbox-wrapper"><input type="checkbox" id="notif-user_deleted"><label for="notif-user_deleted">User Deleted</label></div>
+                                    <div class="checkbox-wrapper"><input type="checkbox" id="notif-password_changed"><label for="notif-password_changed">Password Changed</label></div>
                                 </div>
                             </details>
 
                             <details style="margin-bottom: 10px;">
                                 <summary style="cursor: pointer; font-weight: 500; color: var(--accent); margin-bottom: 10px;">User Portal</summary>
                                 <div style="margin-left: 20px;">
-                                    <div class="checkbox-wrapper"><input type="checkbox" id="notif-user_portal_login_success"><label>Successful Login</label></div>
-                                    <div class="checkbox-wrapper"><input type="checkbox" id="notif-user_portal_login_failed"><label>Failed Login</label></div>
+                                    <div class="checkbox-wrapper"><input type="checkbox" id="notif-user_portal_login_success"><label for="notif-user_portal_login_success">Successful Login</label></div>
+                                    <div class="checkbox-wrapper"><input type="checkbox" id="notif-user_portal_login_failed"><label for="notif-user_portal_login_failed">Failed Login</label></div>
                                 </div>
                             </details>
 
                             <details style="margin-bottom: 10px;">
                                 <summary style="cursor: pointer; font-weight: 500; color: var(--accent); margin-bottom: 10px;">Website Authentication</summary>
                                 <div style="margin-left: 20px;">
-                                    <div class="checkbox-wrapper"><input type="checkbox" id="notif-website_login_success"><label>Successful Login</label></div>
-                                    <div class="checkbox-wrapper"><input type="checkbox" id="notif-website_login_failed"><label>Failed Login</label></div>
+                                    <div class="checkbox-wrapper"><input type="checkbox" id="notif-website_login_success"><label for="notif-website_login_success">Successful Login</label></div>
+                                    <div class="checkbox-wrapper"><input type="checkbox" id="notif-website_login_failed"><label for="notif-website_login_failed">Failed Login</label></div>
                                 </div>
                             </details>
 
                             <details style="margin-bottom: 10px;">
                                 <summary style="cursor: pointer; font-weight: 500; color: var(--accent); margin-bottom: 10px;">Authentication Protocols (LDAP/RADIUS/OIDC)</summary>
                                 <div style="margin-left: 20px;">
-                                    <div class="checkbox-wrapper"><input type="checkbox" id="notif-ldap_auth_success"><label>LDAP: Successful Auth</label></div>
-                                    <div class="checkbox-wrapper"><input type="checkbox" id="notif-ldap_auth_failed"><label>LDAP: Failed Auth</label></div>
-                                    <div class="checkbox-wrapper"><input type="checkbox" id="notif-ldap_auth_denied"><label>LDAP: Access Denied</label></div>
-                                    <div class="checkbox-wrapper"><input type="checkbox" id="notif-ldap_external_connection"><label style="color: var(--danger); font-weight: 500;">🚨 LDAP: External IP Connection (SECURITY)</label></div>
-                                    <div class="checkbox-wrapper"><input type="checkbox" id="notif-radius_auth_success"><label>RADIUS: Successful Auth</label></div>
-                                    <div class="checkbox-wrapper"><input type="checkbox" id="notif-radius_auth_failed"><label>RADIUS: Failed Auth</label></div>
-                                    <div class="checkbox-wrapper"><input type="checkbox" id="notif-radius_auth_denied"><label>RADIUS: Access Denied</label></div>
-                                    <div class="checkbox-wrapper"><input type="checkbox" id="notif-radius_external_connection"><label style="color: var(--danger); font-weight: 500;">🚨 RADIUS: External IP Connection (SECURITY)</label></div>
-                                    <div class="checkbox-wrapper"><input type="checkbox" id="notif-oidc_auth_success"><label>OIDC: Successful Auth</label></div>
-                                    <div class="checkbox-wrapper"><input type="checkbox" id="notif-oidc_auth_denied"><label>OIDC: Access Denied</label></div>
+                                    <div class="checkbox-wrapper"><input type="checkbox" id="notif-ldap_auth_success"><label for="notif-ldap_auth_success">LDAP: Successful Auth</label></div>
+                                    <div class="checkbox-wrapper"><input type="checkbox" id="notif-ldap_auth_failed"><label for="notif-ldap_auth_failed">LDAP: Failed Auth</label></div>
+                                    <div class="checkbox-wrapper"><input type="checkbox" id="notif-ldap_auth_denied"><label for="notif-ldap_auth_denied">LDAP: Access Denied</label></div>
+                                    <div class="checkbox-wrapper"><input type="checkbox" id="notif-ldap_external_connection"><label for="notif-ldap_external_connection" style="color: var(--danger); font-weight: 500;">🚨 LDAP: External IP Connection (SECURITY)</label></div>
+                                    <div class="checkbox-wrapper"><input type="checkbox" id="notif-radius_auth_success"><label for="notif-radius_auth_success">RADIUS: Successful Auth</label></div>
+                                    <div class="checkbox-wrapper"><input type="checkbox" id="notif-radius_auth_failed"><label for="notif-radius_auth_failed">RADIUS: Failed Auth</label></div>
+                                    <div class="checkbox-wrapper"><input type="checkbox" id="notif-radius_auth_denied"><label for="notif-radius_auth_denied">RADIUS: Access Denied</label></div>
+                                    <div class="checkbox-wrapper"><input type="checkbox" id="notif-radius_external_connection"><label for="notif-radius_external_connection" style="color: var(--danger); font-weight: 500;">🚨 RADIUS: External IP Connection (SECURITY)</label></div>
+                                    <div class="checkbox-wrapper"><input type="checkbox" id="notif-oidc_auth_success"><label for="notif-oidc_auth_success">OIDC: Successful Auth</label></div>
+                                    <div class="checkbox-wrapper"><input type="checkbox" id="notif-oidc_auth_denied"><label for="notif-oidc_auth_denied">OIDC: Access Denied</label></div>
                                 </div>
                             </details>
 
                             <details style="margin-bottom: 10px;">
                                 <summary style="cursor: pointer; font-weight: 500; color: var(--danger); margin-bottom: 10px;">🔒 Security Threats</summary>
                                 <div style="margin-left: 20px;">
-                                    <div class="checkbox-wrapper"><input type="checkbox" id="notif-insecure_bind_detected"><label style="color: var(--danger);">Insecure Bind Address Detected</label></div>
-                                    <div class="checkbox-wrapper"><input type="checkbox" id="notif-suspicious_activity"><label style="color: var(--danger);">Suspicious Activity</label></div>
+                                    <div class="checkbox-wrapper"><input type="checkbox" id="notif-insecure_bind_detected"><label for="notif-insecure_bind_detected" style="color: var(--danger);">Insecure Bind Address Detected</label></div>
+                                    <div class="checkbox-wrapper"><input type="checkbox" id="notif-suspicious_activity"><label for="notif-suspicious_activity" style="color: var(--danger);">Suspicious Activity</label></div>
                                 </div>
                             </details>
 
                             <details style="margin-bottom: 10px;">
                                 <summary style="cursor: pointer; font-weight: 500; color: var(--accent); margin-bottom: 10px;">User Management</summary>
                                 <div style="margin-left: 20px;">
-                                    <div class="checkbox-wrapper"><input type="checkbox" id="notif-invite_created"><label>Invite Created</label></div>
-                                    <div class="checkbox-wrapper"><input type="checkbox" id="notif-invite_used"><label>Invite Used</label></div>
-                                    <div class="checkbox-wrapper"><input type="checkbox" id="notif-password_reset_requested"><label>Password Reset Requested</label></div>
-                                    <div class="checkbox-wrapper"><input type="checkbox" id="notif-password_reset_completed"><label>Password Reset Completed</label></div>
-                                    <div class="checkbox-wrapper"><input type="checkbox" id="notif-2fa_enabled"><label>2FA Enabled</label></div>
-                                    <div class="checkbox-wrapper"><input type="checkbox" id="notif-2fa_disabled"><label>2FA Disabled</label></div>
-                                    <div class="checkbox-wrapper"><input type="checkbox" id="notif-wifi_password_set"><label>WiFi Password Set</label></div>
-                                    <div class="checkbox-wrapper"><input type="checkbox" id="notif-wifi_password_deleted"><label>WiFi Password Deleted</label></div>
+                                    <div class="checkbox-wrapper"><input type="checkbox" id="notif-invite_created"><label for="notif-invite_created">Invite Created</label></div>
+                                    <div class="checkbox-wrapper"><input type="checkbox" id="notif-invite_used"><label for="notif-invite_used">Invite Used</label></div>
+                                    <div class="checkbox-wrapper"><input type="checkbox" id="notif-password_reset_requested"><label for="notif-password_reset_requested">Password Reset Requested</label></div>
+                                    <div class="checkbox-wrapper"><input type="checkbox" id="notif-password_reset_completed"><label for="notif-password_reset_completed">Password Reset Completed</label></div>
+                                    <div class="checkbox-wrapper"><input type="checkbox" id="notif-2fa_enabled"><label for="notif-2fa_enabled">2FA Enabled</label></div>
+                                    <div class="checkbox-wrapper"><input type="checkbox" id="notif-2fa_disabled"><label for="notif-2fa_disabled">2FA Disabled</label></div>
+                                    <div class="checkbox-wrapper"><input type="checkbox" id="notif-wifi_password_set"><label for="notif-wifi_password_set">WiFi Password Set</label></div>
+                                    <div class="checkbox-wrapper"><input type="checkbox" id="notif-wifi_password_deleted"><label for="notif-wifi_password_deleted">WiFi Password Deleted</label></div>
                                 </div>
                             </details>
 
                             <details style="margin-bottom: 10px;">
                                 <summary style="cursor: pointer; font-weight: 500; color: var(--accent); margin-bottom: 10px;">Group & OAuth Management</summary>
                                 <div style="margin-left: 20px;">
-                                    <div class="checkbox-wrapper"><input type="checkbox" id="notif-group_created"><label>Group Created</label></div>
-                                    <div class="checkbox-wrapper"><input type="checkbox" id="notif-group_modified"><label>Group Modified</label></div>
-                                    <div class="checkbox-wrapper"><input type="checkbox" id="notif-group_deleted"><label>Group Deleted</label></div>
-                                    <div class="checkbox-wrapper"><input type="checkbox" id="notif-oauth_client_created"><label>OAuth Client Created</label></div>
-                                    <div class="checkbox-wrapper"><input type="checkbox" id="notif-oauth_client_modified"><label>OAuth Client Modified</label></div>
-                                    <div class="checkbox-wrapper"><input type="checkbox" id="notif-oauth_client_deleted"><label>OAuth Client Deleted</label></div>
+                                    <div class="checkbox-wrapper"><input type="checkbox" id="notif-group_created"><label for="notif-group_created">Group Created</label></div>
+                                    <div class="checkbox-wrapper"><input type="checkbox" id="notif-group_modified"><label for="notif-group_modified">Group Modified</label></div>
+                                    <div class="checkbox-wrapper"><input type="checkbox" id="notif-group_deleted"><label for="notif-group_deleted">Group Deleted</label></div>
+                                    <div class="checkbox-wrapper"><input type="checkbox" id="notif-oauth_client_created"><label for="notif-oauth_client_created">OAuth Client Created</label></div>
+                                    <div class="checkbox-wrapper"><input type="checkbox" id="notif-oauth_client_modified"><label for="notif-oauth_client_modified">OAuth Client Modified</label></div>
+                                    <div class="checkbox-wrapper"><input type="checkbox" id="notif-oauth_client_deleted"><label for="notif-oauth_client_deleted">OAuth Client Deleted</label></div>
                                 </div>
                             </details>
 
                             <details style="margin-bottom: 10px;">
                                 <summary style="cursor: pointer; font-weight: 500; color: var(--accent); margin-bottom: 10px;">System Events</summary>
                                 <div style="margin-left: 20px;">
-                                    <div class="checkbox-wrapper"><input type="checkbox" id="notif-caddy_started"><label>Caddy Started</label></div>
-                                    <div class="checkbox-wrapper"><input type="checkbox" id="notif-caddy_stopped"><label>Caddy Stopped</label></div>
-                                    <div class="checkbox-wrapper"><input type="checkbox" id="notif-caddy_crashed"><label>Caddy Crashed</label></div>
-                                    <div class="checkbox-wrapper"><input type="checkbox" id="notif-caddy_reloaded"><label>Config Reloaded</label></div>
-                                    <div class="checkbox-wrapper"><input type="checkbox" id="notif-php_started"><label>PHP Started</label></div>
-                                    <div class="checkbox-wrapper"><input type="checkbox" id="notif-php_stopped"><label>PHP Stopped</label></div>
-                                    <div class="checkbox-wrapper"><input type="checkbox" id="notif-health_check_failed"><label>Health Check Failed</label></div>
-                                    <div class="checkbox-wrapper"><input type="checkbox" id="notif-proxy_down"><label style="color: var(--danger); font-weight: 500;">🔴 Reverse Proxy Down</label></div>
-                                    <div class="checkbox-wrapper"><input type="checkbox" id="notif-proxy_back_online"><label style="color: var(--success);">🟢 Reverse Proxy Back Online</label></div>
-                                    <div class="checkbox-wrapper"><input type="checkbox" id="notif-website_down"><label style="color: var(--danger); font-weight: 500;">🔴 Website Down</label></div>
-                                    <div class="checkbox-wrapper"><input type="checkbox" id="notif-website_back_online"><label style="color: var(--success);">🟢 Website Back Online</label></div>
-                                    <div class="checkbox-wrapper"><input type="checkbox" id="notif-system_restart"><label>System Restart</label></div>
+                                    <div class="checkbox-wrapper"><input type="checkbox" id="notif-caddy_started"><label for="notif-caddy_started">Caddy Started</label></div>
+                                    <div class="checkbox-wrapper"><input type="checkbox" id="notif-caddy_stopped"><label for="notif-caddy_stopped">Caddy Stopped</label></div>
+                                    <div class="checkbox-wrapper"><input type="checkbox" id="notif-caddy_crashed"><label for="notif-caddy_crashed">Caddy Crashed</label></div>
+                                    <div class="checkbox-wrapper"><input type="checkbox" id="notif-caddy_reloaded"><label for="notif-caddy_reloaded">Config Reloaded</label></div>
+                                    <div class="checkbox-wrapper"><input type="checkbox" id="notif-php_started"><label for="notif-php_started">PHP Started</label></div>
+                                    <div class="checkbox-wrapper"><input type="checkbox" id="notif-php_stopped"><label for="notif-php_stopped">PHP Stopped</label></div>
+                                    <div class="checkbox-wrapper"><input type="checkbox" id="notif-health_check_failed"><label for="notif-health_check_failed">Health Check Failed</label></div>
+                                    <div class="checkbox-wrapper"><input type="checkbox" id="notif-proxy_down"><label for="notif-proxy_down" style="color: var(--danger); font-weight: 500;">🔴 Reverse Proxy Down</label></div>
+                                    <div class="checkbox-wrapper"><input type="checkbox" id="notif-proxy_back_online"><label for="notif-proxy_back_online" style="color: var(--success);">🟢 Reverse Proxy Back Online</label></div>
+                                    <div class="checkbox-wrapper"><input type="checkbox" id="notif-website_down"><label for="notif-website_down" style="color: var(--danger); font-weight: 500;">🔴 Website Down</label></div>
+                                    <div class="checkbox-wrapper"><input type="checkbox" id="notif-website_back_online"><label for="notif-website_back_online" style="color: var(--success);">🟢 Website Back Online</label></div>
+                                    <div class="checkbox-wrapper"><input type="checkbox" id="notif-system_restart"><label for="notif-system_restart">System Restart</label></div>
                                 </div>
                             </details>
 
                             <details style="margin-bottom: 10px;">
                                 <summary style="cursor: pointer; font-weight: 500; color: var(--accent); margin-bottom: 10px;">Configuration Changes</summary>
                                 <div style="margin-left: 20px;">
-                                    <div class="checkbox-wrapper"><input type="checkbox" id="notif-website_added"><label>Website Added</label></div>
-                                    <div class="checkbox-wrapper"><input type="checkbox" id="notif-website_modified"><label>Website Modified</label></div>
-                                    <div class="checkbox-wrapper"><input type="checkbox" id="notif-website_deleted"><label>Website Deleted</label></div>
-                                    <div class="checkbox-wrapper"><input type="checkbox" id="notif-proxy_added"><label>Reverse Proxy Added</label></div>
-                                    <div class="checkbox-wrapper"><input type="checkbox" id="notif-proxy_modified"><label>Reverse Proxy Modified</label></div>
-                                    <div class="checkbox-wrapper"><input type="checkbox" id="notif-proxy_deleted"><label>Reverse Proxy Deleted</label></div>
-                                    <div class="checkbox-wrapper"><input type="checkbox" id="notif-settings_changed"><label>Settings Changed</label></div>
+                                    <div class="checkbox-wrapper"><input type="checkbox" id="notif-website_added"><label for="notif-website_added">Website Added</label></div>
+                                    <div class="checkbox-wrapper"><input type="checkbox" id="notif-website_modified"><label for="notif-website_modified">Website Modified</label></div>
+                                    <div class="checkbox-wrapper"><input type="checkbox" id="notif-website_deleted"><label for="notif-website_deleted">Website Deleted</label></div>
+                                    <div class="checkbox-wrapper"><input type="checkbox" id="notif-proxy_added"><label for="notif-proxy_added">Reverse Proxy Added</label></div>
+                                    <div class="checkbox-wrapper"><input type="checkbox" id="notif-proxy_modified"><label for="notif-proxy_modified">Reverse Proxy Modified</label></div>
+                                    <div class="checkbox-wrapper"><input type="checkbox" id="notif-proxy_deleted"><label for="notif-proxy_deleted">Reverse Proxy Deleted</label></div>
+                                    <div class="checkbox-wrapper"><input type="checkbox" id="notif-settings_changed"><label for="notif-settings_changed">Settings Changed</label></div>
                                 </div>
                             </details>
 
                             <details style="margin-bottom: 10px;">
                                 <summary style="cursor: pointer; font-weight: 500; color: var(--accent); margin-bottom: 10px;">Updates & Logs</summary>
                                 <div style="margin-left: 20px;">
-                                    <div class="checkbox-wrapper"><input type="checkbox" id="notif-update_available"><label>Update Available</label></div>
-                                    <div class="checkbox-wrapper"><input type="checkbox" id="notif-update_installed"><label>Update Installed</label></div>
-                                    <div class="checkbox-wrapper"><input type="checkbox" id="notif-error_log"><label>Error Logs</label></div>
-                                    <div class="checkbox-wrapper"><input type="checkbox" id="notif-warning_log"><label>Warning Logs</label></div>
+                                    <div class="checkbox-wrapper"><input type="checkbox" id="notif-update_available"><label for="notif-update_available">Update Available</label></div>
+                                    <div class="checkbox-wrapper"><input type="checkbox" id="notif-update_installed"><label for="notif-update_installed">Update Installed</label></div>
+                                    <div class="checkbox-wrapper"><input type="checkbox" id="notif-error_log"><label for="notif-error_log">Error Logs</label></div>
+                                    <div class="checkbox-wrapper"><input type="checkbox" id="notif-warning_log"><label for="notif-warning_log">Warning Logs</label></div>
                                 </div>
                             </details>
                         </div>
@@ -430,7 +431,7 @@
                         <div class="form-group">
                             <div class="checkbox-wrapper">
                                 <input type="checkbox" id="php-enabled">
-                                <label>Enable PHP Support</label>
+                                <label for="php-enabled">Enable PHP Support</label>
                             </div>
                         </div>
                         <div class="form-group">
@@ -442,7 +443,7 @@
                     <div class="card">
                         <h3>Application Logging</h3>
                         <div class="form-group">
-                            <label>Global Log Level</label>
+                            <label for="caddy-log-level">Global Log Level</label>
                             <select id="caddy-log-level">
                                 <option value="DEBUG">DEBUG - Very detailed logs</option>
                                 <option value="INFO">INFO - General information</option>
@@ -516,6 +517,132 @@
                     <li><strong>Custom HTTPS:</strong> When using non-standard HTTPS ports, Auto HTTPS is automatically disabled</li>
                     <li><strong>Multiple Domains:</strong> You can serve multiple domains from one reverse proxy configuration</li>
                 </ul>
+
+                <h3 style="color: var(--accent); margin-top: 20px;">Advanced JSON Mode</h3>
+                <p>For complex configurations that require custom Caddy JSON routing, use Advanced JSON mode. This is useful for:</p>
+                <ul style="line-height: 1.8;">
+                    <li>Path-based routing with different handlers</li>
+                    <li>Custom request/response manipulation</li>
+                    <li>Specific protocol requirements (HTTP/1.1, HTTP/2)</li>
+                    <li>Complex header transformations</li>
+                </ul>
+
+                <p><strong style="color: var(--success);">✓ Advanced JSON Mode:</strong> Define your routes in a <code>{"routes": [...]}</code> object with complete route configuration (domains, upstreams, headers, etc.).</p>
+                <p><strong>Port Configuration:</strong></p>
+                <ul style="line-height: 1.8; margin-top: 10px;">
+                    <li><strong>Default:</strong> Automatically uses port 443 (HTTPS) with automatic TLS certificates if no ports are configured</li>
+                    <li><strong>Custom Ports:</strong> To use different ports (e.g., 8443, 80, or multiple ports), set "HTTPS Ports" and/or "HTTP Ports" in the form fields above the JSON</li>
+                    <li><strong>Auto HTTPS Redirect:</strong> Check "Auto HTTPS" checkbox to redirect HTTP→HTTPS</li>
+                </ul>
+
+                <h4 style="color: var(--accent); margin-top: 15px;">Example: Emby/Jellyfin Media Server</h4>
+                <p>This example shows optimal configuration for Emby/Jellyfin - streaming paths with no buffering, other paths with compression:</p>
+                <pre style="background: var(--bg-primary); padding: 15px; border-radius: 6px; overflow-x: auto; font-size: 12px;"><code>{
+  "routes": [
+    {
+      "match": [
+        {
+          "host": [
+            "media.mydomain.com",
+            "media.mydomain2.com"
+          ],
+          "path": [
+            "/Videos/*",
+            "/Audio/*",
+            "/Items/*",
+            "/emby/Videos/*",
+            "/emby/Audio/*",
+            "/emby/Items/*",
+            "/emby/LiveTV/*",
+            "/Sessions/*",
+            "/PlaybackInfo*",
+            "/socket*"
+          ]
+        }
+      ],
+      "handle": [
+        {
+          "handler": "reverse_proxy",
+          "upstreams": [
+            { "dial": "127.0.0.1:8096" }
+          ],
+          "flush_interval": -1,
+          "headers": {
+            "request": {
+              "set": {
+                "X-Real-IP": ["{remote_host}"],
+                "X-Forwarded-For": ["{remote_host}"],
+                "X-Forwarded-Proto": ["https"]
+              }
+            }
+          }
+        }
+      ]
+    },
+    {
+      "match": [
+        {
+          "host": [
+            "media.mydomain.com",
+            "media.mydomain2.com"
+          ]
+        }
+      ],
+      "handle": [
+        {
+          "handler": "encode",
+          "encodings": {
+            "gzip": {},
+            "zstd": {}
+          },
+          "prefer": ["gzip"]
+        },
+        {
+          "handler": "reverse_proxy",
+          "upstreams": [
+            { "dial": "127.0.0.1:8096" }
+          ],
+          "headers": {
+            "request": {
+              "set": {
+                "X-Real-IP": ["{remote_host}"],
+                "X-Forwarded-For": ["{remote_host}"],
+                "X-Forwarded-Proto": ["https"]
+              }
+            }
+          }
+        }
+      ]
+    }
+  ]
+}</code></pre>
+
+                <h4 style="color: var(--accent); margin-top: 15px;">Key Points:</h4>
+                <ul style="line-height: 1.8;">
+                    <li><strong>Routes Order:</strong> More specific routes (with path matchers) should come first</li>
+                    <li><strong>No Server Definition:</strong> Don't include <code>"servers"</code> or <code>"listen"</code> - CaddyMAN handles this</li>
+                    <li><strong>Port Configuration:</strong>
+                        <ul style="margin-top: 5px;">
+                            <li><strong>Default:</strong> Port 443 (HTTPS) with automatic TLS certificates</li>
+                            <li><strong>Custom:</strong> Set "HTTPS Ports" or "HTTP Ports" fields above the JSON for different ports</li>
+                            <li><strong>Auto HTTPS:</strong> Enable in form fields to redirect HTTP→HTTPS</li>
+                        </ul>
+                    </li>
+                    <li><strong>Domain Extraction:</strong> CaddyMAN automatically extracts domains from your <code>host</code> matchers for display</li>
+                    <li><strong>Route Configuration:</strong> All route settings (domains, upstreams, headers, flush_interval, encoders, etc.) are defined in the JSON</li>
+                </ul>
+
+                <h4 style="color: var(--accent); margin-top: 15px;">Common Caddy Handlers & Options:</h4>
+                <ul style="line-height: 1.8;">
+                    <li><code>reverse_proxy</code> - Proxy requests to upstream servers</li>
+                    <li><code>flush_interval: -1</code> - Disable buffering for SSE/streaming (use in reverse_proxy handler)</li>
+                    <li><code>encode</code> - Compress responses (gzip, zstd)</li>
+                    <li><code>file_server</code> - Serve static files</li>
+                    <li><code>rewrite</code> - Modify request URI</li>
+                    <li><code>headers</code> - Add/remove/modify headers</li>
+                </ul>
+
+                <p>For full Caddy JSON documentation, see: <a href="https://caddyserver.com/docs/json/" target="_blank" style="color: var(--accent);">Caddy JSON Structure</a></p>
             </div>
 
             <!-- Websites -->
@@ -910,10 +1037,11 @@ rate_limit {
             <!-- Version Information -->
             <div class="card" style="margin-bottom: 20px;">
                 <h2 style="margin-top: 0; color: var(--accent);">Version Information</h2>
-                <p><strong>Current Version:</strong> v1.3.14</p>
+                <p><strong>Current Version:</strong> v1.3.15</p>
 
                 <h3 style="color: var(--accent); margin-top: 20px;">Recent Updates</h3>
                 <ul style="line-height: 1.8;">
+                    <li><strong>v1.3.15:</strong> 🎨 UX & Accessibility Improvements - Fixed HTML accessibility issues (added form label associations, lang attributes, charset declarations); Updated HTTP security headers to modern standards (Content-Security-Policy with frame-ancestors, removed deprecated X-Frame-Options and X-XSS-Protection); Fixed advanced proxy health checks to properly detect routes array format; Fixed WiFi password section to work with all RADIUS authentication methods (PAP, PEAP, EAP-TTLS) instead of only PEAP; Removed health check status badges for static websites (only reverse proxies show them now); Disabled website health check background loop entirely to reduce unnecessary HTTP requests and log spam; Fixed mobile alert positioning to not cover menu button; Enhanced SSE reconnection with heartbeat monitoring and exponential backoff; Advanced proxy example updated to use generic domain names (media.mydomain.com); Added debug logging for health check troubleshooting</li>
                     <li><strong>v1.3.14:</strong> 🔒 CRITICAL Security Hardening - LDAP/RADIUS Network Security Overhaul - Removed bind address configuration (now automatically binds to 0.0.0.0 for all network interfaces); Added automatic external/public IP blocking with security notifications for LDAP and RADIUS servers; Only private networks allowed (10.x, 172.16-31.x, 192.168.x, localhost) - external connections rejected immediately; Fixed JWT kid header for audiobookshelf browser authentication compatibility; Enhanced notification system with 3-attempt retry logic and 15-second delays; Non-blocking notifications prevent application startup delays; Added brute force protection with rate limiting (20 req/min) and 30-minute IP blocks; Website path security prevents hosting from CaddyMAN directory; Improved mobile responsive design for RADIUS settings; All security events trigger configurable notifications</li>
                     <li><strong>v1.3.13:</strong> 🐛 Critical Bug Fixes & Enhancements - Fixed settings page overwriting authentication settings (LDAP/RADIUS/OIDC were being disabled when saving general settings); Settings page now preserves all authentication settings when saving; Fixed update notifications not being sent; Added configurable log level for both CaddyMAN and Caddy (DEBUG/INFO/WARN/ERROR) with immediate application for CaddyMAN; Reduced console log spam from health checks; Created caddyman-update.exe standalone updater with --auto mode for Windows Task Scheduler; Update banner button now properly opens download page; Log levels apply immediately for CaddyMAN (Caddy requires restart); Better error handling for frozen executable logging</li>
                     <li><strong>v1.3.12:</strong> 🐛 Bug Fixes - Removed noisy migration messages that appeared on every startup; Suppressed httpx INFO logs to reduce console spam while keeping important application logs visible; Added automatic update system with SHA256 hash verification for security; Added build-release.py script for automated build/release process</li>
@@ -1075,7 +1203,7 @@ rate_limit {
                                     </label>
                                 </div>
                                 <div>
-                                    <label>Port:</label>
+                                    <label for="ldap_port">Port:</label>
                                     <input type="number" id="ldap_port" value="3389" min="1" max="65535" oninput="updateLDAPConfigDisplay()">
                                 </div>
                                 <div>
@@ -1137,11 +1265,11 @@ rate_limit {
                                     </label>
                                 </div>
                                 <div>
-                                    <label>Authentication Port:</label>
+                                    <label for="radius_auth_port">Authentication Port:</label>
                                     <input type="number" id="radius_auth_port" value="1812" min="1" max="65535">
                                 </div>
                                 <div>
-                                    <label>Accounting Port:</label>
+                                    <label for="radius_acct_port">Accounting Port:</label>
                                     <input type="number" id="radius_acct_port" value="1813" min="1" max="65535">
                                 </div>
                                 <div>
@@ -1162,7 +1290,7 @@ rate_limit {
                                     </label>
                                 </div>
                                 <div>
-                                    <label>EAP Method:</label>
+                                    <label for="radius_eap_method">EAP Method:</label>
                                     <select id="radius_eap_method">
                                         <option value="TTLS" selected>EAP-TTLS (Tunneled TLS with PAP)</option>
                                         <option value="PEAP">PEAP (MSCHAPv2)</option>
@@ -1199,7 +1327,7 @@ rate_limit {
                                     <input type="text" id="smtp_server" placeholder="smtp.gmail.com">
                                 </div>
                                 <div>
-                                    <label>Port:</label>
+                                    <label for="smtp_port">Port:</label>
                                     <input type="number" id="smtp_port" value="587" min="1" max="65535">
                                 </div>
                                 <div>
@@ -1224,7 +1352,7 @@ rate_limit {
                                     <input type="email" id="smtp_from_address" placeholder="noreply@example.com">
                                 </div>
                                 <div>
-                                    <label>From Name:</label>
+                                    <label for="smtp_from_name">From Name:</label>
                                     <input type="text" id="smtp_from_name" value="CaddyMAN">
                                 </div>
                                 <div>
@@ -1282,7 +1410,7 @@ rate_limit {
                     <small style="color: var(--text-secondary); font-size: 12px;">Single backend or comma-separated multiple backends for load balancing</small>
                 </div>
                 <div class="form-group" id="proxy-load-balance-group">
-                    <label>Load Balancing</label>
+                    <label for="proxy-load-balance">Load Balancing</label>
                     <select id="proxy-load-balance">
                         <option value="">None</option>
                         <option value="random">Random</option>
@@ -1298,10 +1426,10 @@ rate_limit {
                 </div>
                 <div class="form-group">
                     <label>Additional Reverse Proxy Directives</label>
-                    <textarea id="proxy-additional-directives" placeholder="header_up X-Custom-Header value&#10;header_down X-Remove-Header&#10;transport http {&#10;    ...&#10;}" style="min-height: 100px; font-family: 'Consolas', 'Monaco', monospace; font-size: 13px;"></textarea>
+                    <textarea id="proxy-additional-directives" placeholder="header_up X-Custom-Header value&#10;header_down X-Remove-Header&#10;flush_interval -1&#10;transport http {&#10;    ...&#10;}" style="min-height: 100px; font-family: 'Consolas', 'Monaco', monospace; font-size: 13px;"></textarea>
                     <small style="color: var(--text-secondary); font-size: 12px;">
                         Add any additional Caddyfile directives that go inside the reverse_proxy block (one per line).
-                        Example: <code>header_up Host 10.10.0.7:5055</code> or <code>header_up -Origin</code>
+                        Examples: <code>header_up Host 10.10.0.7:5055</code>, <code>header_up -Origin</code>, <code>flush_interval -1</code> (disables buffering for SSE/streaming)
                     </small>
                 </div>
                 <div class="form-group">
@@ -1311,19 +1439,19 @@ rate_limit {
                 <div class="form-group">
                     <div class="checkbox-wrapper">
                         <input type="checkbox" id="proxy-websocket">
-                        <label>WebSocket Support</label>
+                        <label for="proxy-websocket">WebSocket Support</label>
                     </div>
                 </div>
                 <div class="form-group">
                     <div class="checkbox-wrapper">
                         <input type="checkbox" id="proxy-remove-origin">
-                        <label>Remove Origin Header</label>
+                        <label for="proxy-remove-origin">Remove Origin Header</label>
                     </div>
                 </div>
                 <div class="form-group">
                     <div class="checkbox-wrapper">
                         <input type="checkbox" id="proxy-remove-referer">
-                        <label>Remove Referer Header</label>
+                        <label for="proxy-remove-referer">Remove Referer Header</label>
                     </div>
                 </div>
                 <div class="form-group">
@@ -1336,13 +1464,13 @@ rate_limit {
                 <div class="form-group">
                     <div class="checkbox-wrapper">
                         <input type="checkbox" id="proxy-auto-https">
-                        <label>Auto HTTP → HTTPS Redirect (default would be port 80 to 443)</label>
+                        <label for="proxy-auto-https">Auto HTTP → HTTPS Redirect (default would be port 80 to 443)</label>
                     </div>
                 </div>
                 <div class="form-group">
                     <div class="checkbox-wrapper">
                         <input type="checkbox" id="proxy-enabled" checked>
-                        <label>Enabled</label>
+                        <label for="proxy-enabled">Enabled</label>
                     </div>
                 </div>
             </div>
@@ -1350,13 +1478,13 @@ rate_limit {
                 <div style="background: var(--card-bg); padding: 15px; border-radius: 8px; margin-bottom: 20px; border-left: 4px solid var(--accent);">
                     <strong>Advanced Mode</strong>
                     <p style="margin: 10px 0 0 0; color: var(--text-secondary); font-size: 14px;">
-                        In advanced mode, you have full control over the Caddy JSON configuration.
-                        Define servers, routes, matchers, handlers, and all Caddy directives directly in JSON format.
-                        All configuration (domains, ports, upstreams, headers, etc.) is defined in the JSON below.
+                        In advanced mode, define your complete proxy configuration in JSON using the <code>{"routes": [...]}</code> format.
+                        <strong>All route settings</strong> (domains, upstreams, headers, flush_interval, etc.) are defined in the JSON below.<br>
+                        <strong>Port Configuration:</strong> Defaults to port 443 (HTTPS) automatically. To use custom ports, set "HTTPS Ports" and/or "HTTP Ports" fields above.
                     </p>
                 </div>
                 <div class="form-group">
-                    <label>Caddy JSON Configuration</label>
+                    <label for="proxy-advanced">Caddy JSON Configuration (Routes Array)</label>
                     <textarea id="proxy-advanced" style="min-height: 400px; font-family: 'Consolas', 'Monaco', monospace; font-size: 13px;"></textarea>
                     <small style="color: var(--text-secondary); font-size: 12px;">
                         Full Caddy server configuration in JSON format.
@@ -1366,7 +1494,7 @@ rate_limit {
                 <div class="form-group">
                     <div class="checkbox-wrapper">
                         <input type="checkbox" id="proxy-enabled-adv" checked>
-                        <label>Enabled</label>
+                        <label for="proxy-enabled-adv">Enabled</label>
                     </div>
                 </div>
             </div>
@@ -1405,7 +1533,7 @@ rate_limit {
                     <input type="text" id="website-root" placeholder="./www">
                 </div>
                 <div class="form-group">
-                    <label>Index Files (comma-separated)</label>
+                    <label for="website-index">Index Files (comma-separated)</label>
                     <input type="text" id="website-index" value="index.html">
                 </div>
                 <div class="form-group" >
@@ -1415,19 +1543,19 @@ rate_limit {
                 <div class="form-group">
                     <div class="checkbox-wrapper">
                         <input type="checkbox" id="website-auto-https">
-                        <label>Auto HTTP → HTTPS Redirect (upgrades port 80 to 443)</label>
+                        <label for="website-auto-https">Auto HTTP → HTTPS Redirect (upgrades port 80 to 443)</label>
                     </div>
                 </div>
                 <div class="form-group">
                     <div class="checkbox-wrapper">
                         <input type="checkbox" id="website-php-enabled">
-                        <label>Enable PHP Support (requires PHP configured in settings)</label>
+                        <label for="website-php-enabled">Enable PHP Support (requires PHP configured in settings)</label>
                     </div>
                 </div>
                 <div class="form-group">
                     <div class="checkbox-wrapper">
                         <input type="checkbox" id="website-enabled" checked>
-                        <label>Enabled</label>
+                        <label for="website-enabled">Enabled</label>
                     </div>
                 </div>
             </div>
@@ -1435,13 +1563,13 @@ rate_limit {
                 <div style="background: var(--card-bg); padding: 15px; border-radius: 8px; margin-bottom: 20px; border-left: 4px solid var(--accent);">
                     <strong>Advanced Mode</strong>
                     <p style="margin: 10px 0 0 0; color: var(--text-secondary); font-size: 14px;">
-                        In advanced mode, you have full control over the Caddy JSON configuration.
-                        Define servers, routes, matchers, handlers, and all Caddy directives directly in JSON format.
-                        All configuration (domains, ports, root paths, file_server, etc.) is defined in the JSON below.
+                        In advanced mode, define your complete website configuration in JSON using the <code>{"routes": [...]}</code> format.
+                        <strong>All route settings</strong> (domains, root paths, file_server, matchers, etc.) are defined in the JSON below.<br>
+                        <strong>Port Configuration:</strong> Defaults to port 443 (HTTPS) automatically. To use custom ports, set "HTTPS Ports" and/or "HTTP Ports" fields above.
                     </p>
                 </div>
                 <div class="form-group">
-                    <label>Caddy JSON Configuration</label>
+                    <label for="website-advanced">Caddy JSON Configuration (Routes Array)</label>
                     <textarea id="website-advanced" style="min-height: 400px; font-family: 'Consolas', 'Monaco', monospace; font-size: 13px;"></textarea>
                     <small style="color: var(--text-secondary); font-size: 12px;">
                         Full Caddy server configuration in JSON format.
@@ -1451,7 +1579,7 @@ rate_limit {
                 <div class="form-group">
                     <div class="checkbox-wrapper">
                         <input type="checkbox" id="website-enabled-adv" checked>
-                        <label>Enabled</label>
+                        <label for="website-enabled-adv">Enabled</label>
                     </div>
                 </div>
             </div>
@@ -1543,7 +1671,7 @@ rate_limit {
                     <div id="invite-groups"></div>
                 </div>
                 <div class="form-group">
-                    <label>Link Expires In</label>
+                    <label for="invite-expiry">Link Expires In</label>
                     <select id="invite-expiry">
                         <option value="1">1 Hour</option>
                         <option value="6">6 Hours</option>
@@ -1647,14 +1775,14 @@ https://app.example.com/auth/callback"></textarea>
                 <strong>⚠️ IMPORTANT:</strong> Save these credentials now! The client secret will not be shown again.
             </div>
             <div class="form-group">
-                <label>Client ID</label>
+                <label for="oauth-client-id-display">Client ID</label>
                 <div style="display: flex; gap: 10px; align-items: center;">
                     <input type="text" id="oauth-client-id-display" readonly style="flex: 1; font-family: monospace; font-size: 12px;">
                     <button class="btn btn-secondary" onclick="copyOAuthClientId()">📋 Copy</button>
                 </div>
             </div>
             <div class="form-group">
-                <label>Client Secret</label>
+                <label for="oauth-client-secret-display">Client Secret</label>
                 <div style="display: flex; gap: 10px; align-items: center;">
                     <input type="text" id="oauth-client-secret-display" readonly style="flex: 1; font-family: monospace; font-size: 12px;">
                     <button class="btn btn-secondary" onclick="copyOAuthClientSecret()">📋 Copy</button>
@@ -1664,6 +1792,6 @@ https://app.example.com/auth/callback"></textarea>
         </div>
     </div>
 
-     <script src="/static/script.js?v=1.3.10">    </script>
+     <script src="/static/script.js?v=1.3.18">    </script>
 </body>
 </html>

@@ -295,4 +295,12 @@ body {
     .button-group .btn {
         width: 100%;
     }
+
+    /* Move alerts to avoid covering UI elements on mobile */
+    #alert-container {
+        top: 10px;
+        right: 10px;
+        left: 10px;
+        max-width: none;
+    }
 }

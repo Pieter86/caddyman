@@ -1382,7 +1382,66 @@ async function loadProxies() {
     const list = document.getElementById('proxy-list');
     setContent(list, proxies.map(p => {
         const features = [];
-        const displayDomain = (p.domains && p.domains.length) ? p.domains.map(d => escapeHtml(d)).join(', ') : 'All domains';
+
+        // Get domains - for advanced mode, extract from JSON config
+        let displayDomain = 'All domains';
+        if (p.domains && p.domains.length) {
+            displayDomain = p.domains.map(d => escapeHtml(d)).join(', ');
+        } else if (p.advanced) {
+            // Try to extract domains from advanced JSON config
+            try {
+                const hosts = [];
+
+                // Check for simple routes array format: {"routes": [...]}
+                if (p.advanced.routes && Array.isArray(p.advanced.routes)) {
+                    p.advanced.routes.forEach(route => {
+                        if (route.match) {
+                            route.match.forEach(matcher => {
+                                if (matcher.host) {
+                                    hosts.push(...matcher.host);
+                                }
+                            });
+                        }
+                    });
+                }
+
+                // Check TLS automation subjects (full Caddy format)
+                if (p.advanced.apps?.tls?.automation?.policies) {
+                    p.advanced.apps.tls.automation.policies.forEach(policy => {
+                        if (policy.subjects) {
+                            hosts.push(...policy.subjects);
+                        }
+                    });
+                }
+
+                // Also check HTTP server route matchers (full Caddy format)
+                if (p.advanced.apps?.http?.servers) {
+                    Object.values(p.advanced.apps.http.servers).forEach(server => {
+                        if (server.routes) {
+                            server.routes.forEach(route => {
+                                if (route.match) {
+                                    route.match.forEach(matcher => {
+                                        if (matcher.host) {
+                                            hosts.push(...matcher.host);
+                                        }
+                                    });
+                                }
+                            });
+                        }
+                    });
+                }
+
+                // Remove duplicates
+                const uniqueHosts = [...new Set(hosts)];
+                if (uniqueHosts.length > 0) {
+                    displayDomain = uniqueHosts.map(h => escapeHtml(h)).join(', ');
+                    features.push('⚙️ Advanced JSON');
+                }
+            } catch (e) {
+                displayDomain = 'Advanced Config';
+                features.push('⚙️ Advanced JSON');
+            }
+        }
 
         // Handle port display - support both new and legacy format
         let http_ports, https_ports;
@@ -1426,6 +1485,11 @@ async function loadProxies() {
         const upstream = escapeHtml(p.upstream);
         const proxyId = escapeHtml(p.id);
 
+        // Only show health check status for reverse proxies (with upstream), not static websites
+        // Check for regular upstream OR advanced config with routes
+        const hasUpstream = (p.upstream && p.upstream.trim() && !p.upstream.startsWith('/')) ||
+                            (p.advanced && p.advanced.routes && Array.isArray(p.advanced.routes) && p.advanced.routes.length > 0);
+
         return `
             <div class="item">
                 <div class="item-info">
@@ -1437,12 +1501,16 @@ async function loadProxies() {
                     <span class="status-badge ${p.enabled ? 'status-active' : 'status-inactive'}">
                         ${p.enabled ? 'Active' : 'Disabled'}
                     </span>
+                    ${p.enabled && hasUpstream ? `<span class="status-badge status-checking" data-status-type="proxy" data-status-id="${proxyId}">Checking...</span>` : ''}
                     <button class="btn btn-primary" onclick="editProxy('${proxyId}')">Edit</button>
                     <button class="btn btn-danger" onclick="deleteProxy('${proxyId}')">Delete</button>
                 </div>
             </div>
         `;
     }).join(''), true);
+
+    // Update status badges with cached status after rendering
+    refreshStatusBadges();
 }
 
 function toggleLoadBalancingVisibility() {
@@ -1478,7 +1546,11 @@ function openProxyModal() {
     document.getElementById('proxy-auto-https').checked = false;
     document.getElementById('proxy-enabled').checked = true;
     document.getElementById('proxy-additional-directives').value = '';
+    document.getElementById('proxy-advanced').value = '';
     renderGroupSelector('proxy-access-groups', []);
+
+    // Reset to simple mode
+    toggleProxyMode('simple');
 
     // Hide load balancing initially (no upstream entered yet)
     document.getElementById('proxy-load-balance-group').classList.add('hidden');
@@ -1747,6 +1819,9 @@ async function loadWebsites() {
             </div>
         `;
     }).join(''), true);
+
+    // Update status badges with cached status after rendering
+    refreshStatusBadges();
 }
 
 function openWebsiteModal() {
@@ -1760,7 +1835,12 @@ function openWebsiteModal() {
     document.getElementById('website-auto-https').checked = false;
     document.getElementById('website-php-enabled').checked = false;
     document.getElementById('website-enabled').checked = true;
+    document.getElementById('website-advanced').value = '';
     renderGroupSelector('website-access-groups', []);
+
+    // Reset to simple mode
+    toggleWebsiteMode('simple');
+
     document.getElementById('website-modal').classList.add('active');
 }
 
@@ -2471,4 +2551,147 @@ function updateAuthenticationNavVisibility(enabled) {
             }
         }
     });
+}
+
+// Server-Sent Events for real-time status updates
+let statusEventSource = null;
+let sseHeartbeatTimer = null;
+let sseReconnectAttempts = 0;
+const SSE_HEARTBEAT_TIMEOUT = 45000; // 45 seconds (server sends keep-alive every 30s)
+const SSE_MAX_RECONNECT_DELAY = 30000; // Max 30 seconds between reconnects
+
+function connectStatusStream() {
+    // Close existing connection if any
+    if (statusEventSource) {
+        statusEventSource.close();
+        statusEventSource = null;
+    }
+
+    // Clear any existing heartbeat timer
+    if (sseHeartbeatTimer) {
+        clearTimeout(sseHeartbeatTimer);
+        sseHeartbeatTimer = null;
+    }
+
+    // Calculate reconnect delay with exponential backoff
+    const reconnectDelay = Math.min(1000 * Math.pow(2, sseReconnectAttempts), SSE_MAX_RECONNECT_DELAY);
+
+    console.log(`Connecting to SSE stream (attempt ${sseReconnectAttempts + 1})...`);
+
+    try {
+        // Connect to SSE endpoint
+        statusEventSource = new EventSource('/api/status/stream');
+
+        // Reset heartbeat timer on any message (including comments)
+        function resetHeartbeat() {
+            if (sseHeartbeatTimer) {
+                clearTimeout(sseHeartbeatTimer);
+            }
+            sseHeartbeatTimer = setTimeout(() => {
+                console.warn('SSE heartbeat timeout - reconnecting...');
+                if (statusEventSource) {
+                    statusEventSource.close();
+                }
+                sseReconnectAttempts++;
+                connectStatusStream();
+            }, SSE_HEARTBEAT_TIMEOUT);
+        }
+
+        statusEventSource.onopen = function() {
+            console.log('SSE connection established');
+            sseReconnectAttempts = 0; // Reset reconnect counter on successful connection
+            resetHeartbeat();
+        };
+
+        statusEventSource.onmessage = function(event) {
+            resetHeartbeat(); // Reset timeout on every message
+            try {
+                const data = JSON.parse(event.data);
+                updateStatusBadge(data.type, data.id, data.online);
+            } catch (e) {
+                console.error('Error parsing SSE message:', e);
+            }
+        };
+
+        statusEventSource.onerror = function(error) {
+            console.error('SSE connection error:', error);
+
+            // Clear heartbeat timer
+            if (sseHeartbeatTimer) {
+                clearTimeout(sseHeartbeatTimer);
+                sseHeartbeatTimer = null;
+            }
+
+            // Close the connection
+            if (statusEventSource) {
+                statusEventSource.close();
+                statusEventSource = null;
+            }
+
+            // Attempt to reconnect with exponential backoff
+            sseReconnectAttempts++;
+            const delay = Math.min(1000 * Math.pow(2, sseReconnectAttempts - 1), SSE_MAX_RECONNECT_DELAY);
+            console.log(`SSE reconnecting in ${delay / 1000} seconds...`);
+            setTimeout(connectStatusStream, delay);
+        };
+
+    } catch (e) {
+        console.error('Error creating SSE connection:', e);
+        sseReconnectAttempts++;
+        setTimeout(connectStatusStream, reconnectDelay);
+    }
+}
+
+function updateStatusBadge(type, id, online) {
+    // Find the status badge element
+    const badge = document.querySelector(`[data-status-type="${type}"][data-status-id="${id}"]`);
+    if (!badge) return;
+
+    // Update badge class and text
+    badge.className = 'status-badge ' + (online ? 'status-online' : 'status-offline');
+    badge.textContent = online ? 'Online' : 'Offline';
+}
+
+async function fetchInitialStatus() {
+    try {
+        const response = await fetch('/api/status/all');
+        if (!response.ok) {
+            console.error('Failed to fetch status:', response.status);
+            return;
+        }
+        const data = await response.json();
+
+        // Update all proxy statuses
+        for (const [proxyId, online] of Object.entries(data.proxies)) {
+            updateStatusBadge('proxy', proxyId, online);
+        }
+
+        // Update all website statuses
+        for (const [websiteId, online] of Object.entries(data.websites)) {
+            updateStatusBadge('website', websiteId, online);
+        }
+    } catch (error) {
+        console.error('Error fetching initial status:', error);
+    }
+}
+
+async function refreshStatusBadges() {
+    // Fetch current status and update badges that exist in the DOM
+    // This is called after loading proxies or websites to update their status badges
+    await fetchInitialStatus();
+}
+
+async function initializeStatusMonitoring() {
+    // Fetch initial status first
+    await fetchInitialStatus();
+
+    // Then connect to SSE for real-time updates
+    connectStatusStream();
+}
+
+// Initialize status monitoring when page loads
+if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', initializeStatusMonitoring);
+} else {
+    initializeStatusMonitoring();
 }

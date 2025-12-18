@@ -392,8 +392,8 @@ async function loadWifiPasswordStatus() {
             wifiSection.style.display = 'none';
 
             // Show reason if not eligible
-            if (!status.peap_enabled) {
-                console.log('WiFi password not available: PEAP is not enabled');
+            if (!status.radius_enabled) {
+                console.log('WiFi password not available: RADIUS is not enabled');
             } else if (!status.in_radius_group) {
                 console.log('WiFi password not available: User is not in a RADIUS-allowed group');
             }

@@ -1,8 +1,10 @@
 <!DOCTYPE html>
-<html>
+<html lang="en">
 <head>
-    <title>Sign In</title>
+    <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Sign In</title>
+    <link rel="icon" type="image/x-icon" href="/favicon.ico">
     <style>
         * { margin: 0; padding: 0; box-sizing: border-box; }
         body {
@@ -108,15 +110,15 @@
         </div>
         <form id="loginForm" onsubmit="login(event)">
             <div class="form-group">
-                <label>Username</label>
+                <label for="username">Username</label>
                 <input type="text" id="username" required autofocus autocomplete="username">
             </div>
             <div class="form-group">
-                <label>Password</label>
+                <label for="password">Password</label>
                 <input type="password" id="password" required autocomplete="current-password">
             </div>
             <div class="form-group hidden" id="2fa-group">
-                <label>2FA Code</label>
+                <label for="2fa-token">2FA Code</label>
                 <input type="text" id="2fa-token" maxlength="6" pattern="[0-9]{6}" autocomplete="one-time-code" placeholder="000000" style="text-align: center; font-size: 18px; letter-spacing: 5px;">
             </div>
             <button type="submit">Sign In</button>

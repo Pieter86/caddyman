@@ -128,6 +128,9 @@
         }
         .status-active { background: rgba(16, 185, 129, 0.2); color: var(--success); }
         .status-inactive { background: rgba(107, 114, 128, 0.2); color: var(--text-secondary); }
+        .status-online { background: rgba(16, 185, 129, 0.2); color: var(--success); }
+        .status-offline { background: rgba(239, 68, 68, 0.2); color: var(--danger); }
+        .status-checking { background: rgba(245, 158, 11, 0.2); color: var(--warning); }
         .modal {
             display: none; position: fixed; top: 0; left: 0; right: 0; bottom: 0;
             background: rgba(0, 0, 0, 0.7); align-items: center;
@@ -151,20 +154,34 @@
         .checkbox-wrapper { display: flex; align-items: center; gap: 8px; }
         .checkbox-wrapper input[type="checkbox"] { width: auto; }
         .hidden { display: none !important; }
+        #alert-container {
+            position: fixed;
+            top: 20px;
+            left: 50%;
+            transform: translateX(-50%);
+            width: 90%;
+            max-width: 600px;
+            z-index: 10000;
+            pointer-events: none;
+        }
+        #alert-container .alert {
+            pointer-events: auto;
+        }
         .alert {
             padding: 12px; border-radius: 6px; margin-bottom: 20px;
+            box-shadow: 0 4px 6px rgba(0, 0, 0, 0.3);
         }
         .alert-error {
-            background: rgba(239, 68, 68, 0.2); color: var(--danger);
-            border: 1px solid var(--danger);
+            background: rgba(239, 68, 68, 0.95); color: #fff;
+            border: 2px solid var(--danger);
         }
         .alert-success {
-            background: rgba(16, 185, 129, 0.2); color: var(--success);
-            border: 1px solid var(--success);
+            background: rgba(16, 185, 129, 0.95); color: #fff;
+            border: 2px solid var(--success);
         }
         .alert-warning {
-            background: rgba(245, 158, 11, 0.2); color: var(--warning);
-            border: 1px solid var(--warning);
+            background: rgba(245, 158, 11, 0.95); color: #000;
+            border: 2px solid var(--warning);
         }
         .update-banner {
             background: var(--warning); color: #000;
@@ -210,6 +227,12 @@
             /* Show mobile menu toggle */
             .mobile-menu-toggle {
                 display: block;
+            }
+
+            /* Move alerts below menu button on mobile */
+            #alert-container {
+                top: 70px;
+                width: 95%;
             }
 
             /* Sidebar becomes overlay menu */
