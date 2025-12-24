@@ -130,8 +130,8 @@
                     // Redirect to 2FA challenge page with original redirect URL
                     window.location.href = `/auth/2fa-challenge?challenge_id=${data.challenge_id}&redirect=${encodeURIComponent(redirectUrl)}`;
                 } else {
-                    // Set session cookie and redirect to original page
-                    document.cookie = `website_session=${data.session_id}; path=/; max-age=86400; SameSite=Lax`;
+                    // Set session cookie and redirect to original page (v1.3.17: unified SSO with session_id)
+                    document.cookie = `session_id=${data.session_id}; path=/; max-age=86400; SameSite=Lax`;
                     window.location.href = redirectUrl;
                 }
             } catch (err) {

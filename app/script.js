@@ -240,6 +240,7 @@ async function login() {
         }
 
         showApp();
+        await checkDebugMode();
         await checkForUpdates();
         await loadDashboard();
         // Update authentication nav visibility after successful login
@@ -275,8 +276,9 @@ async function checkAuth() {
             csrfToken = storedToken;
         }
         showApp();
+        await checkDebugMode();
         await loadDashboard();
-        startAutoRefresh(); // NEW LINE
+        // Removed startAutoRefresh() - all updates now via SSE
     } catch {
         showLogin();
     }
@@ -380,9 +382,26 @@ async function loadDashboard() {
         await loadActivity();
         await loadNotifications();
         await loadPendingInvites();
+        await loadBlockedIPs();
         await updateAuthServicesStatus();
         await checkForUpdates();
+        await checkDebugMode();
     } catch {}
+}
+
+async function checkDebugMode() {
+    try {
+        const debugData = await apiCall('/api/debug-status');
+        const debugBanner = document.getElementById('debug-banner');
+
+        if (debugData.debug_mode && debugBanner) {
+            debugBanner.style.display = 'block';
+            // Adjust body padding to account for banner height
+            document.body.style.paddingTop = '40px';
+        }
+    } catch (err) {
+        console.error('Failed to check debug mode:', err);
+    }
 }
 
 async function checkForUpdates() {
@@ -391,10 +410,26 @@ async function checkForUpdates() {
         const updateStatus = document.getElementById('update-status');
         const updateVersion = document.getElementById('update-version');
         const updateButton = document.getElementById('update-button-text');
+        const sha256Warning = document.getElementById('sha256-warning');
 
         if (updateData.update_available) {
-            updateVersion.textContent = `v${updateData.update_available.version}`;
+            const update = updateData.update_available;
+            updateVersion.textContent = `v${update.version}`;
             updateStatus.style.display = 'block';
+
+            // Show SHA256 verification status
+            if (sha256Warning) {
+                if (update.sha256_verified === false) {
+                    sha256Warning.style.display = 'block';
+                    sha256Warning.innerHTML = `<strong>⚠️ SHA256 Verification Failed!</strong><br>${update.sha256_error || 'Unknown error'}`;
+                } else if (update.sha256_verified === true) {
+                    sha256Warning.style.display = 'block';
+                    sha256Warning.style.color = 'var(--success)';
+                    sha256Warning.innerHTML = `<strong>✓ SHA256 Verified</strong>`;
+                } else {
+                    sha256Warning.style.display = 'none';
+                }
+            }
 
             // Check if running as executable or script
             if (!runtimeInfo) {
@@ -420,8 +455,30 @@ async function handleUpdate() {
     // Always show download link - use caddyman-update.exe for auto-install
     const updateData = await apiCall('/api/update/check');
     if (updateData.update_available && updateData.update_available.download_url) {
-        window.open(updateData.update_available.download_url, '_blank');
-        showAlert('Download started. Use caddyman-update.exe to automatically install updates.', 'info');
+        const update = updateData.update_available;
+
+        // Warn user if SHA256 verification failed
+        if (update.sha256_verified === false) {
+            const proceed = confirm(
+                `⚠️ WARNING: SHA256 Verification Failed!\n\n` +
+                `${update.sha256_error}\n\n` +
+                `This update file may be corrupted or tampered with. ` +
+                `Installing it could be dangerous.\n\n` +
+                `Do you want to download it anyway?`
+            );
+
+            if (!proceed) {
+                return;
+            }
+        }
+
+        window.open(update.download_url, '_blank');
+
+        if (update.sha256_verified === true) {
+            showAlert('Download started. SHA256 verified successfully. Use caddyman-update.exe to automatically install updates.', 'success');
+        } else {
+            showAlert('Download started. ⚠️ SHA256 verification failed - proceed with caution!', 'warning');
+        }
     }
 }
 
@@ -546,7 +603,7 @@ async function loadPendingInvites() {
             const createdTime = escapeHtml(new Date(invite.created_at * 1000).toLocaleString());
             const username = escapeHtml(invite.username);
             const email = escapeHtml(invite.email);
-            const timeRemaining = escapeHtml(invite.time_remaining);
+            const expiresAt = invite.expires_at; // Unix timestamp
             const createdBy = escapeHtml(invite.created_by);
             const groupNames = invite.groups.map(gid => {
                 const group = allGroups.find(g => g.id === gid);
@@ -554,10 +611,10 @@ async function loadPendingInvites() {
             }).join(', ');
 
             return `
-                <div style="padding: 12px; border-bottom: 1px solid var(--border); line-height: 1.6;">
+                <div class="invite-item" data-token="${escapeHtml(invite.token)}" style="padding: 12px; border-bottom: 1px solid var(--border); line-height: 1.6;">
                     <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 5px;">
                         <strong style="color: var(--accent);">${username}</strong>
-                        <span style="color: var(--warning); font-weight: 500;">⏳ ${timeRemaining}</span>
+                        <span class="invite-countdown" data-token="${escapeHtml(invite.token)}" data-expires="${expiresAt}" style="color: var(--warning); font-weight: 500;">⏳ Calculating...</span>
                     </div>
                     <div style="color: var(--text-secondary); font-size: 13px;">📧 ${email}</div>
                     ${groupNames ? `<div style="color: var(--text-secondary); font-size: 12px;">Groups: ${groupNames}</div>` : ''}
@@ -565,8 +622,182 @@ async function loadPendingInvites() {
                 </div>
             `;
         }).join(''), true);
+
+        // Start countdown timers
+        startInviteCountdownTimers();
     } catch (err) {
         console.error('Failed to load pending invites:', err);
+    }
+}
+
+// Invite countdown timer (client-side interpolation between server SSE updates)
+let inviteTimerInterval = null;
+
+function startInviteCountdownTimers() {
+    // Clear existing timer
+    if (inviteTimerInterval) {
+        clearInterval(inviteTimerInterval);
+    }
+
+    function updateCountdowns() {
+        const countdowns = document.querySelectorAll('.invite-countdown');
+        if (countdowns.length === 0) {
+            // No invites, stop timer
+            if (inviteTimerInterval) {
+                clearInterval(inviteTimerInterval);
+                inviteTimerInterval = null;
+            }
+            return;
+        }
+
+        const now = Date.now() / 1000; // Current time in seconds
+
+        countdowns.forEach(element => {
+            const expiresAt = parseFloat(element.getAttribute('data-expires'));
+            const remaining = expiresAt - now;
+
+            // Update display (server sends updates every 60s normally, every 1s when < 1 min)
+            // Client-side timer provides smooth interpolation between server updates
+            if (remaining <= 0) {
+                element.textContent = '⏳ Expired';
+                element.style.color = 'var(--danger)';
+            } else if (remaining < 60) {
+                // Less than 1 minute - show seconds
+                const seconds = Math.floor(remaining);
+                element.textContent = `⏳ ${seconds}s`;
+                element.style.color = 'var(--danger)';
+            } else if (remaining < 3600) {
+                // Less than 1 hour - show minutes
+                const minutes = Math.floor(remaining / 60);
+                element.textContent = `⏳ ${minutes}m`;
+                element.style.color = 'var(--warning)';
+            } else if (remaining < 86400) {
+                // Less than 1 day - show hours
+                const hours = Math.floor(remaining / 3600);
+                element.textContent = `⏳ ${hours}h`;
+                element.style.color = 'var(--warning)';
+            } else {
+                // 1+ days - show days
+                const days = Math.floor(remaining / 86400);
+                element.textContent = `⏳ ${days}d`;
+                element.style.color = 'var(--warning)';
+            }
+        });
+    }
+
+    // Initial update
+    updateCountdowns();
+
+    // Run every second for smooth countdown display
+    inviteTimerInterval = setInterval(updateCountdowns, 1000);
+}
+
+async function loadBlockedIPs() {
+    try {
+        const response = await apiCall('/api/blocked-ips');
+        const blockedIPs = response.blocked_ips || [];
+        const card = document.getElementById('blocked-ips-card');
+        const list = document.getElementById('blocked-ips-list');
+
+        // Hide card if empty
+        if (blockedIPs.length === 0) {
+            card.style.display = 'none';
+            return;
+        }
+
+        card.style.display = 'block';
+        const now = Date.now() / 1000;
+
+        setContent(list, blockedIPs.map(ip => {
+            const lastBlockedTime = new Date(ip.last_blocked_at * 1000).toLocaleString();
+            const ipAddress = escapeHtml(ip.ip_address);
+            const reason = escapeHtml(ip.last_reason || 'Unknown');
+            const blockCount = ip.block_count;
+            const status = ip.status;
+            const isExternal = ip.is_external ? true : false;
+
+            // Calculate time remaining for temporary blocks
+            let blockStatus = '';
+            if (status === 'permanent') {
+                blockStatus = '<span style="color: var(--danger); font-weight: 600;">⛔ PERMANENT</span>';
+            } else if (status === 'temporary' && ip.block_until) {
+                const remaining = ip.block_until - now;
+                if (remaining > 0) {
+                    const minutes = Math.floor(remaining / 60);
+                    blockStatus = `<span style="color: var(--warning); font-weight: 500;">🔒 ${minutes}m remaining</span>`;
+                } else {
+                    blockStatus = '<span style="color: var(--text-secondary);">⏱️ Expired</span>';
+                }
+            } else {
+                blockStatus = '<span style="color: var(--text-secondary);">📋 Monitoring</span>';
+            }
+
+            return `
+                <div class="blocked-ip-item" data-ip="${ipAddress}" style="padding: 14px; border-bottom: 1px solid var(--border); line-height: 1.6;">
+                    <div style="display: flex; justify-content: space-between; align-items: flex-start; margin-bottom: 8px;">
+                        <div>
+                            <strong style="color: ${isExternal ? 'var(--danger)' : 'var(--accent)'}; font-size: 15px;">
+                                ${isExternal ? '🌐' : '🏠'} ${ipAddress}
+                            </strong>
+                            <div style="color: var(--text-secondary); font-size: 12px; margin-top: 2px;">${reason}</div>
+                        </div>
+                        <div style="text-align: right;">
+                            ${blockStatus}
+                            <div style="color: var(--text-secondary); font-size: 11px; margin-top: 2px;">Blocks: ${blockCount}</div>
+                        </div>
+                    </div>
+                    <div style="display: flex; gap: 8px; margin-top: 8px;">
+                        <button onclick="setBlockedIPStatus('${ipAddress}', 'permanent')"
+                                class="btn btn-sm ${status === 'permanent' ? 'btn-danger' : 'btn-secondary'}"
+                                style="flex: 1; padding: 6px 10px; font-size: 12px;">
+                            ⛔ Permanent
+                        </button>
+                        <button onclick="setBlockedIPStatus('${ipAddress}', 'temporary')"
+                                class="btn btn-sm ${status === 'temporary' ? 'btn-warning' : 'btn-secondary'}"
+                                style="flex: 1; padding: 6px 10px; font-size: 12px;">
+                            🔒 Temporary
+                        </button>
+                        <button onclick="deleteBlockedIP('${ipAddress}')"
+                                class="btn btn-sm btn-danger"
+                                style="padding: 6px 12px; font-size: 12px;">
+                            🗑️ Delete
+                        </button>
+                    </div>
+                    <div style="color: var(--text-secondary); font-size: 11px; margin-top: 6px;">Last blocked: ${lastBlockedTime}</div>
+                </div>
+            `;
+        }).join(''), true);
+    } catch (err) {
+        console.error('Failed to load blocked IPs:', err);
+    }
+}
+
+async function setBlockedIPStatus(ipAddress, status) {
+    try {
+        await apiCall(`/api/blocked-ips/${encodeURIComponent(ipAddress)}/status`, {
+            method: 'POST',
+            body: JSON.stringify({ status })
+        });
+        showAlert(`IP ${ipAddress} status updated to ${status}`, 'success');
+        await loadBlockedIPs();
+    } catch (err) {
+        showAlert(`Failed to update IP status: ${err.message}`, 'error');
+    }
+}
+
+async function deleteBlockedIP(ipAddress) {
+    if (!confirm(`Remove ${ipAddress} from the blocked list?`)) {
+        return;
+    }
+
+    try {
+        await apiCall(`/api/blocked-ips/${encodeURIComponent(ipAddress)}`, {
+            method: 'DELETE'
+        });
+        showAlert(`IP ${ipAddress} removed from blocked list`, 'success');
+        await loadBlockedIPs();
+    } catch (err) {
+        showAlert(`Failed to delete IP: ${err.message}`, 'error');
     }
 }
 
@@ -1498,12 +1729,13 @@ async function loadProxies() {
                     ${features.length ? `<p style="font-size: 12px; margin-top: 5px;">${features.join(' • ')}</p>` : ''}
                 </div>
                 <div class="item-actions">
+                    ${p.managed ? '<span class="status-badge" style="background: var(--accent); color: white;">🔒 System Managed</span>' : ''}
                     <span class="status-badge ${p.enabled ? 'status-active' : 'status-inactive'}">
                         ${p.enabled ? 'Active' : 'Disabled'}
                     </span>
                     ${p.enabled && hasUpstream ? `<span class="status-badge status-checking" data-status-type="proxy" data-status-id="${proxyId}">Checking...</span>` : ''}
-                    <button class="btn btn-primary" onclick="editProxy('${proxyId}')">Edit</button>
-                    <button class="btn btn-danger" onclick="deleteProxy('${proxyId}')">Delete</button>
+                    ${!p.managed ? `<button class="btn btn-primary" onclick="editProxy('${proxyId}')">Edit</button>` : ''}
+                    ${!p.managed ? `<button class="btn btn-danger" onclick="deleteProxy('${proxyId}')">Delete</button>` : ''}
                 </div>
             </div>
         `;
@@ -1565,6 +1797,23 @@ function openProxyModal() {
 
 function closeProxyModal() {
     document.getElementById('proxy-modal').classList.remove('active');
+
+    // Clear all fields to prevent data from persisting to next open
+    document.getElementById('proxy-domain').value = '';
+    document.getElementById('proxy-http-ports').value = '';
+    document.getElementById('proxy-https-ports').value = '';
+    document.getElementById('proxy-upstream').value = '';
+    document.getElementById('proxy-load-balance').value = '';
+    document.getElementById('proxy-header-host').value = '';
+    document.getElementById('proxy-websocket').checked = false;
+    document.getElementById('proxy-remove-origin').checked = false;
+    document.getElementById('proxy-remove-referer').checked = false;
+    document.getElementById('proxy-custom-headers').value = '';
+    document.getElementById('proxy-auto-https').checked = false;
+    document.getElementById('proxy-enabled').checked = true;
+    document.getElementById('proxy-additional-directives').value = '';
+    document.getElementById('proxy-advanced').value = '';
+    document.getElementById('proxy-enabled-adv').checked = true;
 }
 
 function toggleProxyMode(mode, event) {
@@ -1699,6 +1948,7 @@ async function editProxy(id) {
         document.getElementById('proxy-advanced').value = JSON.stringify(proxy.advanced, null, 2);
         document.getElementById('proxy-enabled-adv').checked = proxy.enabled;
     } else {
+        toggleProxyMode('simple');
         document.getElementById('proxy-domain').value = (proxy.domains || []).join(', ');
 
         // Handle port arrays - check for new format first, then fall back to legacy
@@ -2007,32 +2257,8 @@ async function deleteWebsite(id) {
 // Auto-refresh for live updates
 let refreshInterval = null;
 
-function startAutoRefresh() {
-    // Clear any existing interval
-    if (refreshInterval) clearInterval(refreshInterval);
-    
-    // Check every 30 seconds
-    refreshInterval = setInterval(async () => {
-        try {
-            // Update banner
-            await checkForUpdates();
-            
-// Update caddy status and activity if on dashboard
-            const dashboardPage = document.getElementById('dashboard-page');
-            if (!dashboardPage.classList.contains('hidden')) {
-                const status = await apiCall('/api/caddy/status');
-                let statusText = status.status === 'running' ? '✅ Running (PID: ' + status.pid + ')' : '❌ Stopped';
-                if (status.status === 'stopped' && status.reason) {
-                    statusText += ' - ' + status.reason;
-                }
-                document.getElementById('caddy-status').textContent = statusText;
-                
-                // Refresh activity log
-                await loadActivity();
-            }
-        } catch {}
-    }, 30000);
-}
+// Polling removed - all updates now via SSE (Server-Sent Events)
+// Real-time updates for: Caddy status, activity log, notifications, invites, updates
 // Initialize theme from localStorage (default to dark)
 const savedTheme = localStorage.getItem('caddy-manager-theme') || 'dark';
 setTheme(savedTheme);
@@ -2607,13 +2833,78 @@ function connectStatusStream() {
             resetHeartbeat(); // Reset timeout on every message
             try {
                 const data = JSON.parse(event.data);
-                updateStatusBadge(data.type, data.id, data.online);
+
+                // Route to appropriate handler based on event type
+                switch(data.event) {
+                    case 'status':
+                        // Proxy/website status updates
+                        updateStatusBadge(data.type, data.id, data.online);
+                        break;
+
+                    case 'caddy_status':
+                        // Caddy server status update
+                        handleCaddyStatusUpdate(data);
+                        break;
+
+                    case 'activity':
+                        // New activity log entry
+                        handleActivityUpdate(data);
+                        break;
+
+                    case 'notification':
+                        // New notification
+                        handleNotificationUpdate(data);
+                        break;
+
+                    case 'invite_created':
+                        // New pending invite
+                        handleInviteCreated(data);
+                        break;
+
+                    case 'invite_update':
+                        // Periodic invite update
+                        handleInviteUpdate(data);
+                        break;
+
+                    case 'invite_expired':
+                        // Invite expired
+                        handleInviteExpired(data);
+                        break;
+
+                    case 'ip_blocked':
+                        // IP blocked (new or initial state)
+                        handleIPBlocked(data);
+                        break;
+
+                    case 'ip_status_changed':
+                        // IP status changed
+                        handleIPStatusChanged(data);
+                        break;
+
+                    case 'ip_unblocked':
+                        // IP removed from block list
+                        handleIPUnblocked(data);
+                        break;
+
+                    case 'update_available':
+                        // New update available
+                        handleUpdateAvailable(data);
+                        break;
+
+                    case 'debug_mode_changed':
+                        // Debug mode toggled in settings
+                        handleDebugModeChanged(data);
+                        break;
+
+                    default:
+                        console.warn('Unknown SSE event type:', data.event);
+                }
             } catch (e) {
                 console.error('Error parsing SSE message:', e);
             }
         };
 
-        statusEventSource.onerror = function(error) {
+        statusEventSource.onerror = async function(error) {
             console.error('SSE connection error:', error);
 
             // Clear heartbeat timer
@@ -2626,6 +2917,25 @@ function connectStatusStream() {
             if (statusEventSource) {
                 statusEventSource.close();
                 statusEventSource = null;
+            }
+
+            // Check if we're still authenticated before reconnecting
+            // This prevents endless reconnect loops when session expires
+            try {
+                const response = await fetch('/api/settings', {
+                    method: 'GET',
+                    credentials: 'include'
+                });
+
+                if (response.status === 401 || response.status === 403) {
+                    // Session expired or not authenticated - stop reconnecting
+                    console.warn('SSE: Session expired, stopping reconnection attempts');
+                    sseReconnectAttempts = 0; // Reset for next login
+                    return;
+                }
+            } catch (e) {
+                // Network error checking auth - proceed with reconnect
+                console.warn('SSE: Could not verify auth, will retry connection');
             }
 
             // Attempt to reconnect with exponential backoff
@@ -2650,6 +2960,177 @@ function updateStatusBadge(type, id, online) {
     // Update badge class and text
     badge.className = 'status-badge ' + (online ? 'status-online' : 'status-offline');
     badge.textContent = online ? 'Online' : 'Offline';
+}
+
+// SSE Event Handlers for real-time updates
+
+function handleCaddyStatusUpdate(data) {
+    // Update Caddy status on dashboard if visible
+    const statusElement = document.getElementById('caddy-status');
+    if (!statusElement) return;
+
+    if (data.status === 'running') {
+        statusElement.textContent = `✅ Running (PID: ${data.pid})`;
+    } else {
+        statusElement.textContent = data.reason ? `❌ Stopped - ${data.reason}` : '❌ Stopped';
+    }
+}
+
+function handleActivityUpdate(data) {
+    // Only update if dashboard is visible
+    const dashboardPage = document.getElementById('dashboard-page');
+    if (!dashboardPage || dashboardPage.classList.contains('hidden')) return;
+
+    // Reload activity log (it already has the new entry from the broadcast)
+    loadActivity();
+}
+
+function handleNotificationUpdate(data) {
+    // Only update if dashboard is visible
+    const dashboardPage = document.getElementById('dashboard-page');
+    if (!dashboardPage || dashboardPage.classList.contains('hidden')) return;
+
+    // Reload notifications (it already has the new entry from the broadcast)
+    loadNotifications();
+}
+
+function handleInviteCreated(data) {
+    // New invite created - reload the entire list
+    const dashboardPage = document.getElementById('dashboard-page');
+    if (!dashboardPage || dashboardPage.classList.contains('hidden')) return;
+    loadPendingInvites();
+}
+
+function handleInviteUpdate(data) {
+    // Periodic update for an invite's countdown timer
+    const dashboardPage = document.getElementById('dashboard-page');
+    if (!dashboardPage || dashboardPage.classList.contains('hidden')) return;
+
+    // Find the countdown element for this specific invite
+    const countdown = document.querySelector(`.invite-countdown[data-token="${data.token}"]`);
+    if (!countdown) return;
+
+    const now = Date.now() / 1000;
+    const remaining = data.expires_at - now;
+
+    // Update the countdown display
+    if (remaining <= 0) {
+        countdown.textContent = '⏳ Expired';
+        countdown.style.color = 'var(--danger)';
+    } else if (remaining < 60) {
+        // Less than 1 minute - show seconds
+        const seconds = Math.floor(remaining);
+        countdown.textContent = `⏳ ${seconds}s`;
+        countdown.style.color = 'var(--danger)';
+    } else if (remaining < 3600) {
+        // Less than 1 hour - show minutes
+        const minutes = Math.floor(remaining / 60);
+        countdown.textContent = `⏳ ${minutes}m`;
+        countdown.style.color = 'var(--warning)';
+    } else if (remaining < 86400) {
+        // Less than 1 day - show hours
+        const hours = Math.floor(remaining / 3600);
+        countdown.textContent = `⏳ ${hours}h`;
+        countdown.style.color = 'var(--warning)';
+    } else {
+        // 1+ days - show days
+        const days = Math.floor(remaining / 86400);
+        countdown.textContent = `⏳ ${days}d`;
+        countdown.style.color = 'var(--warning)';
+    }
+
+    // Update the data-expires attribute for client-side timer
+    countdown.setAttribute('data-expires', data.expires_at);
+}
+
+function handleInviteExpired(data) {
+    // Invite expired - remove it from the list
+    const dashboardPage = document.getElementById('dashboard-page');
+    if (!dashboardPage || dashboardPage.classList.contains('hidden')) return;
+
+    // Find and remove the invite item
+    const inviteItem = document.querySelector(`.invite-item[data-token="${data.token}"]`);
+    if (inviteItem) {
+        inviteItem.remove();
+
+        // If no more invites, update the UI
+        const list = document.querySelector('#pending-invites-list');
+        if (list && list.children.length === 0) {
+            setContent(list, '<div style="padding: 20px; text-align: center; color: var(--text-secondary);">No pending invites</div>', true);
+        }
+    }
+}
+
+function handleUpdateAvailable(data) {
+    // Update the update banner
+    const updateStatus = document.getElementById('update-status');
+    const updateVersion = document.getElementById('update-version');
+    const sha256Warning = document.getElementById('sha256-warning');
+
+    if (updateVersion) {
+        updateVersion.textContent = `v${data.version}`;
+    }
+    if (updateStatus) {
+        updateStatus.style.display = 'block';
+    }
+
+    // Show SHA256 verification status
+    if (sha256Warning) {
+        if (data.sha256_verified === false) {
+            sha256Warning.style.display = 'block';
+            sha256Warning.style.color = 'var(--danger)';
+            sha256Warning.innerHTML = `<strong>⚠️ SHA256 Verification Failed!</strong><br>${data.sha256_error || 'Unknown error'}`;
+        } else if (data.sha256_verified === true) {
+            sha256Warning.style.display = 'block';
+            sha256Warning.style.color = 'var(--success)';
+            sha256Warning.innerHTML = `<strong>✓ SHA256 Verified</strong>`;
+        } else {
+            sha256Warning.style.display = 'none';
+        }
+    }
+}
+
+function handleDebugModeChanged(data) {
+    // Show or hide debug banner based on debug mode state
+    const debugBanner = document.getElementById('debug-banner');
+    if (!debugBanner) return;
+
+    if (data.debug_mode) {
+        debugBanner.style.display = 'block';
+        document.body.style.paddingTop = '40px';
+    } else {
+        debugBanner.style.display = 'none';
+        document.body.style.paddingTop = '0';
+    }
+}
+
+function handleIPBlocked(data) {
+    // New IP blocked or initial state - reload the list
+    const dashboardPage = document.getElementById('dashboard-page');
+    if (!dashboardPage || dashboardPage.classList.contains('hidden')) return;
+    loadBlockedIPs();
+
+    // Show notification if this is a new block (has 'escalated' field)
+    if (data.escalated !== undefined) {
+        const msg = data.escalated
+            ? `⛔ IP ${data.ip_address} auto-escalated to PERMANENT BLOCK (3rd offense)`
+            : `🔒 IP ${data.ip_address} blocked (${data.status})`;
+        showAlert(msg, data.escalated ? 'error' : 'warning');
+    }
+}
+
+function handleIPStatusChanged(data) {
+    // IP status changed - reload the list
+    const dashboardPage = document.getElementById('dashboard-page');
+    if (!dashboardPage || dashboardPage.classList.contains('hidden')) return;
+    loadBlockedIPs();
+}
+
+function handleIPUnblocked(data) {
+    // IP removed from blocked list - reload
+    const dashboardPage = document.getElementById('dashboard-page');
+    if (!dashboardPage || dashboardPage.classList.contains('hidden')) return;
+    loadBlockedIPs();
 }
 
 async function fetchInitialStatus() {

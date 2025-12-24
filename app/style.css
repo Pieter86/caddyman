@@ -18,6 +18,25 @@
             background: var(--bg-primary); color: var(--text-primary);
             transition: background 0.3s, color 0.3s;
         }
+        /* Debug Banner */
+        #debug-banner {
+            display: none;
+            position: fixed;
+            top: 0;
+            left: 0;
+            right: 0;
+            background: linear-gradient(135deg, #ff6b6b 0%, #ee5a6f 100%);
+            color: white;
+            padding: 10px;
+            text-align: center;
+            z-index: 10000;
+            font-weight: 600;
+            box-shadow: 0 2px 8px rgba(0,0,0,0.3);
+        }
+        #debug-banner a {
+            color: #fff;
+            text-decoration: underline;
+        }
 
         /* Custom Scrollbars */
         ::-webkit-scrollbar {

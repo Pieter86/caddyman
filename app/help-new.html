@@ -1,0 +1,360 @@
+            <!-- Help Content -->
+            <div class="card" style="margin-bottom: 20px;">
+                <h2 style="margin-top: 0; color: var(--accent);">Getting Started with CaddyMAN</h2>
+                <p>CaddyMAN is a web-based management interface for Caddy Server with built-in Identity & Access Management (IAM) features.</p>
+
+                <h3 style="color: var(--accent); margin-top: 20px;">Quick Start</h3>
+                <ol style="line-height: 1.8;">
+                    <li><strong>Default Login:</strong> Username <code>admin</code>, Password <code>changeme</code> (you'll be forced to change on first login)</li>
+                    <li><strong>Access:</strong> http://localhost:8000 (default manager port)</li>
+                    <li><strong>Dashboard:</strong> View Caddy status, proxies, websites, users, and pending invitations</li>
+                    <li><strong>Configuration:</strong> All settings stored in <code>CaddyMAN.db</code> (SQLite database)</li>
+                </ol>
+
+                <h3 style="color: var(--accent); margin-top: 20px;">Key Concepts</h3>
+                <ul style="line-height: 1.8;">
+                    <li><strong>Reverse Proxies:</strong> Forward requests to backend services (e.g., apps running on different ports)</li>
+                    <li><strong>Static Websites:</strong> Serve HTML/PHP sites from local directories</li>
+                    <li><strong>Auto HTTPS:</strong> Automatic TLS certificates via Let's Encrypt (requires port 80 + valid domain)</li>
+                    <li><strong>Access Groups:</strong> Restrict proxies/websites to authenticated users in specific groups</li>
+                    <li><strong>SSO:</strong> Single session across admin panel, LDAP, OIDC, and protected websites</li>
+                </ul>
+            </div>
+
+            <!-- Reverse Proxies -->
+            <div class="card" style="margin-bottom: 20px;">
+                <h2 style="margin-top: 0; color: var(--accent);">Reverse Proxies</h2>
+                <p>Forward incoming requests to backend services running on different ports or servers.</p>
+
+                <h3 style="color: var(--accent); margin-top: 20px;">Basic Configuration</h3>
+                <ol style="line-height: 1.8;">
+                    <li><strong>Domains:</strong> Enter one or more domain names (e.g., api.mydomain.com) - one per line</li>
+                    <li><strong>Target:</strong> Backend URL (e.g., http://localhost:3000 or http://192.168.1.100:8080)</li>
+                    <li><strong>HTTP Ports:</strong> Port 80 (default) or custom ports like 8080 - one per line</li>
+                    <li><strong>HTTPS Ports:</strong> Port 443 (default) or custom ports like 8443 - one per line</li>
+                    <li><strong>Auto HTTPS:</strong> Enable for automatic TLS certificates (requires port 80 for HTTP-01 challenge)</li>
+                    <li><strong>Access Groups:</strong> Require authentication from users in selected groups (optional)</li>
+                </ol>
+
+                <h3 style="color: var(--accent); margin-top: 20px;">Advanced Features</h3>
+                <ul style="line-height: 1.8;">
+                    <li><strong>WebSocket Support:</strong> Enable for services using WebSockets (e.g., HomeAssistant)</li>
+                    <li><strong>Custom Headers:</strong> Add headers to proxied requests (JSON format: <code>{"X-Custom": "value"}</code>)</li>
+                    <li><strong>Load Balancing:</strong> Distribute requests across multiple backend servers</li>
+                    <li><strong>Additional Directives:</strong> Add raw Caddyfile text for custom configurations</li>
+                </ul>
+
+                <h3 style="color: var(--accent); margin-top: 20px;">Advanced JSON Mode</h3>
+                <p>For complex configurations, use Advanced JSON mode to define custom Caddy routing. Example: Media server with optimized streaming.</p>
+                <pre style="background: var(--bg-primary); padding: 15px; border-radius: 6px; overflow-x: auto; font-size: 12px;"><code>{
+  "routes": [
+    {
+      "match": [
+        {
+          "host": ["media.mydomain.com"],
+          "path": [
+            "/Videos/*",
+            "/Audio/*",
+            "/Items/*",
+            "/socket*"
+          ]
+        }
+      ],
+      "handle": [
+        {
+          "handler": "reverse_proxy",
+          "upstreams": [{"dial": "127.0.0.1:8096"}],
+          "flush_interval": -1,
+          "headers": {
+            "request": {
+              "set": {
+                "X-Forwarded-Proto": ["https"],
+                "X-Real-IP": ["{http.request.remote}"]
+              }
+            }
+          }
+        }
+      ]
+    },
+    {
+      "match": [{"host": ["media.mydomain.com"]}],
+      "handle": [
+        {
+          "handler": "encode",
+          "encodings": {"gzip": {}, "zstd": {}},
+          "prefer": ["gzip"]
+        },
+        {
+          "handler": "reverse_proxy",
+          "upstreams": [{"dial": "127.0.0.1:8096"}]
+        }
+      ]
+    }
+  ]
+}</code></pre>
+                <p><strong>Key Points:</strong></p>
+                <ul style="line-height: 1.8;">
+                    <li><strong>Port Configuration:</strong> Set HTTPS/HTTP ports in form fields above JSON (defaults to 443 if empty)</li>
+                    <li><strong>No Server Definition:</strong> Don't include <code>"servers"</code> or <code>"listen"</code> - CaddyMAN handles this</li>
+                    <li><strong>Routes Order:</strong> More specific routes (with path matchers) should come first</li>
+                    <li><strong>flush_interval: -1</strong> - Disables buffering for streaming/SSE</li>
+                    <li><strong>encode handler</strong> - Compresses non-streaming responses</li>
+                </ul>
+                <p>Full documentation: <a href="https://caddyserver.com/docs/json/" target="_blank" style="color: var(--accent);">Caddy JSON Structure</a></p>
+            </div>
+
+            <!-- Static Websites -->
+            <div class="card" style="margin-bottom: 20px;">
+                <h2 style="margin-top: 0; color: var(--accent);">Static Websites</h2>
+                <p>Serve HTML, CSS, JavaScript, and PHP files from local directories.</p>
+
+                <h3 style="color: var(--accent); margin-top: 20px;">Configuration</h3>
+                <ol style="line-height: 1.8;">
+                    <li><strong>Domains:</strong> Domain names or IP addresses - one per line</li>
+                    <li><strong>Root Path:</strong> Absolute path to website files (must be at least one subfolder deep for security)</li>
+                    <li><strong>Index Files:</strong> Default files (e.g., index.html, index.php) - one per line</li>
+                    <li><strong>HTTP/HTTPS Ports:</strong> Same as reverse proxies</li>
+                    <li><strong>PHP Enabled:</strong> Check to enable PHP support (requires global PHP configuration)</li>
+                    <li><strong>Auto HTTPS:</strong> Enable for automatic TLS certificates</li>
+                    <li><strong>Access Groups:</strong> Restrict to authenticated users</li>
+                </ol>
+
+                <h3 style="color: var(--accent); margin-top: 20px;">PHP Support</h3>
+                <p>Enable PHP globally in Settings:</p>
+                <ul style="line-height: 1.8;">
+                    <li><strong>PHP Enabled:</strong> Master switch in Settings</li>
+                    <li><strong>PHP-CGI Path:</strong> Path to php-cgi executable (e.g., C:\php\php-cgi.exe or /usr/bin/php-cgi)</li>
+                    <li><strong>Per-Site:</strong> Enable PHP checkbox on individual websites</li>
+                    <li><strong>Default Port:</strong> PHP-CGI runs on port 9000 (automatic)</li>
+                </ul>
+
+                <h3 style="color: var(--accent); margin-top: 20px;">Security</h3>
+                <p><strong>Important:</strong> Website root must be at least one subfolder deep to prevent exposing CaddyMAN.db and other sensitive files.</p>
+                <ul style="line-height: 1.8;">
+                    <li>✅ <strong>Safe:</strong> <code>www</code>, <code>public</code>, <code>sites/mysite</code></li>
+                    <li>❌ <strong>Blocked:</strong> Current directory, parent directories</li>
+                </ul>
+            </div>
+
+            <!-- Authentication & IAM -->
+            <div class="card" style="margin-bottom: 20px;">
+                <h2 style="margin-top: 0; color: var(--accent);">Identity & Access Management (IAM)</h2>
+                <p>CaddyMAN provides enterprise-grade authentication for modern and legacy applications.</p>
+
+                <h3 style="color: var(--accent); margin-top: 20px;">LDAP Server</h3>
+                <ul style="line-height: 1.8;">
+                    <li><strong>Purpose:</strong> Authenticate legacy apps (Emby, Jellyfin, etc.)</li>
+                    <li><strong>Port:</strong> Configurable (default 389 conflicts on Windows - use 3389 or another port)</li>
+                    <li><strong>Binding:</strong> Automatically listens on all interfaces (0.0.0.0)</li>
+                    <li><strong>Security:</strong> External/public IPs automatically rejected - only private networks allowed</li>
+                    <li><strong>Allowed Groups:</strong> Restrict LDAP access to specific user groups</li>
+                    <li><strong>Enhanced Security Mode:</strong> Requires users to append 6-digit 2FA code to password (password123456)</li>
+                    <li><strong>Admin Block:</strong> Admin users cannot authenticate via LDAP (security)</li>
+                </ul>
+
+                <h3 style="color: var(--accent); margin-top: 20px;">RADIUS Server</h3>
+                <ul style="line-height: 1.8;">
+                    <li><strong>Purpose:</strong> WiFi WPA2-Enterprise authentication</li>
+                    <li><strong>Auth Port:</strong> 1812 (configurable)</li>
+                    <li><strong>Accounting Port:</strong> 1813 (configurable)</li>
+                    <li><strong>EAP Methods:</strong> PAP, PEAP (MSCHAPv2), EAP-TTLS (PAP) - configurable</li>
+                    <li><strong>WiFi Passwords:</strong> Users can set separate WiFi password in User Portal (PEAP only)</li>
+                    <li><strong>Security:</strong> Same external IP blocking as LDAP</li>
+                    <li><strong>VLAN Assignment:</strong> Optional VLAN assignment support</li>
+                </ul>
+
+                <h3 style="color: var(--accent); margin-top: 20px;">OIDC/OAuth2 Provider</h3>
+                <ul style="line-height: 1.8;">
+                    <li><strong>Purpose:</strong> Modern app authentication (Audiobookshelf, Grafana, etc.)</li>
+                    <li><strong>Issuer URL:</strong> Your domain (e.g., https://auth.mydomain.com)</li>
+                    <li><strong>Endpoints:</strong> /.well-known/openid-configuration, /oauth/authorize, /oauth/token, /oauth/userinfo</li>
+                    <li><strong>Flows:</strong> Authorization code with PKCE, refresh tokens</li>
+                    <li><strong>Scopes:</strong> openid, profile, email, groups, custom claims</li>
+                    <li><strong>Client Management:</strong> Create OAuth clients with redirect URIs and group restrictions</li>
+                </ul>
+
+                <h3 style="color: var(--accent); margin-top: 20px;">Two-Factor Authentication (2FA)</h3>
+                <ul style="line-height: 1.8;">
+                    <li><strong>Per-User:</strong> Users enable TOTP in User Portal (/user-portal)</li>
+                    <li><strong>Force 2FA:</strong> Require 2FA for users in specific groups (blocks access until configured)</li>
+                    <li><strong>Enhanced Security Mode:</strong> Enforces 2FA for all admin and LDAP logins</li>
+                    <li><strong>Setup:</strong> Scan QR code with authenticator app (Google Authenticator, Authy, etc.)</li>
+                </ul>
+
+                <h3 style="color: var(--accent); margin-top: 20px;">User Management</h3>
+                <ul style="line-height: 1.8;">
+                    <li><strong>Invite System:</strong> Send email invites with time-limited tokens (1-720 hours)</li>
+                    <li><strong>Password Reset:</strong> Email-based password reset with 2FA verification</li>
+                    <li><strong>User Portal:</strong> /user-portal - change password, email, 2FA, WiFi password</li>
+                    <li><strong>Groups:</strong> Assign users to groups for access control</li>
+                    <li><strong>Password Security:</strong> Argon2id hashing with DPAPI-encrypted pepper (Windows)</li>
+                </ul>
+            </div>
+
+            <!-- Settings -->
+            <div class="card" style="margin-bottom: 20px;">
+                <h2 style="margin-top: 0; color: var(--accent);">Settings</h2>
+
+                <h3 style="color: var(--accent); margin-top: 20px;">SMTP Configuration</h3>
+                <ul style="line-height: 1.8;">
+                    <li><strong>Required For:</strong> Invite links, password resets, notifications</li>
+                    <li><strong>Settings:</strong> Server, port (587 default), TLS, username, password</li>
+                    <li><strong>Test:</strong> Use "Test Email" button to verify configuration</li>
+                    <li><strong>Security:</strong> Password encrypted with DPAPI-derived key</li>
+                </ul>
+
+                <h3 style="color: var(--accent); margin-top: 20px;">Notifications</h3>
+                <ul style="line-height: 1.8;">
+                    <li><strong>Services:</strong> Gotify, Ntfy</li>
+                    <li><strong>Event Types:</strong> 50+ events (security alerts, system events, user actions, etc.)</li>
+                    <li><strong>Granular Control:</strong> Enable/disable individual events with severity levels</li>
+                    <li><strong>Auto-Retry:</strong> 3 attempts with 15-second delays for delivery reliability</li>
+                </ul>
+
+                <h3 style="color: var(--accent); margin-top: 20px;">Logging</h3>
+                <ul style="line-height: 1.8;">
+                    <li><strong>Caddy Log Level:</strong> DEBUG, INFO, WARN, ERROR (requires Caddy restart)</li>
+                    <li><strong>CaddyMAN Log Level:</strong> Tied to Caddy level (applies immediately)</li>
+                    <li><strong>Log Files:</strong> app.log (CaddyMAN), check Caddy admin endpoint for Caddy logs</li>
+                </ul>
+
+                <h3 style="color: var(--accent); margin-top: 20px;">Other Settings</h3>
+                <ul style="line-height: 1.8;">
+                    <li><strong>Manager Port:</strong> Port for admin interface (default 8000)</li>
+                    <li><strong>Domain URL:</strong> Your main domain for SSO cookie scope and invite links</li>
+                    <li><strong>Enhanced Security:</strong> Enforces 2FA on admin/LDAP, blocks user creation without 2FA</li>
+                    <li><strong>Organization Name:</strong> Branding for emails and UI</li>
+                </ul>
+            </div>
+
+            <!-- Troubleshooting -->
+            <div class="card" style="margin-bottom: 20px;">
+                <h2 style="margin-top: 0; color: var(--accent);">Troubleshooting</h2>
+
+                <h3 style="color: var(--accent); margin-top: 20px;">Caddy Won't Start</h3>
+                <ul style="line-height: 1.8;">
+                    <li><strong>Port Conflicts:</strong> Use <code>netstat -ano | findstr :PORT</code> to check if port is in use</li>
+                    <li><strong>Configuration Error:</strong> Check Caddy logs for syntax errors in Advanced JSON or directives</li>
+                    <li><strong>Permissions:</strong> Ensure Caddy can bind to ports (especially 80/443)</li>
+                    <li><strong>Path Issues:</strong> Verify Caddy executable path in Settings is correct</li>
+                </ul>
+
+                <h3 style="color: var(--accent); margin-top: 20px;">PHP Not Working</h3>
+                <ul style="line-height: 1.8;">
+                    <li><strong>Global Enable:</strong> Ensure PHP is enabled in Settings</li>
+                    <li><strong>PHP-CGI Path:</strong> Verify path to php-cgi executable</li>
+                    <li><strong>Site Enable:</strong> Check PHP checkbox on website</li>
+                    <li><strong>Port Conflict:</strong> Ensure port 9000 is available</li>
+                    <li><strong>Restart:</strong> Restart Caddy after changing PHP settings</li>
+                </ul>
+
+                <h3 style="color: var(--accent); margin-top: 20px;">Auto HTTPS Not Working</h3>
+                <ul style="line-height: 1.8;">
+                    <li><strong>Port 80 Required:</strong> Must be available for HTTP-01 challenges</li>
+                    <li><strong>Valid Domain:</strong> Need real domain pointing to your server (not localhost or IP)</li>
+                    <li><strong>DNS Propagation:</strong> Ensure DNS records have propagated</li>
+                    <li><strong>Firewall:</strong> Ports 80 and 443 must be open</li>
+                    <li><strong>Alternative:</strong> Use custom TLS with your own certificates</li>
+                </ul>
+
+                <h3 style="color: var(--accent); margin-top: 20px;">LDAP/RADIUS Connection Issues</h3>
+                <ul style="line-height: 1.8;">
+                    <li><strong>Network Binding:</strong> Servers automatically bind to all interfaces (0.0.0.0)</li>
+                    <li><strong>Allowed Networks:</strong> Only private IPs (10.x, 172.16-31.x, 192.168.x, localhost)</li>
+                    <li><strong>External IPs Blocked:</strong> Public IPs automatically rejected with security notifications</li>
+                    <li><strong>Startup Logs:</strong> Verify "LDAP server listening on 0.0.0.0:PORT" message</li>
+                    <li><strong>Port Conflicts:</strong> Use <code>netstat -an | findstr :389</code> (LDAP) or <code>netstat -an | findstr :1812</code> (RADIUS)</li>
+                    <li><strong>Firewall:</strong> Ensure Windows Firewall allows inbound connections</li>
+                    <li><strong>Group Filtering:</strong> Verify user is in allowed groups</li>
+                </ul>
+
+                <h3 style="color: var(--accent); margin-top: 20px;">Session Expired / Can't Login</h3>
+                <ul style="line-height: 1.8;">
+                    <li><strong>Session Duration:</strong> Sessions expire after 7 days</li>
+                    <li><strong>Clear Cookies:</strong> Try clearing browser cookies for CaddyMAN</li>
+                    <li><strong>CSRF Errors:</strong> Refresh the page to get a new CSRF token</li>
+                    <li><strong>2FA Required:</strong> If in force-2FA group, must enable 2FA in User Portal first</li>
+                </ul>
+            </div>
+
+            <!-- API Reference -->
+            <div class="card" style="margin-bottom: 20px;">
+                <h2 style="margin-top: 0; color: var(--accent);">API Reference</h2>
+                <p>CaddyMAN provides a REST API for automation. All endpoints require session authentication via <code>session_id</code> cookie.</p>
+
+                <h3 style="color: var(--accent); margin-top: 20px;">CSRF Protection</h3>
+                <p>All POST/PUT/DELETE requests require <code>X-CSRF-Token</code> header. Get token from login response:</p>
+                <pre style="background: var(--bg-secondary); padding: 15px; border-radius: 8px;">POST /api/login
+{"username": "admin", "password": "your_password"}
+
+Response: {"csrf_token": "xxx", "username": "admin", ...}</pre>
+
+                <h3 style="color: var(--accent); margin-top: 20px;">Key Endpoints</h3>
+                <ul style="line-height: 1.8;">
+                    <li><code>POST /api/login</code> - Authenticate (returns CSRF token)</li>
+                    <li><code>POST /api/auth/logout</code> - End session</li>
+                    <li><code>GET /api/settings</code> - Get all settings</li>
+                    <li><code>POST /api/settings</code> - Update settings (requires CSRF)</li>
+                    <li><code>GET /api/proxies</code> - List reverse proxies</li>
+                    <li><code>POST /api/proxies</code> - Create/update proxy (requires CSRF)</li>
+                    <li><code>GET /api/websites</code> - List websites</li>
+                    <li><code>POST /api/websites</code> - Create/update website (requires CSRF)</li>
+                    <li><code>GET /api/users</code> - List users</li>
+                    <li><code>POST /api/users</code> - Create user (requires CSRF)</li>
+                    <li><code>GET /api/groups</code> - List groups</li>
+                    <li><code>GET /api/caddy/status</code> - Check Caddy status</li>
+                    <li><code>POST /api/caddy/restart</code> - Restart Caddy (requires CSRF)</li>
+                    <li><code>GET /api/status/stream</code> - SSE endpoint for real-time updates</li>
+                </ul>
+
+                <p><strong>Full API Documentation:</strong> Available at <code>/docs</code> when log level is set to DEBUG (shows warning banner)</p>
+            </div>
+
+            <!-- Database & Backups -->
+            <div class="card" style="margin-bottom: 20px;">
+                <h2 style="margin-top: 0; color: var(--accent);">Database & Backups</h2>
+                <p>CaddyMAN uses SQLite for reliable, file-based data storage.</p>
+
+                <h3 style="color: var(--accent); margin-top: 20px;">Database File</h3>
+                <ul style="line-height: 1.8;">
+                    <li><strong>Location:</strong> <code>CaddyMAN.db</code> (same directory as executable)</li>
+                    <li><strong>Contains:</strong> Users, groups, proxies, websites, settings, invites, blocked IPs</li>
+                    <li><strong>Encryption:</strong> Sensitive fields encrypted with DPAPI-derived keys (Windows)</li>
+                </ul>
+
+                <h3 style="color: var(--accent); margin-top: 20px;">Backup</h3>
+                <ul style="line-height: 1.8;">
+                    <li><strong>Simple:</strong> Just copy <code>CaddyMAN.db</code> to a safe location</li>
+                    <li><strong>Restore:</strong> Stop CaddyMAN, replace database file, restart</li>
+                    <li><strong>Security Note:</strong> Moving database to different machine invalidates DPAPI-encrypted secrets (passwords, tokens)</li>
+                    <li><strong>Also Backup:</strong> <code>pepper.enc</code> (required for password verification)</li>
+                </ul>
+
+                <h3 style="color: var(--accent); margin-top: 20px;">Version Management</h3>
+                <ul style="line-height: 1.8;">
+                    <li><strong>Minimum Version:</strong> v1.3.17 requires database from v1.3.16 or newer</li>
+                    <li><strong>Downgrades:</strong> Allowed as long as version meets database's minimum requirement</li>
+                    <li><strong>Tracking:</strong> Database stores last version used and minimum version required</li>
+                </ul>
+            </div>
+
+            <!-- Version Information -->
+            <div class="card" style="margin-bottom: 20px;">
+                <h2 style="margin-top: 0; color: var(--accent);">Version Information</h2>
+                <p><strong>Current Version:</strong> v1.3.17</p>
+                <p><strong>Release Date:</strong> December 22, 2025</p>
+                <p><strong>Minimum Database Version:</strong> v1.3.16</p>
+
+                <h3 style="color: var(--accent); margin-top: 20px;">What's New in v1.3.17</h3>
+                <ul style="line-height: 1.8;">
+                    <li>🧹 Major code cleanup - removed ~100+ lines of dead code and migrations</li>
+                    <li>🔒 Exclusively Argon2id password hashing (bcrypt completely removed)</li>
+                    <li>✅ Fixed cryptography library deprecation warnings</li>
+                    <li>🛡️ Enhanced root directory validation for websites</li>
+                    <li>🔄 Improved version checking allows downgrades (with minimum version enforcement)</li>
+                    <li>📡 SSE client stops reconnecting when session expires (prevents log spam)</li>
+                    <li>🚨 Better brute force notifications - contextual messaging</li>
+                </ul>
+
+                <p><strong>Full Changelog:</strong> See <code>CHANGELOG.md</code> for complete version history</p>
+            </div>
