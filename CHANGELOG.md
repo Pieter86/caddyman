@@ -1,5 +1,15 @@
 # CaddyMAN Changelog
 
+## v1.3.18 (2026-01-12)
+🐛 **Bug Fixes**
+- Fixed LDAP authentication notifications - now sends `ldap_auth_failed` notifications for ALL failure scenarios
+- Previously only sent notifications for incorrect passwords, now includes:
+  - User not found (most common Emby login failure)
+  - Invalid BIND requests
+  - Admin users blocked from LDAP access
+  - Password too short for 2FA
+- All LDAP authentication failures now properly logged and trigger notifications
+
 ## v1.3.17 (2025-12-22)
 🧹 **Major Code Cleanup & Modernization**
 - User passwords now exclusively use Argon2id with DPAPI-encrypted pepper (slow but secure for weak passwords)

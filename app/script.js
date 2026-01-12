@@ -2837,8 +2837,8 @@ function connectStatusStream() {
                 // Route to appropriate handler based on event type
                 switch(data.event) {
                     case 'status':
-                        // Proxy/website status updates
-                        updateStatusBadge(data.type, data.id, data.online);
+                        // Proxy/website status updates (may include protected/status details)
+                        updateStatusBadge(data.type, data.id, data.online, data.protected, data.status);
                         break;
 
                     case 'caddy_status':
@@ -2952,14 +2952,27 @@ function connectStatusStream() {
     }
 }
 
-function updateStatusBadge(type, id, online) {
+function updateStatusBadge(type, id, online, isProtected = false, statusCode = null) {
     // Find the status badge element
     const badge = document.querySelector(`[data-status-type="${type}"][data-status-id="${id}"]`);
     if (!badge) return;
 
-    // Update badge class and text
-    badge.className = 'status-badge ' + (online ? 'status-online' : 'status-offline');
-    badge.textContent = online ? 'Online' : 'Offline';
+    // If a site is protected (401/403) show a distinct badge
+    if (isProtected) {
+        badge.className = 'status-badge status-protected';
+        badge.textContent = '🔒 Protected';
+    } else {
+        badge.className = 'status-badge ' + (online ? 'status-online' : 'status-offline');
+        badge.textContent = online ? 'Online' : 'Offline';
+    }
+
+    // Store status details as data attributes for later inspection
+    badge.setAttribute('data-status', online ? 'online' : 'offline');
+    if (statusCode !== null && statusCode !== undefined) {
+        badge.setAttribute('data-status-code', statusCode);
+    } else {
+        badge.removeAttribute('data-status-code');
+    }
 }
 
 // SSE Event Handlers for real-time updates
@@ -3143,13 +3156,33 @@ async function fetchInitialStatus() {
         const data = await response.json();
 
         // Update all proxy statuses
-        for (const [proxyId, online] of Object.entries(data.proxies)) {
-            updateStatusBadge('proxy', proxyId, online);
+        for (const [proxyId, val] of Object.entries(data.proxies)) {
+            if (typeof val === 'boolean') {
+                updateStatusBadge('proxy', proxyId, val);
+            } else if (val && typeof val === 'object') {
+                updateStatusBadge('proxy', proxyId, val.online, val.protected, val.status);
+            }
         }
 
         // Update all website statuses
-        for (const [websiteId, online] of Object.entries(data.websites)) {
-            updateStatusBadge('website', websiteId, online);
+        for (const [websiteId, val] of Object.entries(data.websites)) {
+            if (typeof val === 'boolean') {
+                updateStatusBadge('website', websiteId, val);
+            } else if (val && typeof val === 'object') {
+                updateStatusBadge('website', websiteId, val.online, val.protected, val.status);
+            }
+        }
+
+        // If server provided detailed status information, apply it (overrides booleans)
+        if (data.details && data.details.websites) {
+            for (const [wid, det] of Object.entries(data.details.websites)) {
+                updateStatusBadge('website', wid, det.online, det.protected, det.status);
+            }
+        }
+        if (data.details && data.details.proxies) {
+            for (const [pid, det] of Object.entries(data.details.proxies)) {
+                updateStatusBadge('proxy', pid, det.online, det.protected, det.status);
+            }
         }
     } catch (error) {
         console.error('Error fetching initial status:', error);

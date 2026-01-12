@@ -149,6 +149,7 @@
         .status-inactive { background: rgba(107, 114, 128, 0.2); color: var(--text-secondary); }
         .status-online { background: rgba(16, 185, 129, 0.2); color: var(--success); }
         .status-offline { background: rgba(239, 68, 68, 0.2); color: var(--danger); }
+        .status-protected { background: rgba(59, 130, 246, 0.12); color: #2563eb; }
         .status-checking { background: rgba(245, 158, 11, 0.2); color: var(--warning); }
         .modal {
             display: none; position: fixed; top: 0; left: 0; right: 0; bottom: 0;
