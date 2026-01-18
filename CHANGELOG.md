@@ -1,6 +1,19 @@
 # CaddyMAN Changelog
 
+## v1.3.19 (2026-01-18)
+🐛 **Bug Fixes**
+- Fixed database migration for `managed` column in reverse_proxies table
+- Ensures existing databases are properly upgraded with all required columns
+
 ## v1.3.18 (2026-01-12)
+🔒 **Permanent IP Blocklist Feature**
+- New Caddy-level IP blocking using `remote_ip` matcher - blocks before reaching the application
+- Permanent blocks are managed in Settings > Authentication > Permanent IP Blocklist
+- Supports individual IPs (1.2.3.4) and CIDR ranges (4.194.0.0/16)
+- Dashboard "Set Permanent" button now moves IP to permanent blocklist and removes from dashboard
+- Permanent blocks reload Caddy config automatically when added/removed
+- Dashboard now only shows temporary blocks (30 min auto-expiring)
+
 🐛 **Bug Fixes**
 - Fixed LDAP authentication notifications - now sends `ldap_auth_failed` notifications for ALL failure scenarios
 - Previously only sent notifications for incorrect passwords, now includes:

@@ -801,6 +801,120 @@ async function deleteBlockedIP(ipAddress) {
     }
 }
 
+// ============================================================================
+// PERMANENT IP BLOCKLIST FUNCTIONS
+// ============================================================================
+
+async function loadPermanentBlocklist() {
+    try {
+        const data = await apiCall('/api/settings/permanent-blocklist');
+        const listContainer = document.getElementById('permanent-blocklist-list');
+        const emptyMsg = document.getElementById('permanent-blocklist-empty');
+        const countSpan = document.getElementById('blocklist-count');
+
+        if (!listContainer) return;
+
+        listContainer.innerHTML = '';
+
+        // Update count in toggle button
+        const count = data.blocklist ? data.blocklist.length : 0;
+        if (countSpan) countSpan.textContent = count;
+
+        if (!data.blocklist || data.blocklist.length === 0) {
+            listContainer.style.display = 'none';
+            if (emptyMsg) emptyMsg.style.display = 'block';
+            return;
+        }
+
+        listContainer.style.display = 'block';
+        if (emptyMsg) emptyMsg.style.display = 'none';
+
+        data.blocklist.forEach(entry => {
+            const item = document.createElement('div');
+            item.className = 'blocklist-item';
+
+            const addedDate = new Date(entry.added_at * 1000).toLocaleDateString();
+
+            item.innerHTML = `
+                <div class="ip-range">${entry.ip_range}</div>
+                <div class="reason">${entry.reason || '-'}</div>
+                <div class="meta">${addedDate}</div>
+                <div class="meta">${entry.added_by || '-'}</div>
+                <button class="btn btn-danger btn-sm" onclick="removePermanentBlock(${entry.id}, '${entry.ip_range}')" title="Remove">
+                    Remove
+                </button>
+            `;
+            listContainer.appendChild(item);
+        });
+    } catch (err) {
+        console.error('Failed to load permanent blocklist:', err);
+    }
+}
+
+function toggleBlocklist() {
+    const container = document.getElementById('permanent-blocklist-container');
+    const icon = document.getElementById('blocklist-toggle-icon');
+
+    if (container.style.display === 'none') {
+        container.style.display = 'block';
+        icon.textContent = '▼';
+    } else {
+        container.style.display = 'none';
+        icon.textContent = '▶';
+    }
+}
+
+async function addPermanentBlock() {
+    const ipInput = document.getElementById('new-block-ip');
+    const reasonInput = document.getElementById('new-block-reason');
+
+    const ipRange = ipInput.value.trim();
+    const reason = reasonInput.value.trim();
+
+    if (!ipRange) {
+        showAlert('Please enter an IP address or CIDR range', 'error');
+        return;
+    }
+
+    // Basic client-side validation
+    const ipPattern = /^(\d{1,3}\.){3}\d{1,3}(\/\d{1,2})?$/;
+    if (!ipPattern.test(ipRange)) {
+        showAlert('Invalid format. Use IP (1.2.3.4) or CIDR (1.2.3.0/24)', 'error');
+        return;
+    }
+
+    try {
+        await apiCall('/api/settings/permanent-blocklist', {
+            method: 'POST',
+            body: JSON.stringify({ ip_range: ipRange, reason: reason })
+        });
+
+        showAlert(`Added ${ipRange} to permanent blocklist`, 'success');
+        ipInput.value = '';
+        reasonInput.value = '';
+        await loadPermanentBlocklist();
+    } catch (err) {
+        showAlert(`Failed to add block: ${err.message}`, 'error');
+    }
+}
+
+async function removePermanentBlock(entryId, ipRange) {
+    if (!confirm(`Remove ${ipRange} from permanent blocklist?\n\nThis will allow traffic from this IP/range again.`)) {
+        return;
+    }
+
+    try {
+        await apiCall(`/api/settings/permanent-blocklist/${entryId}`, {
+            method: 'DELETE'
+        });
+
+        showAlert(`Removed ${ipRange} from permanent blocklist`, 'success');
+        await loadPermanentBlocklist();
+    } catch (err) {
+        showAlert(`Failed to remove block: ${err.message}`, 'error');
+    }
+}
+
 async function updateAuthServicesStatus() {
     try {
         const settings = await apiCall('/api/settings', {}, false);
@@ -1015,6 +1129,9 @@ async function loadSettings() {
             }
         });
     }
+
+    // Load permanent IP blocklist
+    await loadPermanentBlocklist();
 }
 
 // Toggle notification events visibility when service changes
@@ -2886,6 +3003,16 @@ function connectStatusStream() {
                         handleIPUnblocked(data);
                         break;
 
+                    case 'ip_moved_to_permanent':
+                        // IP moved from dashboard to permanent blocklist
+                        handleIPMovedToPermanent(data);
+                        break;
+
+                    case 'permanent_blocklist_updated':
+                        // Permanent blocklist changed
+                        handlePermanentBlocklistUpdated(data);
+                        break;
+
                     case 'update_available':
                         // New update available
                         handleUpdateAvailable(data);
@@ -3144,6 +3271,28 @@ function handleIPUnblocked(data) {
     const dashboardPage = document.getElementById('dashboard-page');
     if (!dashboardPage || dashboardPage.classList.contains('hidden')) return;
     loadBlockedIPs();
+}
+
+function handleIPMovedToPermanent(data) {
+    // IP moved to permanent blocklist - reload dashboard blocked IPs
+    const dashboardPage = document.getElementById('dashboard-page');
+    if (!dashboardPage || dashboardPage.classList.contains('hidden')) {
+        // If on settings page, reload the permanent blocklist
+        loadPermanentBlocklist();
+    } else {
+        loadBlockedIPs();
+    }
+    showAlert(`IP ${data.ip_address} moved to permanent blocklist (Caddy-level block)`, 'success');
+}
+
+function handlePermanentBlocklistUpdated(data) {
+    // Permanent blocklist updated - reload if on settings page
+    loadPermanentBlocklist();
+    if (data.action === 'added') {
+        showAlert(`Added ${data.ip_range} to permanent blocklist`, 'success');
+    } else if (data.action === 'removed') {
+        showAlert(`Removed ${data.ip_range} from permanent blocklist`, 'success');
+    }
 }
 
 async function fetchInitialStatus() {

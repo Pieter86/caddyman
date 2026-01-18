@@ -736,6 +736,7 @@ default_settings = {
     "php_enabled": False, "php_path": "",
     "manager_port": 8000, "enhanced_security": False,
     "caddy_log_level": "WARN", "caddy_admin_port": 12999,
+    "caddy_use_path_prefix": False,  # Use path_prefix instead of path for ACME challenges
 
     # Branding & Domain Settings (v1.3.5)
     "organization_name": "CaddyMAN",
@@ -839,6 +840,7 @@ default_settings = {
     "radius_secret": "",  # Shared secret
     "radius_vlan_assignment": False,
     "radius_eap_method": "PAP",
+    "radius_auth_method": "pap",  # For WiFi password requirement check (pap, peap, eap-ttls)
     "radius_allowed_groups": [],
 
     # Version Tracking (v1.3.16)
@@ -1339,10 +1341,34 @@ def init_database():
                 groups TEXT NOT NULL,
                 totp_secret TEXT,
                 totp_enabled INTEGER DEFAULT 0,
+                email TEXT,
+                email_verified INTEGER DEFAULT 0,
+                first_name TEXT,
+                last_name TEXT,
+                wifi_password_hash TEXT,
+                is_admin INTEGER DEFAULT 0,
+                password_reset_token TEXT,
+                password_reset_expires TIMESTAMP,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         ''')
+
+        # Migration: Add missing columns to existing users table
+        for col_def in [
+            'email TEXT',
+            'email_verified INTEGER DEFAULT 0',
+            'first_name TEXT',
+            'last_name TEXT',
+            'wifi_password_hash TEXT',
+            'is_admin INTEGER DEFAULT 0',
+            'password_reset_token TEXT',
+            'password_reset_expires TIMESTAMP'
+        ]:
+            try:
+                cursor.execute(f'ALTER TABLE users ADD COLUMN {col_def}')
+            except sqlite3.OperationalError:
+                pass  # Column already exists
 
         # Create settings table (key-value store)
         cursor.execute('''
@@ -1360,10 +1386,27 @@ def init_database():
                 name TEXT NOT NULL,
                 description TEXT,
                 system INTEGER DEFAULT 0,
+                radius_vlan INTEGER,
+                force_2fa INTEGER DEFAULT 0,
+                oidc_claims TEXT,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         ''')
+
+        # Migration: Add missing columns to existing groups table
+        try:
+            cursor.execute('ALTER TABLE groups ADD COLUMN radius_vlan INTEGER')
+        except sqlite3.OperationalError:
+            pass
+        try:
+            cursor.execute('ALTER TABLE groups ADD COLUMN force_2fa INTEGER DEFAULT 0')
+        except sqlite3.OperationalError:
+            pass
+        try:
+            cursor.execute('ALTER TABLE groups ADD COLUMN oidc_claims TEXT')
+        except sqlite3.OperationalError:
+            pass
 
         # Create websites table
         cursor.execute('''
@@ -1386,6 +1429,19 @@ def init_database():
             )
         ''')
 
+        # Migration: Add missing columns to existing websites table
+        for col_def in [
+            'access_groups TEXT',
+            'php_enabled INTEGER DEFAULT 0',
+            'advanced TEXT',
+            'listen_port INTEGER',
+            'tls TEXT'
+        ]:
+            try:
+                cursor.execute(f'ALTER TABLE websites ADD COLUMN {col_def}')
+            except sqlite3.OperationalError:
+                pass
+
         # Create reverse_proxies table
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS reverse_proxies (
@@ -1401,10 +1457,32 @@ def init_database():
                 additional_directives TEXT,
                 listen_port INTEGER,
                 tls TEXT,
+                websocket INTEGER DEFAULT 0,
+                header_up_host TEXT,
+                remove_origin INTEGER DEFAULT 0,
+                remove_referer INTEGER DEFAULT 0,
+                custom_headers TEXT,
+                load_balance TEXT,
+                managed INTEGER DEFAULT 0,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         ''')
+
+        # Migration: Add missing columns to existing reverse_proxies table
+        for col_def in [
+            'websocket INTEGER DEFAULT 0',
+            'header_up_host TEXT',
+            'remove_origin INTEGER DEFAULT 0',
+            'remove_referer INTEGER DEFAULT 0',
+            'custom_headers TEXT',
+            'load_balance TEXT',
+            'managed INTEGER DEFAULT 0'
+        ]:
+            try:
+                cursor.execute(f'ALTER TABLE reverse_proxies ADD COLUMN {col_def}')
+            except sqlite3.OperationalError:
+                pass
 
         # v1.3.17: All database migrations removed
         # Minimum version is 1.3.16, so all schemas are already up-to-date
@@ -1425,6 +1503,16 @@ def init_database():
                 enabled INTEGER DEFAULT 1
             )
         ''')
+
+        # Migration: Add missing columns to oauth_clients
+        try:
+            cursor.execute("ALTER TABLE oauth_clients ADD COLUMN allowed_groups TEXT NOT NULL DEFAULT '[]'")
+        except sqlite3.OperationalError:
+            pass
+        try:
+            cursor.execute("ALTER TABLE oauth_clients ADD COLUMN enabled INTEGER DEFAULT 1")
+        except sqlite3.OperationalError:
+            pass
 
         # Create OAuth authorization codes table
         cursor.execute('''
@@ -1494,6 +1582,17 @@ def init_database():
                 is_external INTEGER DEFAULT 0,
                 first_seen_at REAL NOT NULL,
                 notes TEXT
+            )
+        ''')
+
+        # Create permanent blocklist table for Caddy-level IP blocking
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS permanent_blocklist (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ip_range TEXT NOT NULL UNIQUE,
+                reason TEXT,
+                added_at REAL NOT NULL,
+                added_by TEXT
             )
         ''')
 
@@ -1760,6 +1859,66 @@ def delete_blocked_ip_from_db(ip_address: str):
         cursor = conn.cursor()
         cursor.execute('DELETE FROM blocked_ips WHERE ip_address = ?', (ip_address,))
         conn.commit()
+
+# ============================================================================
+# PERMANENT BLOCKLIST FUNCTIONS (Caddy-level IP blocking)
+# ============================================================================
+
+def validate_ip_or_cidr(value: str) -> bool:
+    """Validate IP address or CIDR notation"""
+    import ipaddress
+    try:
+        ipaddress.ip_network(value, strict=False)
+        return True
+    except ValueError:
+        try:
+            ipaddress.ip_address(value)
+            return True
+        except ValueError:
+            return False
+
+def get_permanent_blocklist():
+    """Get all permanent blocklist entries"""
+    with closing(get_db_connection()) as conn:
+        cursor = conn.cursor()
+        cursor.execute('SELECT * FROM permanent_blocklist ORDER BY added_at DESC')
+        return [dict(row) for row in cursor.fetchall()]
+
+def get_permanent_blocklist_entry(entry_id: int):
+    """Get a specific permanent blocklist entry by ID"""
+    with closing(get_db_connection()) as conn:
+        cursor = conn.cursor()
+        cursor.execute('SELECT * FROM permanent_blocklist WHERE id = ?', (entry_id,))
+        row = cursor.fetchone()
+        return dict(row) if row else None
+
+def add_to_permanent_blocklist(ip_range: str, reason: str = None, added_by: str = None):
+    """Add an IP or CIDR range to the permanent blocklist"""
+    import ipaddress
+    # Normalize the IP/CIDR
+    try:
+        network = ipaddress.ip_network(ip_range, strict=False)
+        normalized = str(network)
+    except ValueError:
+        # Single IP without CIDR notation
+        normalized = ip_range
+
+    with closing(get_db_connection()) as conn:
+        cursor = conn.cursor()
+        cursor.execute('''
+            INSERT INTO permanent_blocklist (ip_range, reason, added_at, added_by)
+            VALUES (?, ?, ?, ?)
+        ''', (normalized, reason, time.time(), added_by))
+        conn.commit()
+        return cursor.lastrowid
+
+def remove_from_permanent_blocklist(entry_id: int):
+    """Remove an entry from the permanent blocklist by ID"""
+    with closing(get_db_connection()) as conn:
+        cursor = conn.cursor()
+        cursor.execute('DELETE FROM permanent_blocklist WHERE id = ?', (entry_id,))
+        conn.commit()
+        return cursor.rowcount > 0
 
 def increment_blocked_ip_count(ip_address: str, reason: str, is_external: bool = False):
     """
@@ -7011,6 +7170,22 @@ def build_caddy_config():
             # Insert at beginning so ACME requests are handled first
             server_data["routes"].insert(0, acme_bypass_route)
 
+            # Add permanent IP blocklist route - blocks at Caddy level before any other processing
+            blocklist = get_permanent_blocklist()
+            if blocklist:
+                blocked_ranges = [entry['ip_range'] for entry in blocklist]
+                block_route = {
+                    "match": [{"remote_ip": {"ranges": blocked_ranges}}],
+                    "handle": [{
+                        "handler": "static_response",
+                        "status_code": 403,
+                        "body": "Access denied"
+                    }],
+                    "terminal": True
+                }
+                # Insert at position 0 so it's processed FIRST (before ACME)
+                server_data["routes"].insert(0, block_route)
+
             # Bypass for API auth endpoints (manager login, website auth, etc.)
             # Note: auth_allowed_hosts is populated below, so we'll create this route after that
             api_auth_bypass_route_placeholder = True
@@ -10179,7 +10354,7 @@ async def update_blocked_ip_status_endpoint(
     request: Request,
     session_id: Optional[str] = Cookie(None)
 ):
-    """Update the status of a blocked IP (temporary, permanent, or monitoring)"""
+    """Update the status of a blocked IP (temporary or monitoring). Use 'permanent' to move to permanent blocklist."""
     user = get_session_user(session_id)
     if not user or "admin_group" not in user.get("groups", []):
         raise HTTPException(status_code=403, detail="Admin access required")
@@ -10194,11 +10369,49 @@ async def update_blocked_ip_status_endpoint(
     if not ip_record:
         raise HTTPException(status_code=404, detail="IP not found")
 
-    # Update status
+    old_status = ip_record['status']
+
+    # If setting to permanent, move to permanent blocklist instead
+    if new_status == 'permanent':
+        # Add to permanent blocklist
+        reason = ip_record.get('last_reason', 'Moved from temporary block')
+        try:
+            add_to_permanent_blocklist(ip_address, reason, user.get('username', 'admin'))
+        except Exception as e:
+            if 'UNIQUE constraint failed' in str(e):
+                raise HTTPException(status_code=400, detail="IP already in permanent blocklist")
+            raise
+
+        # Remove from blocked_ips table
+        delete_blocked_ip_from_db(ip_address)
+
+        # Remove from in-memory cache
+        if ip_address in blocked_ips:
+            del blocked_ips[ip_address]
+
+        # Reload Caddy to apply the new block
+        try:
+            await reload_caddy()
+        except Exception as e:
+            logger.warning(f"Failed to reload Caddy after adding permanent block: {e}")
+
+        # Broadcast removal from dashboard
+        await broadcast_sse_event('ip_moved_to_permanent', {
+            'ip_address': ip_address,
+            'old_status': old_status
+        })
+
+        await log_activity(user.get('username', 'admin'), "IP_PERMANENTLY_BLOCKED",
+                          f"Moved {ip_address} to permanent blocklist (Caddy-level block)",
+                          "admin")
+
+        return {"status": "success", "ip_address": ip_address, "action": "moved_to_permanent_blocklist"}
+
+    # Update status for temporary/monitoring
     update_blocked_ip_status(ip_address, new_status)
 
-    # If changing from permanent to temporary, reset the block timer
-    if new_status == 'temporary' and ip_record['status'] == 'permanent':
+    # If changing to temporary, reset the block timer
+    if new_status == 'temporary':
         ip_record['status'] = 'temporary'
         ip_record['block_until'] = time.time() + AUTH_VERIFY_BLOCK_DURATION
         save_blocked_ip_to_db(ip_record)
@@ -10207,13 +10420,13 @@ async def update_blocked_ip_status_endpoint(
     updated_record = get_blocked_ip_from_db(ip_address)
     await broadcast_sse_event('ip_status_changed', {
         'ip_address': ip_address,
-        'old_status': ip_record['status'],
+        'old_status': old_status,
         'new_status': new_status,
         'block_count': updated_record['block_count']
     })
 
     await log_activity(user.get('username', 'admin'), "IP_STATUS_CHANGED",
-                      f"Changed {ip_address} status from {ip_record['status']} to {new_status}",
+                      f"Changed {ip_address} status from {old_status} to {new_status}",
                       "admin")
 
     return {"status": "success", "ip_address": ip_address, "new_status": new_status}
@@ -10251,6 +10464,104 @@ async def delete_blocked_ip_endpoint(
                       "admin")
 
     return {"status": "success", "ip_address": ip_address}
+
+# ============================================================================
+# PERMANENT BLOCKLIST API ENDPOINTS
+# ============================================================================
+
+@app.get("/api/settings/permanent-blocklist")
+async def get_permanent_blocklist_endpoint(session_id: Optional[str] = Cookie(None)):
+    """Get all entries in the permanent IP blocklist"""
+    user = get_session_user(session_id)
+    if not user or "admin_group" not in user.get("groups", []):
+        raise HTTPException(status_code=403, detail="Admin access required")
+
+    blocklist = get_permanent_blocklist()
+    return {"blocklist": blocklist}
+
+@app.post("/api/settings/permanent-blocklist")
+async def add_permanent_blocklist_endpoint(
+    request: Request,
+    session_id: Optional[str] = Cookie(None)
+):
+    """Add an IP or CIDR range to the permanent blocklist"""
+    user = get_session_user(session_id)
+    if not user or "admin_group" not in user.get("groups", []):
+        raise HTTPException(status_code=403, detail="Admin access required")
+
+    data = await request.json()
+    ip_range = data.get('ip_range', '').strip()
+    reason = data.get('reason', '').strip() or None
+
+    if not ip_range:
+        raise HTTPException(status_code=400, detail="IP range is required")
+
+    # Validate IP/CIDR format
+    if not validate_ip_or_cidr(ip_range):
+        raise HTTPException(status_code=400, detail="Invalid IP address or CIDR notation")
+
+    try:
+        entry_id = add_to_permanent_blocklist(ip_range, reason, user.get('username', 'admin'))
+    except Exception as e:
+        if 'UNIQUE constraint failed' in str(e):
+            raise HTTPException(status_code=400, detail="IP/range already in blocklist")
+        raise
+
+    # Reload Caddy to apply the block
+    try:
+        await reload_caddy()
+    except Exception as e:
+        logger.warning(f"Failed to reload Caddy after adding permanent block: {e}")
+
+    # Broadcast update
+    await broadcast_sse_event('permanent_blocklist_updated', {
+        'action': 'added',
+        'ip_range': ip_range
+    })
+
+    await log_activity(user.get('username', 'admin'), "PERMANENT_BLOCK_ADDED",
+                      f"Added {ip_range} to permanent blocklist",
+                      "admin")
+
+    return {"status": "success", "id": entry_id, "ip_range": ip_range}
+
+@app.delete("/api/settings/permanent-blocklist/{entry_id}")
+async def remove_permanent_blocklist_endpoint(
+    entry_id: int,
+    session_id: Optional[str] = Cookie(None)
+):
+    """Remove an entry from the permanent blocklist"""
+    user = get_session_user(session_id)
+    if not user or "admin_group" not in user.get("groups", []):
+        raise HTTPException(status_code=403, detail="Admin access required")
+
+    # Get the entry first for logging
+    entry = get_permanent_blocklist_entry(entry_id)
+    if not entry:
+        raise HTTPException(status_code=404, detail="Entry not found")
+
+    ip_range = entry['ip_range']
+
+    # Remove from database
+    remove_from_permanent_blocklist(entry_id)
+
+    # Reload Caddy to remove the block
+    try:
+        await reload_caddy()
+    except Exception as e:
+        logger.warning(f"Failed to reload Caddy after removing permanent block: {e}")
+
+    # Broadcast update
+    await broadcast_sse_event('permanent_blocklist_updated', {
+        'action': 'removed',
+        'ip_range': ip_range
+    })
+
+    await log_activity(user.get('username', 'admin'), "PERMANENT_BLOCK_REMOVED",
+                      f"Removed {ip_range} from permanent blocklist",
+                      "admin")
+
+    return {"status": "success", "ip_range": ip_range}
 
 @app.get("/api/debug-status")
 async def get_debug_status(session_id: Optional[str] = Cookie(None)):

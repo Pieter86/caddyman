@@ -452,3 +452,63 @@
             overflow-x: auto;
             -webkit-overflow-scrolling: touch;
         }
+
+        /* Permanent IP Blocklist Styles */
+        .blocklist-add-form {
+            display: grid;
+            grid-template-columns: 1fr 1fr auto;
+            gap: 10px;
+            margin-bottom: 15px;
+        }
+
+        .blocklist-item {
+            display: grid;
+            grid-template-columns: 1fr 1fr auto auto auto;
+            gap: 10px;
+            align-items: center;
+            padding: 10px;
+            border-bottom: 1px solid var(--border);
+        }
+
+        .blocklist-item:last-child {
+            border-bottom: none;
+        }
+
+        .blocklist-item .ip-range {
+            font-family: monospace;
+            font-weight: 500;
+        }
+
+        .blocklist-item .meta {
+            font-size: 12px;
+            color: var(--text-secondary);
+        }
+
+        @media (max-width: 768px) {
+            .blocklist-add-form {
+                grid-template-columns: 1fr;
+            }
+
+            .blocklist-add-form button {
+                width: 100%;
+            }
+
+            .blocklist-item {
+                grid-template-columns: 1fr;
+                gap: 5px;
+                padding: 12px;
+                background: var(--bg-tertiary);
+                border-radius: 8px;
+                margin-bottom: 8px;
+                border-bottom: none;
+            }
+
+            .blocklist-item .ip-range {
+                font-size: 14px;
+            }
+
+            .blocklist-item .btn {
+                width: 100%;
+                margin-top: 5px;
+            }
+        }
