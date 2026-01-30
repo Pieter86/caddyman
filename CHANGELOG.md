@@ -1,5 +1,40 @@
 # CaddyMAN Changelog
 
+## v1.3.22 (2026-01-26)
+🔒 **Major Security Overhaul - All Blocks Are Permanent**
+
+**Simplified Blocking System:**
+- Removed all temporary/timed blocks - every block is now permanent
+- Blocks apply at BOTH Caddy level (403 before reaching app) AND application level
+- Single blocklist managed in Settings > IP Blocklist (removed from Dashboard)
+- Two simple actions: Block and Unblock
+
+**New Attack Thresholds:**
+- **Rapid attacks:** 60+ attempts in 2 minutes → instant permanent ban
+- ~~**Slow attacks:** 280+ attempts in 24 hours → instant permanent ban~~ *(DISABLED - interferes with monitoring tools like Uptime Kuma)*
+- **403 probing:** 60+ 403 errors in 2 minutes → instant permanent ban
+
+**UI Changes:**
+- Removed "Blocked IPs" card from Dashboard
+- Settings page now has prominent "IP Blocklist" section (always visible)
+- Blocklist shows all permanently blocked IPs with Block/Unblock buttons
+
+**Code Cleanup:**
+- Removed `blocked_ips` in-memory dict and related functions
+- Removed `/api/blocked-ips` endpoints (use `/api/settings/permanent-blocklist` instead)
+- Simplified `permanently_block_ip()` function replaces `increment_blocked_ip_count()`
+- Removed block duration constants (all blocks permanent now)
+
+## v1.3.20 (2026-01-24)
+🔒 **Security - Permanent IP Blocklist CIDR Fix**
+- Fixed CIDR range blocking not working at application level (e.g., `4.190.200.0/24` now properly blocks all IPs in range)
+- Added `is_ip_in_permanent_blocklist()` function to check if IP falls within any CIDR range
+- Login endpoints (`/api/login`, `/api/auth/login`) now check permanent blocklist CIDR ranges
+- Auth verify endpoint (`/api/auth/verify`) now checks permanent blocklist CIDR ranges
+- Auto-escalation to permanent block (after 3 blocks) now properly adds IP to `permanent_blocklist` table
+- Caddy is automatically reloaded when IP is auto-escalated to permanent blocklist
+- IPs blocked 3 times now appear in both Dashboard AND Settings > Permanent Blocklist
+
 ## v1.3.19 (2026-01-18)
 🐛 **Bug Fixes**
 - Fixed database migration for `managed` column in reverse_proxies table

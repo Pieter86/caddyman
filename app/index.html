@@ -156,12 +156,7 @@
                             <p style="color: var(--text-secondary);">No pending invitations</p>
                         </div>
                     </div>
-                    <div class="card" id="blocked-ips-card" style="display: none;">
-                        <h3>🛡️ Blocked IPs</h3>
-                        <div id="blocked-ips-list" style="max-height: 400px; overflow-y: auto;">
-                            <p style="color: var(--text-secondary);">No blocked IPs</p>
-                        </div>
-                    </div>
+                    <!-- NOTE: Dashboard blocked IPs removed in v1.3.22 - all blocks are permanent and managed in Settings -->
                 </div>
 
                 <!-- Proxies Page -->
@@ -249,30 +244,29 @@
                         </div>
                     </div>
                     <div class="card">
-                        <h3>Permanent IP Blocklist</h3>
+                        <h3>🛡️ IP Blocklist</h3>
                         <p style="color: var(--text-secondary); font-size: 13px; margin-bottom: 15px;">
-                            IPs and ranges blocked at Caddy level (403 response). Blocked before reaching the application.
+                            All blocked IPs are permanent. Blocked at both Caddy level (before app) and application level.
+                            Rapid attacks (60+ in 2 min) and slow attacks (280+ in 24h) are auto-blocked.
                         </p>
 
                         <!-- Add new block form - mobile responsive -->
                         <div class="blocklist-add-form">
                             <input type="text" id="new-block-ip" placeholder="IP or CIDR (e.g., 1.2.3.4 or 4.194.0.0/16)">
                             <input type="text" id="new-block-reason" placeholder="Reason (optional)">
-                            <button class="btn btn-primary" onclick="addPermanentBlock()">Add</button>
+                            <button class="btn btn-primary" onclick="addPermanentBlock()">Block</button>
                         </div>
 
-                        <!-- Toggle button to show/hide list -->
-                        <button class="btn btn-secondary" id="blocklist-toggle-btn" onclick="toggleBlocklist()" style="width: 100%;">
-                            <span id="blocklist-toggle-icon">▶</span> View Blocked IPs (<span id="blocklist-count">0</span>)
-                        </button>
-
-                        <!-- Collapsible blocklist -->
-                        <div id="permanent-blocklist-container" style="display: none; margin-top: 10px;">
-                            <div id="permanent-blocklist-list">
+                        <!-- Blocklist display - always visible -->
+                        <div id="permanent-blocklist-container" style="margin-top: 15px;">
+                            <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px;">
+                                <strong>Blocked IPs (<span id="blocklist-count">0</span>)</strong>
+                            </div>
+                            <div id="permanent-blocklist-list" style="max-height: 400px; overflow-y: auto;">
                                 <!-- Populated by JavaScript -->
                             </div>
-                            <div id="permanent-blocklist-empty" style="text-align: center; padding: 20px; color: var(--text-secondary); display: none;">
-                                No permanent blocks configured
+                            <div id="permanent-blocklist-empty" style="text-align: center; padding: 20px; color: var(--text-secondary);">
+                                No IPs blocked
                             </div>
                         </div>
                     </div>

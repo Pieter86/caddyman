@@ -54,7 +54,7 @@ from argon2 import PasswordHasher, Type
 from argon2.exceptions import VerifyMismatchError, VerificationError, InvalidHash
 import bcrypt  # Permanent: OAuth client secrets use bcrypt for speed (high-entropy, frequent verification)
 
-VERSION = "1.3.18"
+VERSION = "1.3.22"
 
 # ============================================================================
 # DEBUG mode - enables sensitive TLS secret logging and keylog files
@@ -480,6 +480,33 @@ class AdminAuthMiddleware(BaseHTTPMiddleware):
 
 app.add_middleware(AdminAuthMiddleware)
 
+
+class Admin403TrackingMiddleware(BaseHTTPMiddleware):
+    """Middleware to track and auto-block IPs that repeatedly get 403 errors on admin endpoints"""
+    async def dispatch(self, request: Request, call_next):
+        response = await call_next(request)
+
+        # Only track 403 errors on /api/ endpoints
+        if response.status_code == 403 and request.url.path.startswith("/api/"):
+            # Get client IP
+            client_ip = request.headers.get("x-forwarded-for", request.client.host if request.client else "unknown")
+            if "," in client_ip:
+                client_ip = client_ip.split(",")[0].strip()
+
+            # Check if external IP
+            is_external = is_external_ip(client_ip)
+
+            # Track this 403 attempt (async call in background)
+            try:
+                await track_admin_403_attempt(client_ip, request.url.path, is_external)
+            except Exception as e:
+                logger.error(f"Error tracking 403 attempt for {client_ip}: {e}")
+
+        return response
+
+app.add_middleware(Admin403TrackingMiddleware)
+
+
 # Custom exception handlers for better user experience
 @app.exception_handler(404)
 async def not_found_handler(request: Request, exc):
@@ -674,8 +701,9 @@ notification_log = []  # Store recent notifications
 MAX_NOTIFICATION_LOG = 100  # Keep last 100 notifications
 failed_login_attempts = {}  # Track failed login attempts by IP
 pending_2fa_challenges = {}  # Track pending 2FA challenges {challenge_id: {username, expires, original_url}}
-auth_verify_attempts = {}  # Track /api/auth/verify attempts by IP: {ip: [timestamps]}
-blocked_ips = {}  # Temporarily blocked IPs: {ip: block_until_timestamp}
+auth_verify_attempts = {}  # Track /api/auth/verify attempts by IP: {ip: [timestamps]} (rapid attacks)
+auth_verify_401_attempts = {}  # Track 401 errors on auth endpoints by IP: {ip: [timestamps]} (slow attacks over 24h)
+admin_403_attempts = {}  # Track 403 errors on admin endpoints by IP: {ip: [timestamps]}
 
 # Status monitoring - track online/offline state of proxies and websites
 status_cache = {}  # {proxy_id: online_status, website_id: online_status}
@@ -685,9 +713,20 @@ status_sse_clients = []  # List of SSE clients for real-time status updates
 # Security constants
 MAX_LOGIN_ATTEMPTS = 5  # Lock account after this many failures
 LOCKOUT_DURATION = 900  # 15 minutes lockout in seconds
-MAX_AUTH_VERIFY_ATTEMPTS = 20  # Max auth verify requests per minute
-AUTH_VERIFY_WINDOW = 60  # Check attempts in last 60 seconds
-AUTH_VERIFY_BLOCK_DURATION = 1800  # Block for 30 minutes
+
+# Rapid attack detection - instant permanent ban
+MAX_AUTH_VERIFY_ATTEMPTS = 60  # Max auth verify requests before permanent ban
+AUTH_VERIFY_WINDOW = 120  # Check attempts in last 120 seconds (2 minutes)
+
+# 403 rate limiting - auto-block IPs that repeatedly hit admin endpoints without auth
+ADMIN_403_MAX_ATTEMPTS = 60  # Max 403 errors before permanent ban
+ADMIN_403_WINDOW = 120  # Check attempts in last 120 seconds (2 minutes)
+
+# Slow brute force detection - catches distributed/slow attacks over longer periods
+# DISABLED: Commented out to avoid blocking legitimate monitoring tools (e.g., Uptime Kuma)
+# TODO: Re-enable when custom monitoring with authentication handshake is implemented
+# SLOW_BRUTE_FORCE_MAX_401S = 280  # Max 401 errors in 24 hours before permanent ban
+# SLOW_BRUTE_FORCE_WINDOW = 86400  # Check 401s in last 24 hours (86400 seconds)
 
 # Settings cache - reduces disk I/O by keeping settings in memory
 _cached_settings = None
@@ -1884,6 +1923,41 @@ def get_permanent_blocklist():
         cursor.execute('SELECT * FROM permanent_blocklist ORDER BY added_at DESC')
         return [dict(row) for row in cursor.fetchall()]
 
+def is_ip_in_permanent_blocklist(ip_address: str) -> dict | None:
+    """
+    Check if an IP address falls within any CIDR range in the permanent blocklist.
+    Returns the blocklist entry if found, None otherwise.
+    """
+    import ipaddress
+    try:
+        ip_obj = ipaddress.ip_address(ip_address)
+    except ValueError:
+        return None
+
+    blocklist = get_permanent_blocklist()
+    for entry in blocklist:
+        try:
+            network = ipaddress.ip_network(entry['ip_range'], strict=False)
+            if ip_obj in network:
+                return entry
+        except ValueError:
+            # If ip_range is invalid, skip it
+            continue
+
+    return None
+
+def is_external_ip(ip_address: str) -> bool:
+    """
+    Check if an IP address is external (not private/loopback).
+    Returns True if the IP is external (internet-facing), False if internal/private.
+    """
+    import ipaddress
+    try:
+        ip_obj = ipaddress.ip_address(ip_address)
+        return not (ip_obj.is_loopback or ip_obj.is_private)
+    except ValueError:
+        return False
+
 def get_permanent_blocklist_entry(entry_id: int):
     """Get a specific permanent blocklist entry by ID"""
     with closing(get_db_connection()) as conn:
@@ -1920,52 +1994,120 @@ def remove_from_permanent_blocklist(entry_id: int):
         conn.commit()
         return cursor.rowcount > 0
 
-def increment_blocked_ip_count(ip_address: str, reason: str, is_external: bool = False):
+def permanently_block_ip(ip_address: str, reason: str, is_external: bool = False):
     """
-    Increment block count for an IP and auto-escalate to permanent if >= 3 blocks.
-    Returns the updated IP record.
+    Permanently block an IP address via Caddy-level blocklist.
+    All blocks are now permanent - no more temporary blocks.
+    Returns info about the block.
     """
     current_time = time.time()
-    existing = get_blocked_ip_from_db(ip_address)
 
+    # Check if already in permanent blocklist
+    existing = is_ip_in_permanent_blocklist(ip_address)
     if existing:
-        # Increment block count
-        new_count = existing['block_count'] + 1
-
-        # Auto-escalate to permanent if:
-        # - Block count >= 3 AND
-        # - Current status is 'temporary' (not already permanent or manually set to monitoring)
-        new_status = existing['status']
-        if new_count >= 3 and existing['status'] == 'temporary':
-            new_status = 'permanent'
-
-        ip_data = {
+        logger.info(f"IP {ip_address} already in permanent blocklist: {existing['ip_range']}")
+        return {
             'ip_address': ip_address,
-            'block_count': new_count,
-            'status': new_status,
-            'last_blocked_at': current_time,
-            'block_until': current_time + AUTH_VERIFY_BLOCK_DURATION if new_status == 'temporary' else None,
-            'last_reason': reason,
-            'is_external': int(is_external),
-            'first_seen_at': existing['first_seen_at'],
-            'notes': existing.get('notes')
-        }
-    else:
-        # New blocked IP
-        ip_data = {
-            'ip_address': ip_address,
-            'block_count': 1,
-            'status': 'temporary',
-            'last_blocked_at': current_time,
-            'block_until': current_time + AUTH_VERIFY_BLOCK_DURATION,
-            'last_reason': reason,
-            'is_external': int(is_external),
-            'first_seen_at': current_time,
-            'notes': None
+            'reason': existing.get('reason', reason),
+            'added_at': existing.get('added_at', current_time),
+            'is_external': is_external,
+            'already_blocked': True
         }
 
-    save_blocked_ip_to_db(ip_data)
-    return ip_data
+    # Add to permanent blocklist
+    try:
+        entry_id = add_to_permanent_blocklist(ip_address, reason, "system")
+        logger.critical(f"PERMANENT BLOCK: {ip_address} added to blocklist. Reason: {reason}")
+
+        return {
+            'ip_address': ip_address,
+            'entry_id': entry_id,
+            'reason': reason,
+            'added_at': current_time,
+            'is_external': is_external,
+            'already_blocked': False,
+            '_needs_caddy_reload': True
+        }
+    except Exception as e:
+        if 'UNIQUE constraint failed' in str(e):
+            logger.info(f"IP {ip_address} already in permanent blocklist (constraint)")
+            return {
+                'ip_address': ip_address,
+                'reason': reason,
+                'added_at': current_time,
+                'is_external': is_external,
+                'already_blocked': True
+            }
+        logger.error(f"Failed to add {ip_address} to permanent blocklist: {e}")
+        raise
+
+async def track_admin_403_attempt(ip_address: str, endpoint: str, is_external: bool = False):
+    """
+    Track 403 errors on admin endpoints and permanently block IPs that exceed the threshold.
+    Returns True if the IP was blocked, False otherwise.
+    """
+    global admin_403_attempts
+
+    current_time = time.time()
+
+    # Check if IP is already in permanent blocklist
+    if is_ip_in_permanent_blocklist(ip_address):
+        return False  # Already permanently blocked
+
+    # Track this 403 attempt
+    if ip_address not in admin_403_attempts:
+        admin_403_attempts[ip_address] = []
+
+    admin_403_attempts[ip_address].append(current_time)
+
+    # Clean old attempts outside the window
+    admin_403_attempts[ip_address] = [
+        ts for ts in admin_403_attempts[ip_address]
+        if current_time - ts < ADMIN_403_WINDOW
+    ]
+
+    # Check if threshold exceeded - instant permanent ban
+    if len(admin_403_attempts[ip_address]) >= ADMIN_403_MAX_ATTEMPTS:
+        reason = f"Admin endpoint probing: {len(admin_403_attempts[ip_address])} 403 errors in {ADMIN_403_WINDOW}s on {endpoint}"
+        ip_data = permanently_block_ip(ip_address, reason, is_external)
+
+        # Clear the attempts since we've blocked them
+        admin_403_attempts[ip_address] = []
+
+        if not ip_data.get('already_blocked'):
+            logger.critical(f"PERMANENT BLOCK - ADMIN PROBING: {ip_address} hit {endpoint} {ADMIN_403_MAX_ATTEMPTS}+ times in {ADMIN_403_WINDOW}s")
+
+            # Broadcast blocked IP event via SSE
+            await broadcast_sse_event('ip_permanently_blocked', {
+                'ip_address': ip_address,
+                'reason': reason,
+                'is_external': int(is_external)
+            })
+
+            # Reload Caddy to apply block
+            if ip_data.get('_needs_caddy_reload'):
+                try:
+                    await reload_caddy()
+                    logger.info(f"Caddy reloaded to apply permanent block for {ip_address}")
+                except Exception as e:
+                    logger.error(f"Failed to reload Caddy: {e}")
+
+            await send_ntfy_notification(
+                "Security Alert: IP Permanently Blocked",
+                f"🔒 IP PERMANENTLY BLOCKED - ADMIN ENDPOINT PROBING\n\n"
+                f"Source IP: {ip_address}\n"
+                f"IP Type: {'EXTERNAL (Internet)' if is_external else 'Internal/Private'}\n"
+                f"Endpoint: {endpoint}\n"
+                f"Attempts: {ADMIN_403_MAX_ATTEMPTS}+ in {ADMIN_403_WINDOW} seconds\n"
+                f"Block Type: PERMANENT (Caddy + App level)\n\n"
+                f"This IP was probing admin endpoints without authentication.",
+                tags="rotating_light,shield",
+                priority="high"
+            )
+
+        return True
+
+    return False
 
 def get_settings_from_db():
     """Get all settings from database as a dictionary (uses cache if available)"""
@@ -7421,6 +7563,12 @@ async def oauth_login(login_data: LoginRequest, request: Request, response: Resp
     if "," in client_ip:
         client_ip = client_ip.split(",")[0].strip()
 
+    # Check if IP is in permanent blocklist (CIDR ranges)
+    permanent_block = is_ip_in_permanent_blocklist(client_ip)
+    if permanent_block:
+        logger.warning(f"Login attempt from permanently blocked IP {client_ip} (blocklist: {permanent_block['ip_range']})")
+        raise HTTPException(status_code=403, detail="Access permanently blocked.")
+
     # Check if IP is locked out
     if is_account_locked(client_ip):
         await log_activity(login_data.username, "LOGIN_BLOCKED", "IP locked out due to too many failed attempts", client_ip)
@@ -7511,6 +7659,12 @@ async def admin_login(login_data: LoginRequest, request: Request, response: Resp
     client_ip = request.headers.get("x-forwarded-for", request.client.host if request.client else "unknown")
     if "," in client_ip:
         client_ip = client_ip.split(",")[0].strip()
+
+    # Check if IP is in permanent blocklist (CIDR ranges)
+    permanent_block = is_ip_in_permanent_blocklist(client_ip)
+    if permanent_block:
+        logger.warning(f"Admin login attempt from permanently blocked IP {client_ip} (blocklist: {permanent_block['ip_range']})")
+        raise HTTPException(status_code=403, detail="Access permanently blocked.")
 
     # Check if IP is locked out
     if is_account_locked(client_ip):
@@ -7704,31 +7858,11 @@ async def verify_auth(request: Request, session_id: Optional[str] = Cookie(None)
     client_ip = request.client.host if request.client else "unknown"
     current_time = time.time()
 
-    # Check if IP is blocked in database
-    blocked_ip_record = get_blocked_ip_from_db(client_ip)
-    if blocked_ip_record:
-        status = blocked_ip_record['status']
-
-        # Permanent block - always reject
-        if status == 'permanent':
-            logger.warning(f"Permanently blocked IP attempted access: {client_ip}")
-            raise HTTPException(status_code=403, detail="Access permanently blocked.")
-
-        # Temporary block - check if still active
-        if status == 'temporary':
-            block_until = blocked_ip_record.get('block_until')
-            if block_until and current_time < block_until:
-                # Still blocked
-                raise HTTPException(status_code=429, detail="Too many requests. Temporarily blocked.")
-            # If block expired, allow through (will be handled by rate limit check below)
-
-    # Also check in-memory cache for backwards compatibility during migration
-    if client_ip in blocked_ips:
-        block_until = blocked_ips[client_ip]
-        if current_time < block_until:
-            raise HTTPException(status_code=429, detail="Too many requests. Temporarily blocked.")
-        else:
-            del blocked_ips[client_ip]
+    # Check if IP is in permanent blocklist (CIDR ranges) - Caddy + App level block
+    permanent_block = is_ip_in_permanent_blocklist(client_ip)
+    if permanent_block:
+        logger.warning(f"IP {client_ip} blocked by permanent blocklist entry: {permanent_block['ip_range']}")
+        raise HTTPException(status_code=403, detail="Access permanently blocked.")
 
     # Track this attempt
     if client_ip not in auth_verify_attempts:
@@ -7743,67 +7877,58 @@ async def verify_auth(request: Request, session_id: Optional[str] = Cookie(None)
     # Add current attempt
     auth_verify_attempts[client_ip].append(current_time)
 
-    # Check if exceeded rate limit
+    # Check if exceeded rate limit - instant permanent ban
     if len(auth_verify_attempts[client_ip]) > MAX_AUTH_VERIFY_ATTEMPTS:
-        # Determine if IP is external
-        import ipaddress
-        try:
-            ip_obj = ipaddress.ip_address(client_ip)
-            is_external = not (ip_obj.is_loopback or ip_obj.is_private)
-        except:
-            is_external = False
+        is_external = is_external_ip(client_ip)
+        reason = f"Rapid brute force: {len(auth_verify_attempts[client_ip])} auth attempts in {AUTH_VERIFY_WINDOW}s"
+        ip_data = permanently_block_ip(client_ip, reason, is_external)
 
-        # Block this IP in database (with auto-escalation to permanent after 3 blocks)
-        reason = f"Brute force: {len(auth_verify_attempts[client_ip])} auth attempts in {AUTH_VERIFY_WINDOW}s"
-        ip_data = increment_blocked_ip_count(client_ip, reason, is_external)
+        # Clear attempts since we've blocked them
+        auth_verify_attempts[client_ip] = []
 
-        # Also add to in-memory cache for immediate effect
-        blocked_ips[client_ip] = current_time + AUTH_VERIFY_BLOCK_DURATION
+        if not ip_data.get('already_blocked'):
+            logger.critical(f"PERMANENT BLOCK - RAPID BRUTE FORCE: {client_ip} made {MAX_AUTH_VERIFY_ATTEMPTS}+ attempts in {AUTH_VERIFY_WINDOW}s")
 
-        logger.critical(f"BRUTE FORCE DETECTED: {client_ip} made {len(auth_verify_attempts[client_ip])} auth attempts in {AUTH_VERIFY_WINDOW}s. Blocked for {AUTH_VERIFY_BLOCK_DURATION/60} minutes. (Block #{ip_data['block_count']}, Status: {ip_data['status']})")
+            # Broadcast blocked IP event via SSE
+            await broadcast_sse_event('ip_permanently_blocked', {
+                'ip_address': client_ip,
+                'reason': reason,
+                'is_external': is_external
+            })
 
-        # Broadcast blocked IP event via SSE
-        await broadcast_sse_event('ip_blocked', {
-            'ip_address': client_ip,
-            'reason': reason,
-            'block_count': ip_data['block_count'],
-            'status': ip_data['status'],
-            'is_external': is_external,
-            'escalated': ip_data['status'] == 'permanent'
-        })
+            # Contextual message based on whether this is external or internal
+            if is_external:
+                context_msg = (
+                    "If you're hosting public websites, brute force attempts are normal.\n"
+                    "CaddyMAN automatically blocks attackers permanently."
+                )
+            else:
+                context_msg = "This may indicate a compromised device on your local network."
 
-        # Send security notification
-        event_type = "suspicious_activity" if is_external else "suspicious_activity"
-        escalation_msg = f"\n⚠️ AUTO-ESCALATED TO PERMANENT BLOCK (3rd offense)" if ip_data['status'] == 'permanent' else ""
-
-        # Contextual message based on whether this is external or internal
-        if is_external:
-            context_msg = (
-                "ℹ️ If you're hosting public websites, brute force attempts are normal.\n"
-                "   CaddyMAN automatically blocks attackers after failed attempts.\n"
-                "   If this server should NOT be internet-accessible, check your firewall/router settings."
+            await send_event_notification(
+                "suspicious_activity",
+                "IP Permanently Blocked - Brute Force" if is_external else "Suspicious Activity - IP Blocked",
+                f"IP permanently blocked for rapid brute force attack!\n\n"
+                f"Source IP: {client_ip}\n"
+                f"IP Type: {'EXTERNAL (Internet)' if is_external else 'Internal/Private'}\n"
+                f"Attempts: {MAX_AUTH_VERIFY_ATTEMPTS}+ in {AUTH_VERIFY_WINDOW} seconds\n"
+                f"Endpoint: /api/auth/verify\n"
+                f"Block Type: PERMANENT (Caddy + App level)\n\n"
+                f"{context_msg}",
+                source_ip=client_ip,
+                attempts=MAX_AUTH_VERIFY_ATTEMPTS,
+                is_external=is_external
             )
-        else:
-            context_msg = "This may indicate a compromised device on your local network."
 
-        await send_event_notification(
-            event_type,
-            "Brute Force Attempt Blocked" if is_external else "Suspicious Activity Detected",
-            f"IP address blocked due to excessive authentication attempts!\n\n"
-            f"Source IP: {client_ip}\n"
-            f"IP Type: {'EXTERNAL (Internet)' if is_external else 'Internal/Private'}\n"
-            f"Attempts: {len(auth_verify_attempts[client_ip])} requests in {AUTH_VERIFY_WINDOW} seconds\n"
-            f"Endpoint: /api/auth/verify\n"
-            f"Block Duration: {'PERMANENT' if ip_data['status'] == 'permanent' else str(AUTH_VERIFY_BLOCK_DURATION/60) + ' minutes'}\n"
-            f"Total Blocks: {ip_data['block_count']}{escalation_msg}\n\n"
-            f"{context_msg}\n"
-            f"Action: IP {'permanently' if ip_data['status'] == 'permanent' else 'temporarily'} blocked.",
-            source_ip=client_ip,
-            attempts=len(auth_verify_attempts[client_ip]),
-            is_external=is_external
-        )
+            # Reload Caddy to apply permanent block
+            if ip_data.get('_needs_caddy_reload'):
+                try:
+                    await reload_caddy()
+                    logger.info(f"Caddy reloaded to apply permanent block for {client_ip}")
+                except Exception as e:
+                    logger.error(f"Failed to reload Caddy: {e}")
 
-        raise HTTPException(status_code=429, detail="Too many requests. Temporarily blocked.")
+        raise HTTPException(status_code=403, detail="Access permanently blocked.")
 
     session = None
     session_source = None
@@ -7833,6 +7958,68 @@ async def verify_auth(request: Request, session_id: Optional[str] = Cookie(None)
 
     # If not authenticated, redirect to login page
     if not session:
+        # SLOW BRUTE FORCE DETECTION - DISABLED
+        # Commented out to avoid blocking legitimate monitoring tools (e.g., Uptime Kuma)
+        # TODO: Re-enable when custom monitoring with authentication handshake is implemented
+        #
+        # # Track this 401 for slow brute force detection
+        # global auth_verify_401_attempts
+        # if client_ip not in auth_verify_401_attempts:
+        #     auth_verify_401_attempts[client_ip] = []
+        #
+        # # Clean old 401 attempts outside the long window
+        # auth_verify_401_attempts[client_ip] = [
+        #     ts for ts in auth_verify_401_attempts[client_ip]
+        #     if current_time - ts < SLOW_BRUTE_FORCE_WINDOW
+        # ]
+        #
+        # # Add current 401
+        # auth_verify_401_attempts[client_ip].append(current_time)
+        #
+        # # Check if exceeded slow brute force threshold - instant permanent ban
+        # if len(auth_verify_401_attempts[client_ip]) >= SLOW_BRUTE_FORCE_MAX_401S:
+        #     is_external = is_external_ip(client_ip)
+        #     reason = f"Slow brute force: {len(auth_verify_401_attempts[client_ip])} 401 errors in {SLOW_BRUTE_FORCE_WINDOW//3600} hours"
+        #     ip_data = permanently_block_ip(client_ip, reason, is_external)
+        #
+        #     # Clear the 401 attempts since we've blocked them
+        #     auth_verify_401_attempts[client_ip] = []
+        #
+        #     if not ip_data.get('already_blocked'):
+        #         logger.critical(f"PERMANENT BLOCK - SLOW BRUTE FORCE: {client_ip} made {SLOW_BRUTE_FORCE_MAX_401S}+ 401 requests in {SLOW_BRUTE_FORCE_WINDOW//3600} hours")
+        #
+        #         # Broadcast blocked IP event via SSE
+        #         await broadcast_sse_event('ip_permanently_blocked', {
+        #             'ip_address': client_ip,
+        #             'reason': reason,
+        #             'is_external': is_external
+        #         })
+        #
+        #         await send_event_notification(
+        #             "suspicious_activity",
+        #             "IP Permanently Blocked - Slow Brute Force",
+        #             f"IP permanently blocked for slow brute force attack!\n\n"
+        #             f"Source IP: {client_ip}\n"
+        #             f"IP Type: {'EXTERNAL (Internet)' if is_external else 'Internal/Private'}\n"
+        #             f"401 Errors: {SLOW_BRUTE_FORCE_MAX_401S}+ in {SLOW_BRUTE_FORCE_WINDOW//3600} hours\n"
+        #             f"Endpoint: /api/auth/verify\n"
+        #             f"Block Type: PERMANENT (Caddy + App level)\n\n"
+        #             f"This IP was making slow, persistent requests to evade rapid rate limiting.",
+        #             source_ip=client_ip,
+        #             attempts=SLOW_BRUTE_FORCE_MAX_401S,
+        #             is_external=is_external
+        #         )
+        #
+        #         # Reload Caddy to apply permanent block
+        #         if ip_data.get('_needs_caddy_reload'):
+        #             try:
+        #                 await reload_caddy()
+        #                 logger.info(f"Caddy reloaded to apply permanent block for {client_ip} (slow brute force)")
+        #             except Exception as e:
+        #                 logger.error(f"Failed to reload Caddy: {e}")
+        #
+        #     raise HTTPException(status_code=403, detail="Access permanently blocked.")
+
         # Get the original URL from headers (set by Caddy forward_auth) or from request
         original_url = request.headers.get("X-Original-URI", request.headers.get("X-Forwarded-Uri", "/"))
 
@@ -10065,10 +10252,8 @@ async def status_stream(session_id: Optional[str] = Cookie(None)):
                 if time_remaining > 0:
                     yield f"data: {json.dumps({'event': 'invite_update', 'token': invite['token'], 'username': invite['username'], 'email': invite['email'], 'expires_at': invite['expires_at'], 'created_by': invite['created_by'], 'time_remaining': time_remaining})}\n\n"
 
-            # Send blocked IPs (initial state)
-            blocked_ips_list = get_all_blocked_ips_from_db()
-            for blocked_ip in blocked_ips_list:
-                yield f"data: {json.dumps({'event': 'ip_blocked', 'ip_address': blocked_ip['ip_address'], 'block_count': blocked_ip['block_count'], 'status': blocked_ip['status'], 'last_blocked_at': blocked_ip['last_blocked_at'], 'block_until': blocked_ip.get('block_until'), 'last_reason': blocked_ip.get('last_reason'), 'is_external': blocked_ip.get('is_external', 0)})}\n\n"
+            # NOTE: Blocked IPs SSE removed in v1.3.22 - all blocks are now permanent
+            # Permanent blocklist is managed in Settings page
 
             # Send update status if available
             global update_available
@@ -10338,132 +10523,9 @@ async def get_notifications(session_id: Optional[str] = Cookie(None)):
         raise HTTPException(status_code=401, detail="Not authenticated")
     return {"notifications": notification_log}
 
-@app.get("/api/blocked-ips")
-async def get_blocked_ips(session_id: Optional[str] = Cookie(None)):
-    """Get all blocked IPs"""
-    user = get_session_user(session_id)
-    if not user or "admin_group" not in user.get("groups", []):
-        raise HTTPException(status_code=403, detail="Admin access required")
-
-    blocked_ips_list = get_all_blocked_ips_from_db()
-    return {"blocked_ips": blocked_ips_list}
-
-@app.post("/api/blocked-ips/{ip_address}/status")
-async def update_blocked_ip_status_endpoint(
-    ip_address: str,
-    request: Request,
-    session_id: Optional[str] = Cookie(None)
-):
-    """Update the status of a blocked IP (temporary or monitoring). Use 'permanent' to move to permanent blocklist."""
-    user = get_session_user(session_id)
-    if not user or "admin_group" not in user.get("groups", []):
-        raise HTTPException(status_code=403, detail="Admin access required")
-
-    data = await request.json()
-    new_status = data.get('status')
-    if new_status not in ['temporary', 'permanent', 'monitoring']:
-        raise HTTPException(status_code=400, detail="Invalid status. Must be 'temporary', 'permanent', or 'monitoring'")
-
-    # Get existing record
-    ip_record = get_blocked_ip_from_db(ip_address)
-    if not ip_record:
-        raise HTTPException(status_code=404, detail="IP not found")
-
-    old_status = ip_record['status']
-
-    # If setting to permanent, move to permanent blocklist instead
-    if new_status == 'permanent':
-        # Add to permanent blocklist
-        reason = ip_record.get('last_reason', 'Moved from temporary block')
-        try:
-            add_to_permanent_blocklist(ip_address, reason, user.get('username', 'admin'))
-        except Exception as e:
-            if 'UNIQUE constraint failed' in str(e):
-                raise HTTPException(status_code=400, detail="IP already in permanent blocklist")
-            raise
-
-        # Remove from blocked_ips table
-        delete_blocked_ip_from_db(ip_address)
-
-        # Remove from in-memory cache
-        if ip_address in blocked_ips:
-            del blocked_ips[ip_address]
-
-        # Reload Caddy to apply the new block
-        try:
-            await reload_caddy()
-        except Exception as e:
-            logger.warning(f"Failed to reload Caddy after adding permanent block: {e}")
-
-        # Broadcast removal from dashboard
-        await broadcast_sse_event('ip_moved_to_permanent', {
-            'ip_address': ip_address,
-            'old_status': old_status
-        })
-
-        await log_activity(user.get('username', 'admin'), "IP_PERMANENTLY_BLOCKED",
-                          f"Moved {ip_address} to permanent blocklist (Caddy-level block)",
-                          "admin")
-
-        return {"status": "success", "ip_address": ip_address, "action": "moved_to_permanent_blocklist"}
-
-    # Update status for temporary/monitoring
-    update_blocked_ip_status(ip_address, new_status)
-
-    # If changing to temporary, reset the block timer
-    if new_status == 'temporary':
-        ip_record['status'] = 'temporary'
-        ip_record['block_until'] = time.time() + AUTH_VERIFY_BLOCK_DURATION
-        save_blocked_ip_to_db(ip_record)
-
-    # Broadcast update via SSE
-    updated_record = get_blocked_ip_from_db(ip_address)
-    await broadcast_sse_event('ip_status_changed', {
-        'ip_address': ip_address,
-        'old_status': old_status,
-        'new_status': new_status,
-        'block_count': updated_record['block_count']
-    })
-
-    await log_activity(user.get('username', 'admin'), "IP_STATUS_CHANGED",
-                      f"Changed {ip_address} status from {old_status} to {new_status}",
-                      "admin")
-
-    return {"status": "success", "ip_address": ip_address, "new_status": new_status}
-
-@app.delete("/api/blocked-ips/{ip_address}")
-async def delete_blocked_ip_endpoint(
-    ip_address: str,
-    session_id: Optional[str] = Cookie(None)
-):
-    """Remove an IP from the blocked list"""
-    user = get_session_user(session_id)
-    if not user or "admin_group" not in user.get("groups", []):
-        raise HTTPException(status_code=403, detail="Admin access required")
-
-    # Check if IP exists
-    ip_record = get_blocked_ip_from_db(ip_address)
-    if not ip_record:
-        raise HTTPException(status_code=404, detail="IP not found")
-
-    # Delete from database
-    delete_blocked_ip_from_db(ip_address)
-
-    # Also remove from in-memory cache if present
-    if ip_address in blocked_ips:
-        del blocked_ips[ip_address]
-
-    # Broadcast removal via SSE
-    await broadcast_sse_event('ip_unblocked', {
-        'ip_address': ip_address,
-        'was_status': ip_record['status']
-    })
-
-    await log_activity(user.get('username', 'admin'), "IP_UNBLOCKED",
-                      f"Removed {ip_address} from blocked list",
-                      "admin")
-
-    return {"status": "success", "ip_address": ip_address}
+# NOTE: /api/blocked-ips endpoints removed in v1.3.22
+# All IP blocking is now permanent via the permanent_blocklist table
+# Use /api/permanent-blocklist endpoints instead
 
 # ============================================================================
 # PERMANENT BLOCKLIST API ENDPOINTS

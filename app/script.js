@@ -692,114 +692,9 @@ function startInviteCountdownTimers() {
     inviteTimerInterval = setInterval(updateCountdowns, 1000);
 }
 
-async function loadBlockedIPs() {
-    try {
-        const response = await apiCall('/api/blocked-ips');
-        const blockedIPs = response.blocked_ips || [];
-        const card = document.getElementById('blocked-ips-card');
-        const list = document.getElementById('blocked-ips-list');
-
-        // Hide card if empty
-        if (blockedIPs.length === 0) {
-            card.style.display = 'none';
-            return;
-        }
-
-        card.style.display = 'block';
-        const now = Date.now() / 1000;
-
-        setContent(list, blockedIPs.map(ip => {
-            const lastBlockedTime = new Date(ip.last_blocked_at * 1000).toLocaleString();
-            const ipAddress = escapeHtml(ip.ip_address);
-            const reason = escapeHtml(ip.last_reason || 'Unknown');
-            const blockCount = ip.block_count;
-            const status = ip.status;
-            const isExternal = ip.is_external ? true : false;
-
-            // Calculate time remaining for temporary blocks
-            let blockStatus = '';
-            if (status === 'permanent') {
-                blockStatus = '<span style="color: var(--danger); font-weight: 600;">⛔ PERMANENT</span>';
-            } else if (status === 'temporary' && ip.block_until) {
-                const remaining = ip.block_until - now;
-                if (remaining > 0) {
-                    const minutes = Math.floor(remaining / 60);
-                    blockStatus = `<span style="color: var(--warning); font-weight: 500;">🔒 ${minutes}m remaining</span>`;
-                } else {
-                    blockStatus = '<span style="color: var(--text-secondary);">⏱️ Expired</span>';
-                }
-            } else {
-                blockStatus = '<span style="color: var(--text-secondary);">📋 Monitoring</span>';
-            }
-
-            return `
-                <div class="blocked-ip-item" data-ip="${ipAddress}" style="padding: 14px; border-bottom: 1px solid var(--border); line-height: 1.6;">
-                    <div style="display: flex; justify-content: space-between; align-items: flex-start; margin-bottom: 8px;">
-                        <div>
-                            <strong style="color: ${isExternal ? 'var(--danger)' : 'var(--accent)'}; font-size: 15px;">
-                                ${isExternal ? '🌐' : '🏠'} ${ipAddress}
-                            </strong>
-                            <div style="color: var(--text-secondary); font-size: 12px; margin-top: 2px;">${reason}</div>
-                        </div>
-                        <div style="text-align: right;">
-                            ${blockStatus}
-                            <div style="color: var(--text-secondary); font-size: 11px; margin-top: 2px;">Blocks: ${blockCount}</div>
-                        </div>
-                    </div>
-                    <div style="display: flex; gap: 8px; margin-top: 8px;">
-                        <button onclick="setBlockedIPStatus('${ipAddress}', 'permanent')"
-                                class="btn btn-sm ${status === 'permanent' ? 'btn-danger' : 'btn-secondary'}"
-                                style="flex: 1; padding: 6px 10px; font-size: 12px;">
-                            ⛔ Permanent
-                        </button>
-                        <button onclick="setBlockedIPStatus('${ipAddress}', 'temporary')"
-                                class="btn btn-sm ${status === 'temporary' ? 'btn-warning' : 'btn-secondary'}"
-                                style="flex: 1; padding: 6px 10px; font-size: 12px;">
-                            🔒 Temporary
-                        </button>
-                        <button onclick="deleteBlockedIP('${ipAddress}')"
-                                class="btn btn-sm btn-danger"
-                                style="padding: 6px 12px; font-size: 12px;">
-                            🗑️ Delete
-                        </button>
-                    </div>
-                    <div style="color: var(--text-secondary); font-size: 11px; margin-top: 6px;">Last blocked: ${lastBlockedTime}</div>
-                </div>
-            `;
-        }).join(''), true);
-    } catch (err) {
-        console.error('Failed to load blocked IPs:', err);
-    }
-}
-
-async function setBlockedIPStatus(ipAddress, status) {
-    try {
-        await apiCall(`/api/blocked-ips/${encodeURIComponent(ipAddress)}/status`, {
-            method: 'POST',
-            body: JSON.stringify({ status })
-        });
-        showAlert(`IP ${ipAddress} status updated to ${status}`, 'success');
-        await loadBlockedIPs();
-    } catch (err) {
-        showAlert(`Failed to update IP status: ${err.message}`, 'error');
-    }
-}
-
-async function deleteBlockedIP(ipAddress) {
-    if (!confirm(`Remove ${ipAddress} from the blocked list?`)) {
-        return;
-    }
-
-    try {
-        await apiCall(`/api/blocked-ips/${encodeURIComponent(ipAddress)}`, {
-            method: 'DELETE'
-        });
-        showAlert(`IP ${ipAddress} removed from blocked list`, 'success');
-        await loadBlockedIPs();
-    } catch (err) {
-        showAlert(`Failed to delete IP: ${err.message}`, 'error');
-    }
-}
+// NOTE: Dashboard blocked IPs functions removed in v1.3.22
+// All IP blocking is now permanent and managed via Settings > IP Blocklist
+// Old functions: loadBlockedIPs, setBlockedIPStatus, deleteBlockedIP removed
 
 // ============================================================================
 // PERMANENT IP BLOCKLIST FUNCTIONS
@@ -840,8 +735,8 @@ async function loadPermanentBlocklist() {
                 <div class="reason">${entry.reason || '-'}</div>
                 <div class="meta">${addedDate}</div>
                 <div class="meta">${entry.added_by || '-'}</div>
-                <button class="btn btn-danger btn-sm" onclick="removePermanentBlock(${entry.id}, '${entry.ip_range}')" title="Remove">
-                    Remove
+                <button class="btn btn-danger btn-sm" onclick="removePermanentBlock(${entry.id}, '${entry.ip_range}')" title="Unblock">
+                    Unblock
                 </button>
             `;
             listContainer.appendChild(item);
@@ -851,18 +746,7 @@ async function loadPermanentBlocklist() {
     }
 }
 
-function toggleBlocklist() {
-    const container = document.getElementById('permanent-blocklist-container');
-    const icon = document.getElementById('blocklist-toggle-icon');
-
-    if (container.style.display === 'none') {
-        container.style.display = 'block';
-        icon.textContent = '▼';
-    } else {
-        container.style.display = 'none';
-        icon.textContent = '▶';
-    }
-}
+// NOTE: toggleBlocklist removed in v1.3.22 - blocklist is always visible now
 
 async function addPermanentBlock() {
     const ipInput = document.getElementById('new-block-ip');
@@ -3013,6 +2897,12 @@ function connectStatusStream() {
                         handlePermanentBlocklistUpdated(data);
                         break;
 
+                    case 'ip_permanently_blocked':
+                        // New IP auto-blocked (from brute force detection)
+                        loadPermanentBlocklist();
+                        showAlert(`⛔ IP ${data.ip_address} permanently blocked: ${data.reason || 'Auto-blocked'}`, 'warning');
+                        break;
+
                     case 'update_available':
                         // New update available
                         handleUpdateAvailable(data);
@@ -3245,44 +3135,27 @@ function handleDebugModeChanged(data) {
 }
 
 function handleIPBlocked(data) {
-    // New IP blocked or initial state - reload the list
-    const dashboardPage = document.getElementById('dashboard-page');
-    if (!dashboardPage || dashboardPage.classList.contains('hidden')) return;
-    loadBlockedIPs();
-
-    // Show notification if this is a new block (has 'escalated' field)
-    if (data.escalated !== undefined) {
-        const msg = data.escalated
-            ? `⛔ IP ${data.ip_address} auto-escalated to PERMANENT BLOCK (3rd offense)`
-            : `🔒 IP ${data.ip_address} blocked (${data.status})`;
-        showAlert(msg, data.escalated ? 'error' : 'warning');
-    }
+    // NOTE: v1.3.22+ - All blocks are permanent
+    // Reload the permanent blocklist and show notification
+    loadPermanentBlocklist();
+    showAlert(`⛔ IP ${data.ip_address} permanently blocked`, 'warning');
 }
 
 function handleIPStatusChanged(data) {
-    // IP status changed - reload the list
-    const dashboardPage = document.getElementById('dashboard-page');
-    if (!dashboardPage || dashboardPage.classList.contains('hidden')) return;
-    loadBlockedIPs();
+    // NOTE: v1.3.22+ - All blocks are permanent, status changes no longer used
+    loadPermanentBlocklist();
 }
 
 function handleIPUnblocked(data) {
-    // IP removed from blocked list - reload
-    const dashboardPage = document.getElementById('dashboard-page');
-    if (!dashboardPage || dashboardPage.classList.contains('hidden')) return;
-    loadBlockedIPs();
+    // IP removed from blocklist - reload
+    loadPermanentBlocklist();
+    showAlert(`✅ IP ${data.ip_address} unblocked`, 'success');
 }
 
 function handleIPMovedToPermanent(data) {
-    // IP moved to permanent blocklist - reload dashboard blocked IPs
-    const dashboardPage = document.getElementById('dashboard-page');
-    if (!dashboardPage || dashboardPage.classList.contains('hidden')) {
-        // If on settings page, reload the permanent blocklist
-        loadPermanentBlocklist();
-    } else {
-        loadBlockedIPs();
-    }
-    showAlert(`IP ${data.ip_address} moved to permanent blocklist (Caddy-level block)`, 'success');
+    // NOTE: v1.3.22+ - All blocks are permanent now
+    loadPermanentBlocklist();
+    showAlert(`⛔ IP ${data.ip_address} permanently blocked`, 'success');
 }
 
 function handlePermanentBlocklistUpdated(data) {
