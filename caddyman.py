@@ -54,7 +54,7 @@ from argon2 import PasswordHasher, Type
 from argon2.exceptions import VerifyMismatchError, VerificationError, InvalidHash
 import bcrypt  # Permanent: OAuth client secrets use bcrypt for speed (high-entropy, frequent verification)
 
-VERSION = "1.3.22"
+VERSION = "1.3.23"
 
 # ============================================================================
 # DEBUG mode - enables sensitive TLS secret logging and keylog files
@@ -143,6 +143,29 @@ def get_permanent_caddy_path():
     if os.path.exists(permanent_caddy):
         return permanent_caddy
     return resource_path("caddy.exe")
+
+def get_permanent_app_path():
+    """Copy the 'app' folder to a permanent location to avoid missing static files when PyInstaller temp is cleared.
+    """
+    # Define permanent location in the same directory as the database
+    permanent_app = os.path.join(os.path.abspath("."), "app")
+    
+    # If running from PyInstaller bundle, copy app dir to permanent location
+    try:
+        bundled_app = resource_path("app")
+        # Ensure we are in a bundle (app exists and is not the permanent location)
+        if bundled_app != permanent_app and os.path.isdir(bundled_app):
+            # We copy everything, replacing the existing permanent files so they update with app upgrades
+            if os.path.exists(permanent_app):
+                shutil.rmtree(permanent_app, ignore_errors=True)
+            shutil.copytree(bundled_app, permanent_app)
+            logger.info(f"Copied app folder to permanent location: {permanent_app}")
+    except Exception as e:
+        logger.warning(f"Could not copy app folder to permanent location: {e}")
+        
+    if os.path.exists(permanent_app):
+        return permanent_app
+    return resource_path("app")
 
 def get_php_cgi_executable():
     """Get the platform-specific PHP-CGI executable name"""
@@ -675,7 +698,8 @@ async def server_error_handler(request: Request, exc):
     )
 
 # Get absolute path for reliability - works with PyInstaller
-static_dir = resource_path("app")
+# and copies `app` folder to permanent path to avoid cleanup issues
+static_dir = get_permanent_app_path()
 
 # Mount /static to serve CSS/JS/etc
 app.mount("/static", StaticFiles(directory=static_dir), name="static")
@@ -7477,10 +7501,13 @@ async def periodic_update_check():
 # API Endpoints
 @app.get("/favicon.ico")
 async def favicon():
-    """Serve favicon"""
-    favicon_path = resource_path("ico.ico")
+    favicon_path = os.path.join(static_dir, "..", "ico.ico")
     if os.path.exists(favicon_path):
         return FileResponse(favicon_path, media_type="image/x-icon")
+    # Fallback to bundled if not found in root
+    favicon_bundled = resource_path("ico.ico")
+    if os.path.exists(favicon_bundled):
+        return FileResponse(favicon_bundled, media_type="image/x-icon")
     # Return 204 No Content instead of 404 to avoid console errors
     return Response(status_code=204)
 
@@ -7502,7 +7529,7 @@ async def root():
         return RedirectResponse(url="/user-portal")
 
     # Default behavior: serve admin interface
-    index_path = resource_path("app/index.html")
+    index_path = os.path.join(static_dir, "index.html")
     with open(index_path, "r", encoding="utf-8") as f:
         html_content = f.read()
         html_content = html_content.replace('""" + VERSION + """', VERSION)
@@ -7520,7 +7547,7 @@ async def admin_page():
         raise HTTPException(status_code=404, detail="Not found")
 
     # Serve admin interface
-    index_path = resource_path("app/index.html")
+    index_path = os.path.join(static_dir, "index.html")
     with open(index_path, "r", encoding="utf-8") as f:
         html_content = f.read()
         html_content = html_content.replace('""" + VERSION + """', VERSION)
@@ -7543,7 +7570,7 @@ async def login_page(return_to: Optional[str] = None, session_id: Optional[str] 
             return RedirectResponse(url="/user-portal")
 
     # Not logged in, show login page
-    oauth_login_path = resource_path("app/oauth_login.html")
+    oauth_login_path = os.path.join(static_dir, "oauth_login.html")
     with open(oauth_login_path, "r", encoding="utf-8") as f:
         html_content = f.read()
 
@@ -8399,21 +8426,21 @@ async def generate_invite_link(
 @app.get("/login", response_class=HTMLResponse)
 async def user_portal_root():
     """Serve the user portal HTML (also accessible via /login for convenience)"""
-    portal_path = resource_path("app/user-portal-index.html")
+    portal_path = os.path.join(static_dir, "user-portal-index.html")
     with open(portal_path, "r", encoding="utf-8") as f:
         return HTMLResponse(content=f.read())
 
 @app.get("/user-portal/style.css")
 async def user_portal_css():
     """Serve user portal CSS"""
-    css_path = resource_path("app/user-portal-style.css")
+    css_path = os.path.join(static_dir, "user-portal-style.css")
     with open(css_path, "r", encoding="utf-8") as f:
         return Response(content=f.read(), media_type="text/css")
 
 @app.get("/user-portal/script.js")
 async def user_portal_js():
     """Serve user portal JavaScript"""
-    js_path = resource_path("app/user-portal-script.js")
+    js_path = os.path.join(static_dir, "user-portal-script.js")
     with open(js_path, "r", encoding="utf-8") as f:
         return Response(content=f.read(), media_type="application/javascript")
 
@@ -10875,7 +10902,7 @@ async def serve_website_login_page():
     """
     Serve the login page for website authentication.
     """
-    login_page_path = resource_path(os.path.join("app", "website_login.html"))
+    login_page_path = os.path.join(static_dir, "website_login.html")
     with open(login_page_path, 'r', encoding='utf-8') as f:
         return HTMLResponse(f.read())
 
